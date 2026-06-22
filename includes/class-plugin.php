@@ -20,8 +20,9 @@ class Plugin {
 		ApiAuth::get_or_create_key();
 
 		add_action( 'rest_api_init', [ $this, 'register_rest_routes' ] );
-		// Priority 5 ensures hooks are registered before Action Scheduler's default runner fires.
-		add_action( 'plugins_loaded', [ $this, 'register_action_hooks' ], 5 );
+		// Register AS action hooks directly — we're already on plugins_loaded priority 10,
+		// so we can't re-add to plugins_loaded at an earlier priority.
+		$this->register_action_hooks();
 
 		if ( is_admin() || is_network_admin() ) {
 			Admin\AdminPage::init();

@@ -16,7 +16,8 @@ class AdminPage {
 	}
 
 	public static function register_page(): void {
-		add_management_page(
+		add_submenu_page(
+			'settings.php',
 			__( 'HB Migrator', 'hb-migrator' ),
 			__( 'HB Migrator', 'hb-migrator' ),
 			'manage_network',
@@ -26,7 +27,7 @@ class AdminPage {
 	}
 
 	public static function enqueue_assets( string $hook ): void {
-		if ( 'tools_page_hb-migrator' !== $hook ) {
+		if ( 'settings_page_hb-migrator' !== $hook ) {
 			return;
 		}
 		wp_enqueue_style( 'hb-migrator-admin', HBM_PLUGIN_URL . 'assets/css/admin.css', [], HBM_VERSION );
@@ -177,7 +178,7 @@ class AdminPage {
 		update_site_option( 'hbm_dest_url', esc_url_raw( wp_unslash( $_POST['hbm_dest_url'] ?? '' ) ) );
 		update_site_option( 'hbm_dest_key', sanitize_text_field( wp_unslash( $_POST['hbm_dest_key'] ?? '' ) ) );
 		update_site_option( 'hbm_dest_email', sanitize_email( wp_unslash( $_POST['hbm_dest_email'] ?? '' ) ) );
-		wp_safe_redirect( network_admin_url( 'tools.php?page=hb-migrator&saved=1' ) );
+		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&saved=1' ) );
 		exit;
 	}
 
@@ -193,7 +194,7 @@ class AdminPage {
 		$site_ids   = array_map( 'intval', (array) ( $_POST['site_ids'] ?? [] ) );
 
 		if ( ! $dest_url || ! $dest_key || empty( $site_ids ) ) {
-			wp_safe_redirect( network_admin_url( 'tools.php?page=hb-migrator&error=' . rawurlencode( 'Destination URL, API key, and at least one site are required.' ) ) );
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&error=' . rawurlencode( 'Destination URL, API key, and at least one site are required.' ) ) );
 			exit;
 		}
 
@@ -218,7 +219,7 @@ class AdminPage {
 		);
 
 		if ( is_wp_error( $response ) ) {
-			wp_safe_redirect( network_admin_url( 'tools.php?page=hb-migrator&error=' . rawurlencode( $response->get_error_message() ) ) );
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&error=' . rawurlencode( $response->get_error_message() ) ) );
 			exit;
 		}
 
@@ -227,7 +228,7 @@ class AdminPage {
 
 		if ( ! in_array( $code, [ 200, 201 ], true ) || empty( $body['migration_id'] ) ) {
 			$msg = $body['error'] ?? "Destination returned HTTP $code";
-			wp_safe_redirect( network_admin_url( 'tools.php?page=hb-migrator&error=' . rawurlencode( $msg ) ) );
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&error=' . rawurlencode( $msg ) ) );
 			exit;
 		}
 
@@ -238,7 +239,7 @@ class AdminPage {
 			'dest_key'     => $dest_key,
 		] );
 
-		wp_safe_redirect( network_admin_url( 'tools.php?page=hb-migrator&started=1' ) );
+		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&started=1' ) );
 		exit;
 	}
 
@@ -248,7 +249,7 @@ class AdminPage {
 			wp_die( esc_html__( 'Insufficient permissions.', 'hb-migrator' ), 403 );
 		}
 		delete_site_option( 'hbm_active_migration' );
-		wp_safe_redirect( network_admin_url( 'tools.php?page=hb-migrator' ) );
+		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator' ) );
 		exit;
 	}
 }
