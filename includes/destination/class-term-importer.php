@@ -30,6 +30,8 @@ class TermImporter {
 					'current_stage' => 'terms',
 				] );
 				$job->dest_blog_id = $dest_blog_id;
+				// Assign user roles now that the subsite exists.
+				self::assign_user_roles( $job, $dest_blog_id, $migration );
 			} else {
 				MigrationRegistry::update_site_job( $site_job_id, [
 					'status'        => 'running',
@@ -114,6 +116,33 @@ class TermImporter {
 				$e,
 				$site_job_id
 			);
+		}
+	}
+
+	private static function assign_user_roles( object $job, int $dest_blog_id, object $migration ): void {
+		$offset = 0;
+		while ( true ) {
+			$users = SourceClient::get(
+				$migration->source_url,
+				$migration->source_api_key,
+				'source/users',
+				[ 'per_page' => 100, 'offset' => $offset ]
+			);
+			foreach ( $users as $u ) {
+				$dest_user_id = IdMap::get( IdMap::NETWORK, 'user', (int) $u['source_user_id'] );
+				if ( ! $dest_user_id ) {
+					continue;
+				}
+				foreach ( $u['site_roles'] as $sr ) {
+					if ( (int) $sr['blog_id'] === (int) $job->source_blog_id ) {
+						add_user_to_blog( $dest_blog_id, $dest_user_id, $sr['role'] );
+					}
+				}
+			}
+			if ( count( $users ) < 100 ) {
+				break;
+			}
+			$offset += 100;
 		}
 	}
 

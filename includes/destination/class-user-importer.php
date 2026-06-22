@@ -60,16 +60,8 @@ class UserImporter {
 
 				// Map source user ID → dest user ID at network level (site_job_id = 0).
 				IdMap::set( IdMap::NETWORK, 'user', (int) $u['source_user_id'], $dest_user_id );
-
-				// Assign site roles for each site being migrated in this migration.
-				$jobs = MigrationRegistry::get_site_jobs_for_migration( $migration_id );
-				$job_source_ids = array_column( $jobs, 'source_blog_id' );
-
-				foreach ( $u['site_roles'] as $sr ) {
-					if ( in_array( (int) $sr['blog_id'], array_map( 'intval', $job_source_ids ), true ) ) {
-						add_user_to_blog( get_current_blog_id(), $dest_user_id, $sr['role'] );
-					}
-				}
+				// Blog role assignment happens in TermImporter after each subsite is created,
+				// since dest_blog_id is NULL until that point.
 			}
 
 			wp_suspend_cache_invalidation( false );
