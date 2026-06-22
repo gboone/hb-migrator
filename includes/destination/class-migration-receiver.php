@@ -47,6 +47,20 @@ class MigrationReceiver {
 		// Idempotency: return existing running/pending migration for the same source.
 		$existing = MigrationRegistry::find_active_migration_for_source( $source_url );
 		if ( $existing ) {
+			// If every site job is still pending, the initial AS action was never queued
+			// (e.g. AS wasn't installed when the migration was first triggered). Re-enqueue.
+			$jobs       = MigrationRegistry::get_site_jobs_for_migration( (int) $existing->id );
+			$all_pending = ! empty( $jobs ) && count( $jobs ) === count(
+				array_filter( $jobs, fn( $j ) => 'pending' === $j->status )
+			);
+			if ( $all_pending ) {
+				as_enqueue_async_action(
+					'hbm_import_network_users',
+					[ 'migration_id' => (int) $existing->id, 'offset' => 0, 'attempt' => 0 ],
+					'hb-migrator'
+				);
+			}
+
 			return new \WP_REST_Response( [
 				'migration_id' => (int) $existing->id,
 				'status'       => $existing->status,
