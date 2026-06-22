@@ -87,6 +87,7 @@ class UserImporter {
 			}
 
 		} catch ( \Throwable $e ) {
+			wp_suspend_cache_invalidation( false );
 			PipelineController::handle_batch_failure(
 				'hbm_import_network_users',
 				[ 'migration_id' => $migration_id, 'offset' => $offset, 'attempt' => $attempt ],

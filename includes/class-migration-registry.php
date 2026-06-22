@@ -52,7 +52,7 @@ class MigrationRegistry {
 	public static function list_migrations(): array {
 		global $wpdb;
 		$table = $wpdb->base_prefix . 'hbm_migrations';
-		return $wpdb->get_results( "SELECT * FROM `$table` ORDER BY id DESC" ) ?: [];
+		return $wpdb->get_results( "SELECT * FROM `{$wpdb->base_prefix}hbm_migrations` ORDER BY id DESC" ) ?: []; // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- no user input, table name is hardcoded
 	}
 
 	// -----------------------------------------------------------------------

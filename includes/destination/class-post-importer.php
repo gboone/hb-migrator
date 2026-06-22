@@ -125,6 +125,8 @@ class PostImporter {
 			);
 
 		} catch ( \Throwable $e ) {
+			kses_init_filters();
+			wp_suspend_cache_invalidation( false );
 			if ( isset( $job ) && $job ) {
 				restore_current_blog();
 			}

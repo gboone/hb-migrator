@@ -160,10 +160,12 @@ class SearchReplace {
 	 */
 	public static function safe_replace( $value, array $replacements ) {
 		if ( is_array( $value ) ) {
+			$result = [];
 			foreach ( $value as $k => $v ) {
-				$value[ $k ] = self::safe_replace( $v, $replacements );
+				$new_key            = is_string( $k ) ? str_replace( array_keys( $replacements ), array_values( $replacements ), $k ) : $k;
+				$result[ $new_key ] = self::safe_replace( $v, $replacements );
 			}
-			return $value;
+			return $result;
 		}
 
 		if ( ! is_string( $value ) ) {
