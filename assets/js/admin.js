@@ -2,113 +2,108 @@
 ( function () {
 	'use strict';
 
-	const wrap = document.getElementById( 'hbm-wrap' );
-	if ( ! wrap ) {
-		return;
-	}
-
-	// Confirm guard for the Reset Export button.
-	const resetForm = document.getElementById( 'hbm-reset-form' );
-	if ( resetForm ) {
-		resetForm.addEventListener( 'submit', function ( e ) {
-			const btn = resetForm.querySelector( '.hbm-reset-btn' );
-			const msg = ( btn && btn.dataset.confirm ) || 'Are you sure you want to reset the export?';
-			if ( ! window.confirm( msg ) ) {
-				e.preventDefault();
+	// Copy API key button.
+	const copyBtn = document.getElementById( 'hbm-copy-key' );
+	if ( copyBtn ) {
+		copyBtn.addEventListener( 'click', function () {
+			const input = document.getElementById( 'hbm-api-key' );
+			if ( input ) {
+				input.select();
+				document.execCommand( 'copy' );
+				copyBtn.textContent = 'Copied!';
+				setTimeout( function () {
+					copyBtn.textContent = 'Copy';
+				}, 2000 );
 			}
 		} );
 	}
 
-	// Only start polling when the page reports an active export.
-	if ( ! wrap.dataset.exportRunning ) {
+	// Progress polling — only when a migration is active.
+	if ( ! hbmAdmin.activeMigration ) {
 		return;
 	}
 
-	const POLL_INTERVAL_MS = 5000;
-	const STATUS_LABELS    = {
+	const wrap = document.getElementById( 'hbm-progress-wrap' );
+	if ( ! wrap ) {
+		return;
+	}
+
+	const POLL_MS        = 4000;
+	const BACKOFF_MS     = 10000;
+	const STATUS_LABELS  = {
 		pending:  'Pending',
 		running:  'Running',
 		complete: 'Complete',
 		failed:   'Failed',
 	};
 
-	function formatNumber( n ) {
-		return Number( n ).toLocaleString();
+	function pct( offset, total ) {
+		return total > 0 ? Math.min( 100, Math.round( offset / total * 100 ) ) : 0;
 	}
 
-	function updateStageRow( stage, data ) {
-		const row = document.getElementById( 'hbm-stage-' + stage );
-		if ( ! row ) {
-			return;
-		}
-
-		row.dataset.status = data.status;
-
-		const statusEl = row.querySelector( '.hbm-status' );
-		if ( statusEl ) {
-			statusEl.textContent  = STATUS_LABELS[ data.status ] || data.status;
-			statusEl.className    = 'hbm-status hbm-status-' + data.status;
-		}
-
-		const pct  = data.total_items > 0 ? Math.min( 100, Math.round( data.batch_offset / data.total_items * 100 ) ) : 0;
-		const fill = row.querySelector( '.hbm-progress-fill' );
-		const bar  = row.querySelector( '.hbm-progress-bar' );
-		if ( fill ) {
-			fill.style.width = pct + '%';
-		}
-		if ( bar ) {
-			bar.setAttribute( 'aria-valuenow', pct );
-		}
-
-		const label = row.querySelector( '.hbm-progress-label' );
-		if ( label ) {
-			label.textContent = data.total_items > 0
-				? formatNumber( data.batch_offset ) + ' / ' + formatNumber( data.total_items )
-				: '—';
-		}
-
-		// Show or clear error messages below failed stage rows.
-		let errEl = row.querySelector( '.hbm-error-message' );
-		if ( 'failed' === data.status && data.error_message ) {
-			if ( ! errEl ) {
-				const td  = row.querySelector( 'td:last-child' );
-				errEl     = document.createElement( 'p' );
-				errEl.className = 'hbm-error-message';
-				td && td.appendChild( errEl );
-			}
-			errEl.textContent = data.error_message;
-		} else if ( errEl ) {
-			errEl.remove();
-		}
+	function renderSite( site ) {
+		const p = pct( site.stage_offset, site.stage_total );
+		const statusLabel = STATUS_LABELS[ site.status ] || site.status;
+		const stage       = site.current_stage ? ' (' + site.current_stage + ')' : '';
+		const errHtml     = ( site.status === 'failed' && site.error_message )
+			? '<p class="hbm-error-message">' + esc( site.error_message ) + '</p>'
+			: '';
+		return '<tr>' +
+			'<td>' + esc( site.source_domain ) + '</td>' +
+			'<td>' + esc( site.dest_path ) + '</td>' +
+			'<td><span class="hbm-status hbm-status-' + esc( site.status ) + '">' + esc( statusLabel ) + esc( stage ) + '</span></td>' +
+			'<td>' +
+				'<div class="hbm-progress-bar"><div class="hbm-progress-fill" style="width:' + p + '%"></div></div>' +
+				'<span class="hbm-progress-label">' + ( site.stage_total > 0 ? site.stage_offset + ' / ' + site.stage_total : '&mdash;' ) + '</span>' +
+			'</td>' +
+			'<td>' + errHtml + '</td>' +
+		'</tr>';
 	}
 
-	function pollProgress() {
-		wp.apiFetch( {
-			url:     hbmAdmin.progressEndpoint,
+	function esc( str ) {
+		return String( str )
+			.replace( /&/g, '&amp;' )
+			.replace( /</g, '&lt;' )
+			.replace( />/g, '&gt;' )
+			.replace( /"/g, '&quot;' );
+	}
+
+	function render( data ) {
+		const sites   = data.sites || [];
+		const allDone = sites.length > 0 && sites.every( function ( s ) { return s.status === 'complete'; } );
+		const anyFail = sites.some( function ( s ) { return s.status === 'failed'; } );
+
+		let html = '<table class="widefat hbm-site-table">' +
+			'<thead><tr><th>Source</th><th>Destination path</th><th>Status</th><th>Progress</th><th></th></tr></thead>' +
+			'<tbody>';
+		sites.forEach( function ( s ) { html += renderSite( s ); } );
+		html += '</tbody></table>';
+
+		if ( allDone ) {
+			html += '<div class="notice notice-success"><p><strong>Migration complete!</strong></p></div>';
+		} else if ( anyFail ) {
+			html += '<div class="notice notice-error"><p><strong>One or more sites failed.</strong> Check error messages above.</p></div>';
+		}
+
+		wrap.innerHTML = html;
+		return allDone || anyFail;
+	}
+
+	function poll() {
+		fetch( hbmAdmin.statusEndpoint, {
 			headers: { 'X-WP-Nonce': hbmAdmin.nonce },
 		} )
+			.then( function ( res ) { return res.json(); } )
 			.then( function ( data ) {
-				const stages = data.stages || {};
-				Object.keys( stages ).forEach( function ( stage ) {
-					updateStageRow( stage, stages[ stage ] );
-				} );
-
-				if ( data.is_complete || data.is_failed ) {
-					// Stop polling and reload to show download links or retry buttons.
-					window.location.reload();
-					return;
-				}
-
-				if ( data.is_running ) {
-					setTimeout( pollProgress, POLL_INTERVAL_MS );
+				const done = render( data );
+				if ( ! done ) {
+					setTimeout( poll, POLL_MS );
 				}
 			} )
 			.catch( function () {
-				// On network error, keep retrying.
-				setTimeout( pollProgress, POLL_INTERVAL_MS * 2 );
+				setTimeout( poll, BACKOFF_MS );
 			} );
 	}
 
-	// Kick off the first poll after a short delay.
-	setTimeout( pollProgress, POLL_INTERVAL_MS );
+	setTimeout( poll, POLL_MS );
 }() );

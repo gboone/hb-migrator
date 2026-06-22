@@ -1,106 +1,95 @@
 <?php
 /**
- * Tests for Checkpoint and QueueTable.
- *
- * Run with: vendor/bin/phpunit tests/test-checkpoint.php
- * Requires WP test suite bootstrap (wp-tests-config.php).
+ * Tests for MigrationRegistry, IdMap, and QueueTable (v2 schema).
  */
 
-use HBMigrator\Checkpoint;
+use HBMigrator\MigrationRegistry;
+use HBMigrator\IdMap;
 use HBMigrator\QueueTable;
 
-class Test_Checkpoint extends WP_UnitTestCase {
+class Test_MigrationRegistry extends WP_UnitTestCase {
 
 	public function set_up(): void {
 		parent::set_up();
 		QueueTable::maybe_create_or_upgrade();
-		Checkpoint::reset_all();
 	}
 
-	public function test_initialize_stages_inserts_three_rows(): void {
-		Checkpoint::initialize_stages();
-		$stages = Checkpoint::get_all_stages();
-		$this->assertCount( 3, $stages );
-		$statuses = array_column( $stages, 'status' );
-		$this->assertSame( [ 'pending', 'pending', 'pending' ], $statuses );
+	public function test_create_and_get_migration(): void {
+		$id = MigrationRegistry::create_migration( 'https://source.example.com', 'testapikey', 'admin@example.com' );
+		$this->assertGreaterThan( 0, $id );
+		$m = MigrationRegistry::get_migration( $id );
+		$this->assertNotNull( $m );
+		$this->assertSame( 'https://source.example.com', $m->source_url );
+		$this->assertSame( 'pending', $m->status );
 	}
 
-	public function test_set_offset_updates_only_target_stage(): void {
-		Checkpoint::initialize_stages();
-		Checkpoint::set_offset( 'sql', 500 );
-		$sql = Checkpoint::get_stage( 'sql' );
-		$wxr = Checkpoint::get_stage( 'wxr' );
-		$this->assertSame( 500, (int) $sql->batch_offset );
-		$this->assertSame( 0, (int) $wxr->batch_offset );
+	public function test_update_migration_status(): void {
+		$id = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		MigrationRegistry::update_migration_status( $id, 'running' );
+		$m = MigrationRegistry::get_migration( $id );
+		$this->assertSame( 'running', $m->status );
 	}
 
-	public function test_set_row_offset(): void {
-		Checkpoint::initialize_stages();
-		Checkpoint::set_row_offset( 'sql', 9999 );
-		$sql = Checkpoint::get_stage( 'sql' );
-		$this->assertSame( 9999, (int) $sql->row_offset );
+	public function test_complete_migration(): void {
+		$id = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		MigrationRegistry::complete_migration( $id );
+		$m = MigrationRegistry::get_migration( $id );
+		$this->assertSame( 'complete', $m->status );
+		$this->assertNotNull( $m->completed_at );
 	}
 
-	public function test_mark_stage_failed_sets_error(): void {
-		Checkpoint::initialize_stages();
-		Checkpoint::mark_stage_failed( 'wxr', 'OOM error' );
-		$wxr = Checkpoint::get_stage( 'wxr' );
-		$this->assertSame( 'failed', $wxr->status );
-		$this->assertSame( 'OOM error', $wxr->error_message );
+	public function test_create_site_job(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 4, 'example.com', 'https://example.com', 'https://example.com/wp-content/uploads/', '/example.com/' );
+		$this->assertGreaterThan( 0, $jid );
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 4, (int) $job->source_blog_id );
+		$this->assertSame( '/example.com/', $job->dest_path );
 	}
 
-	public function test_mark_stage_complete(): void {
-		Checkpoint::initialize_stages();
-		Checkpoint::mark_stage_complete( 'sql' );
-		$sql = Checkpoint::get_stage( 'sql' );
-		$this->assertSame( 'complete', $sql->status );
-	}
-
-	public function test_reset_all_clears_rows(): void {
-		Checkpoint::initialize_stages();
-		Checkpoint::reset_all();
-		$this->assertCount( 0, Checkpoint::get_all_stages() );
-	}
-
-	public function test_is_pipeline_complete(): void {
-		Checkpoint::initialize_stages();
-		$this->assertFalse( Checkpoint::is_pipeline_complete() );
-		foreach ( [ 'sql', 'wxr', 'media' ] as $s ) {
-			Checkpoint::mark_stage_complete( $s );
-		}
-		$this->assertTrue( Checkpoint::is_pipeline_complete() );
-	}
-
-	public function test_is_pipeline_failed(): void {
-		Checkpoint::initialize_stages();
-		$this->assertFalse( Checkpoint::is_pipeline_failed() );
-		Checkpoint::mark_stage_failed( 'sql', 'boom' );
-		$this->assertTrue( Checkpoint::is_pipeline_failed() );
-	}
-
-	public function test_insert_and_get_media_files(): void {
-		Checkpoint::insert_media_files( [
-			[ 'relative_path' => '2024/03/img.jpg', 'file_size' => 1024, 'partition' => 0 ],
-			[ 'relative_path' => '2024/04/vid.mp4', 'file_size' => 2048, 'partition' => 0 ],
-		] );
-		$this->assertSame( 2, Checkpoint::count_media_files() );
-		$files = Checkpoint::get_media_files( 0, 10 );
-		$this->assertSame( '2024/03/img.jpg', $files[0]->relative_path );
-	}
-
-	public function test_mark_media_file_copied(): void {
-		Checkpoint::insert_media_files( [
-			[ 'relative_path' => '2024/03/img.jpg', 'file_size' => 1024, 'partition' => 0 ],
-		] );
-		$files = Checkpoint::get_media_files( 0, 1 );
-		Checkpoint::mark_media_file_copied( (int) $files[0]->id );
-		$updated = Checkpoint::get_media_files( 0, 10 );
-		$this->assertSame( 'copied', $updated[0]->status );
+	public function test_all_sites_complete(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$j1  = MigrationRegistry::create_site_job( $mid, 4, 'example.com', 'https://example.com', '', '/example.com/' );
+		$j2  = MigrationRegistry::create_site_job( $mid, 7, 'news.example.com', 'https://news.example.com', '', '/news.example.com/' );
+		$this->assertFalse( MigrationRegistry::all_sites_complete( $mid ) );
+		MigrationRegistry::update_site_job( $j1, [ 'status' => 'complete' ] );
+		$this->assertFalse( MigrationRegistry::all_sites_complete( $mid ) );
+		MigrationRegistry::update_site_job( $j2, [ 'status' => 'complete' ] );
+		$this->assertTrue( MigrationRegistry::all_sites_complete( $mid ) );
 	}
 
 	public function test_schema_upgrade_updates_version(): void {
-		delete_option( 'hbm_db_version' );
+		delete_site_option( 'hbm_db_version' );
 		QueueTable::maybe_create_or_upgrade();
-		$this->assertSame( HBM_DB_VERSION, (int) get_option( 'hbm_db_version' ) );
+		$this->assertSame( HBM_DB_VERSION, (int) get_site_option( 'hbm_db_version' ) );
+	}
+}
+
+class Test_IdMap extends WP_UnitTestCase {
+
+	public function test_set_and_get(): void {
+		IdMap::set( 1, 'post', 100, 200 );
+		$this->assertSame( 200, IdMap::get( 1, 'post', 100 ) );
+	}
+
+	public function test_get_missing_returns_null(): void {
+		$this->assertNull( IdMap::get( 999, 'post', 999 ) );
+	}
+
+	public function test_network_user_mapping(): void {
+		IdMap::set( IdMap::NETWORK, 'user', 5, 12 );
+		$this->assertSame( 12, IdMap::get( IdMap::NETWORK, 'user', 5 ) );
+	}
+
+	public function test_upsert(): void {
+		IdMap::set( 10, 'post', 1, 100 );
+		IdMap::set( 10, 'post', 1, 200 );
+		$this->assertSame( 200, IdMap::get( 10, 'post', 1 ) );
+	}
+
+	public function test_delete_for_job(): void {
+		IdMap::set( 42, 'post', 1, 2 );
+		IdMap::delete_for_job( 42 );
+		$this->assertNull( IdMap::get( 42, 'post', 1 ) );
 	}
 }

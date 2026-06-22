@@ -9,41 +9,43 @@ class Plugin {
 	public static function get_instance(): Plugin {
 		if ( null === self::$instance ) {
 			self::$instance = new self();
-			self::$instance->init();
+			self::$instance->setup();
 		}
 		return self::$instance;
 	}
 
-	private function init(): void {
-		// Register AS action hooks on plugins_loaded so handlers are present
-		// before AS begins dispatching pending actions (avoids the action_scheduler_init
-		// timing gap where pending actions could fire without a registered callback).
+	private function setup(): void {
+		QueueTable::maybe_create_or_upgrade();
+		ApiAuth::get_or_create_key();
+
+		add_action( 'rest_api_init', [ $this, 'register_rest_routes' ] );
 		add_action( 'plugins_loaded', [ $this, 'register_action_hooks' ], 20 );
 
-		// REST endpoint must be registered on all requests (REST requests are not admin).
-		Admin\ProgressEndpoint::init();
-
-		// Admin-facing integrations.
 		if ( is_admin() ) {
 			Admin\AdminPage::init();
-			Admin\DownloadHandler::init();
 		}
 	}
 
-	public function register_action_hooks(): void {
-		add_action( 'hbm_export_sql_batch',   [ Exporters\SqlExporter::class, 'process_batch' ], 10, 3 );
-		add_action( 'hbm_export_wxr_batch',   [ Exporters\WxrExporter::class, 'process_batch' ], 10, 2 );
-		add_action( 'hbm_export_media_batch', [ Exporters\MediaExporter::class, 'process_batch' ], 10, 3 );
-		add_action( 'hbm_media_finalize',     [ Exporters\MediaExporter::class, 'finalize' ], 10, 1 );
+	public function register_rest_routes(): void {
+		Source\SourceEndpoints::register_routes();
+		Destination\MigrationReceiver::register_routes();
+		Admin\ProgressEndpoint::register_routes();
 	}
 
-	/** Runs on plugin activation. */
+	public function register_action_hooks(): void {
+		add_action( 'hbm_import_network_users', [ Destination\UserImporter::class, 'process' ], 10, 3 );
+		add_action( 'hbm_import_terms',         [ Destination\TermImporter::class, 'process' ], 10, 3 );
+		add_action( 'hbm_import_posts',         [ Destination\PostImporter::class, 'process' ], 10, 3 );
+		add_action( 'hbm_import_media',         [ Destination\MediaImporter::class, 'process' ], 10, 3 );
+		add_action( 'hbm_import_options',       [ Destination\OptionImporter::class, 'process' ], 10, 2 );
+		add_action( 'hbm_search_replace',       [ Destination\SearchReplace::class, 'process' ], 10, 2 );
+	}
+
 	public static function activate(): void {
 		QueueTable::maybe_create_or_upgrade();
-		ArtifactManager::create_export_directory();
+		ApiAuth::get_or_create_key();
 	}
 
-	/** Runs on plugin deactivation — preserves data for resume. */
 	public static function deactivate(): void {
 		if ( function_exists( 'as_unschedule_all_actions' ) ) {
 			as_unschedule_all_actions( '', [], 'hb-migrator' );

@@ -4,14 +4,24 @@
 	margin-bottom: 1rem;
 }
 
-/* Stage table */
-.hbm-stages {
+#hbm-wrap h2 {
+	margin-top: 2rem;
+}
+
+/* Site selection table */
+.hbm-site-table {
 	margin-top: 1rem;
 }
 
-.hbm-stages td,
-.hbm-stages th {
+.hbm-site-table td,
+.hbm-site-table th {
 	vertical-align: middle;
+}
+
+/* API key row */
+#hbm-api-key {
+	font-family: monospace;
+	font-size: 13px;
 }
 
 /* Status badges */
@@ -45,12 +55,17 @@
 	color: #721c24;
 }
 
+.hbm-status-archived {
+	background: #fff3cd;
+	color: #856404;
+}
+
 /* Progress bar */
 .hbm-progress-bar {
 	background: #e0e0e0;
 	border-radius: 3px;
 	height: 12px;
-	width: 200px;
+	width: 180px;
 	overflow: hidden;
 	display: inline-block;
 	vertical-align: middle;
@@ -71,12 +86,7 @@
 	vertical-align: middle;
 }
 
-/* Inline retry form */
-.hbm-inline-form {
-	display: inline;
-}
-
-/* Error message below failed stage row */
+/* Error message */
 .hbm-error-message {
 	color: #721c24;
 	font-size: 12px;
@@ -84,7 +94,7 @@
 	word-break: break-word;
 }
 
-/* Reset button */
-.hbm-reset-btn {
-	margin-top: 12px;
+/* Progress section */
+#hbm-progress-wrap {
+	margin-top: 1rem;
 }

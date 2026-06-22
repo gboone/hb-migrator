@@ -1,0 +1,117 @@
+<?php
+
+namespace HBMigrator;
+
+class MigrationRegistry {
+
+	// -----------------------------------------------------------------------
+	// Migrations
+	// -----------------------------------------------------------------------
+
+	public static function create_migration( string $source_url, string $source_api_key, ?string $email ): int {
+		global $wpdb;
+		$wpdb->insert(
+			$wpdb->base_prefix . 'hbm_migrations',
+			[
+				'source_url'        => $source_url,
+				'source_api_key'    => $source_api_key,
+				'status'            => 'pending',
+				'notification_email' => $email,
+			]
+		);
+		return (int) $wpdb->insert_id;
+	}
+
+	public static function get_migration( int $id ): ?object {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_migrations';
+		return $wpdb->get_row( $wpdb->prepare( "SELECT * FROM `$table` WHERE id = %d", $id ) );
+	}
+
+	public static function update_migration_status( int $id, string $status ): void {
+		global $wpdb;
+		$wpdb->update(
+			$wpdb->base_prefix . 'hbm_migrations',
+			[ 'status' => $status ],
+			[ 'id' => $id ]
+		);
+	}
+
+	public static function complete_migration( int $id ): void {
+		global $wpdb;
+		$wpdb->update(
+			$wpdb->base_prefix . 'hbm_migrations',
+			[
+				'status'       => 'complete',
+				'completed_at' => current_time( 'mysql', true ),
+			],
+			[ 'id' => $id ]
+		);
+	}
+
+	public static function list_migrations(): array {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_migrations';
+		return $wpdb->get_results( "SELECT * FROM `$table` ORDER BY id DESC" ) ?: [];
+	}
+
+	// -----------------------------------------------------------------------
+	// Site jobs
+	// -----------------------------------------------------------------------
+
+	public static function create_site_job(
+		int $migration_id,
+		int $source_blog_id,
+		string $source_domain,
+		string $source_siteurl,
+		string $source_upload_url,
+		string $dest_path
+	): int {
+		global $wpdb;
+		$wpdb->insert(
+			$wpdb->base_prefix . 'hbm_site_jobs',
+			[
+				'migration_id'      => $migration_id,
+				'source_blog_id'    => $source_blog_id,
+				'source_domain'     => $source_domain,
+				'source_siteurl'    => $source_siteurl,
+				'source_upload_url' => $source_upload_url,
+				'dest_path'         => $dest_path,
+				'status'            => 'pending',
+			]
+		);
+		return (int) $wpdb->insert_id;
+	}
+
+	public static function get_site_job( int $id ): ?object {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_site_jobs';
+		return $wpdb->get_row( $wpdb->prepare( "SELECT * FROM `$table` WHERE id = %d", $id ) );
+	}
+
+	public static function update_site_job( int $id, array $fields ): void {
+		global $wpdb;
+		$wpdb->update( $wpdb->base_prefix . 'hbm_site_jobs', $fields, [ 'id' => $id ] );
+	}
+
+	public static function get_site_jobs_for_migration( int $migration_id ): array {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_site_jobs';
+		return $wpdb->get_results(
+			$wpdb->prepare( "SELECT * FROM `$table` WHERE migration_id = %d ORDER BY id", $migration_id )
+		) ?: [];
+	}
+
+	public static function all_sites_complete( int $migration_id ): bool {
+		$jobs = self::get_site_jobs_for_migration( $migration_id );
+		if ( empty( $jobs ) ) {
+			return false;
+		}
+		foreach ( $jobs as $job ) {
+			if ( 'complete' !== $job->status ) {
+				return false;
+			}
+		}
+		return true;
+	}
+}
