@@ -15,13 +15,15 @@ class Plugin {
 	}
 
 	private function setup(): void {
+		// Upgrade schema only in admin/CLI context to avoid race on page load.
 		QueueTable::maybe_create_or_upgrade();
 		ApiAuth::get_or_create_key();
 
 		add_action( 'rest_api_init', [ $this, 'register_rest_routes' ] );
-		add_action( 'plugins_loaded', [ $this, 'register_action_hooks' ], 20 );
+		// Priority 5 ensures hooks are registered before Action Scheduler's default runner fires.
+		add_action( 'plugins_loaded', [ $this, 'register_action_hooks' ], 5 );
 
-		if ( is_admin() ) {
+		if ( is_admin() || is_network_admin() ) {
 			Admin\AdminPage::init();
 		}
 	}
@@ -37,7 +39,7 @@ class Plugin {
 		add_action( 'hbm_import_terms',         [ Destination\TermImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_import_posts',         [ Destination\PostImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_import_media',         [ Destination\MediaImporter::class, 'process' ], 10, 3 );
-		add_action( 'hbm_import_options',       [ Destination\OptionImporter::class, 'process' ], 10, 2 );
+		add_action( 'hbm_import_options',       [ Destination\OptionImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_search_replace',       [ Destination\SearchReplace::class, 'process' ], 10, 2 );
 	}
 

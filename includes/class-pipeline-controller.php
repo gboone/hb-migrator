@@ -28,7 +28,10 @@ class PipelineController {
 			self::MAX_RETRIES_CAP
 		);
 
-		if ( $attempt < $max_retries ) {
+		// Non-retryable source errors (e.g. 400, 401, 404) should not burn the retry budget.
+		$retryable = ! ( $e instanceof SourceClientException ) || $e->retryable;
+
+		if ( $retryable && $attempt < $max_retries ) {
 			$delay         = self::BASE_DELAY * (int) pow( 2, $attempt );
 			$args['attempt'] = $attempt + 1;
 			as_schedule_single_action( time() + $delay, $action, $args, 'hb-migrator' );

@@ -2,6 +2,8 @@
 
 namespace HBMigrator\Source;
 
+use HBMigrator\ApiAuth;
+
 class SiteIndex {
 
 	public static function get_sites( \WP_REST_Request $request ): \WP_REST_Response {
@@ -30,7 +32,14 @@ class SiteIndex {
 		if ( ! $active || empty( $active['migration_id'] ) ) {
 			return new \WP_REST_Response( [ 'error' => 'No active migration' ], 404 );
 		}
-		$url      = trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/status/' . (int) $active['migration_id'];
+
+		// Pass the status_token so the destination IDOR check passes.
+		$status_token = $active['status_token'] ?? '';
+		$url = add_query_arg(
+			[ 'status_token' => $status_token ],
+			trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/status/' . (int) $active['migration_id']
+		);
+
 		$response = wp_remote_get( $url, [
 			'headers'   => [ 'Authorization' => 'Bearer ' . $active['dest_key'] ],
 			'timeout'   => 15,
@@ -40,6 +49,9 @@ class SiteIndex {
 			return new \WP_REST_Response( [ 'error' => $response->get_error_message() ], 502 );
 		}
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		if ( ! is_array( $body ) ) {
+			return new \WP_REST_Response( [ 'error' => 'Unexpected response from destination.' ], 502 );
+		}
 		return new \WP_REST_Response( $body, wp_remote_retrieve_response_code( $response ) );
 	}
 }

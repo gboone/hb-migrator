@@ -7,6 +7,10 @@ use HBMigrator\PipelineController;
 
 class SearchReplace {
 
+	// Authoritative skip list for options. Matches OptionReader::SKIP so both
+	// sides exclude the same names (source never sends them; destination never replaces them).
+	private const SKIP_OPTION_NAMES = [ 'siteurl', 'home' ];
+
 	public static function process( int $site_job_id, int $attempt ): void {
 		try {
 			$job = MigrationRegistry::get_site_job( $site_job_id );
@@ -39,11 +43,12 @@ class SearchReplace {
 				'current_stage' => null,
 			] );
 
-			// Check if all sites in this migration are complete.
+			// Atomic completion: only the winner sends the notification.
 			$migration_id = (int) $job->migration_id;
 			if ( MigrationRegistry::all_sites_complete( $migration_id ) ) {
-				MigrationRegistry::complete_migration( $migration_id );
-				self::maybe_send_notification( $migration_id );
+				if ( MigrationRegistry::complete_migration( $migration_id ) ) {
+					self::maybe_send_notification( $migration_id );
+				}
 			}
 
 		} catch ( \Throwable $e ) {
@@ -64,7 +69,6 @@ class SearchReplace {
 
 		switch_to_blog( $blog_id );
 
-		// posts: post_content, post_excerpt, post_title, guid
 		$tables = [
 			$wpdb->posts    => [ 'post_content', 'post_excerpt', 'post_title', 'guid' ],
 			$wpdb->postmeta => [ 'meta_value' ],
@@ -73,9 +77,8 @@ class SearchReplace {
 
 		foreach ( $tables as $table => $columns ) {
 			foreach ( $columns as $col ) {
-				// Skip siteurl and home in options — already correct.
-				if ( 'option_value' === $col ) {
-					self::replace_in_options( $table, $col, $replacements );
+				if ( $wpdb->options === $table && 'option_value' === $col ) {
+					self::replace_in_options( $table, $replacements );
 					continue;
 				}
 				self::replace_in_column( $table, $col, $replacements );
@@ -88,16 +91,17 @@ class SearchReplace {
 	private static function replace_in_column( string $table, string $col, array $replacements ): void {
 		global $wpdb;
 
-		$offset = 0;
-		$batch  = 200;
+		// Determine the primary key column name.
+		$pk_col  = false !== strpos( $table, 'postmeta' ) ? 'meta_id' : 'ID';
+		$last_pk = 0;
+		$batch   = 200;
 
 		while ( true ) {
-			$pk_col = 'option_value' === $col ? 'option_id' : ( false !== strpos( $table, 'postmeta' ) ? 'meta_id' : 'ID' );
-
+			// Keyset pagination — stable under concurrent writes, O(n) instead of O(n²).
 			$rows = $wpdb->get_results( $wpdb->prepare(
-				"SELECT $pk_col AS pk, `$col` AS val FROM `$table` LIMIT %d OFFSET %d",
-				$batch,
-				$offset
+				"SELECT {$pk_col} AS pk, `{$col}` AS val FROM `{$table}` WHERE {$pk_col} > %d ORDER BY {$pk_col} ASC LIMIT %d",
+				$last_pk,
+				$batch
 			), ARRAY_A );
 
 			if ( empty( $rows ) ) {
@@ -110,26 +114,26 @@ class SearchReplace {
 				if ( $replaced !== $original ) {
 					$wpdb->update( $table, [ $col => $replaced ], [ $pk_col => $row['pk'] ] );
 				}
+				$last_pk = (int) $row['pk'];
 			}
-
-			$offset += $batch;
 		}
 	}
 
-	private static function replace_in_options( string $table, string $col, array $replacements ): void {
+	private static function replace_in_options( string $table, array $replacements ): void {
 		global $wpdb;
 
-		$skip_names = [ 'siteurl', 'home' ];
-		$offset     = 0;
-		$batch      = 200;
+		$last_pk = 0;
+		$batch   = 200;
 
 		while ( true ) {
 			$rows = $wpdb->get_results( $wpdb->prepare(
-				"SELECT option_id AS pk, option_name, option_value AS val FROM `$table`
-				  WHERE option_name NOT IN ('siteurl','home')
-				  LIMIT %d OFFSET %d",
-				$batch,
-				$offset
+				"SELECT option_id AS pk, option_name, option_value AS val FROM `{$table}`
+				  WHERE option_id > %d
+				    AND option_name NOT IN ('siteurl','home')
+				  ORDER BY option_id ASC
+				  LIMIT %d",
+				$last_pk,
+				$batch
 			), ARRAY_A );
 
 			if ( empty( $rows ) ) {
@@ -137,7 +141,8 @@ class SearchReplace {
 			}
 
 			foreach ( $rows as $row ) {
-				if ( in_array( $row['option_name'], $skip_names, true ) ) {
+				if ( in_array( $row['option_name'], self::SKIP_OPTION_NAMES, true ) ) {
+					$last_pk = (int) $row['pk'];
 					continue;
 				}
 				$original = $row['val'];
@@ -145,14 +150,13 @@ class SearchReplace {
 				if ( $replaced !== $original ) {
 					$wpdb->update( $table, [ 'option_value' => $replaced ], [ 'option_id' => $row['pk'] ] );
 				}
+				$last_pk = (int) $row['pk'];
 			}
-
-			$offset += $batch;
 		}
 	}
 
 	/**
-	 * Serialization-aware string replacement.
+	 * Serialization-aware, binary-safe string replacement.
 	 *
 	 * @param mixed  $value        The value to search within.
 	 * @param array  $replacements Map of old => new strings.
@@ -169,6 +173,11 @@ class SearchReplace {
 		}
 
 		if ( ! is_string( $value ) ) {
+			return $value;
+		}
+
+		// Skip binary data — str_replace on non-UTF-8 bytes corrupts EXIF/binary meta.
+		if ( ! mb_check_encoding( $value, 'UTF-8' ) ) {
 			return $value;
 		}
 

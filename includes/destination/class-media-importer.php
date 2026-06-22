@@ -30,6 +30,9 @@ class MediaImporter {
 				[ 'per_page' => 50, 'offset' => $offset ]
 			);
 
+			// Allowed download origin: the source site's upload URL (prevents SSRF via crafted file_url).
+			$allowed_upload_origin = wp_parse_url( rtrim( $job->source_upload_url, '/' ), PHP_URL_HOST );
+
 			switch_to_blog( (int) $job->dest_blog_id );
 
 			require_once ABSPATH . 'wp-admin/includes/media.php';
@@ -37,14 +40,26 @@ class MediaImporter {
 			require_once ABSPATH . 'wp-admin/includes/image.php';
 
 			foreach ( $media as $att ) {
+				$source_att_id = (int) ( $att['source_attachment_id'] ?? 0 );
+
+				// Skip if already imported (idempotency on retry).
+				if ( $source_att_id && IdMap::get( $site_job_id, 'attachment', $source_att_id ) ) {
+					continue;
+				}
+
 				$file_url = $att['file_url'] ?? '';
 				if ( ! $file_url ) {
 					continue;
 				}
 
+				// Validate file_url origin against the source's upload directory to prevent SSRF.
+				$file_host = wp_parse_url( $file_url, PHP_URL_HOST );
+				if ( ! $allowed_upload_origin || $file_host !== $allowed_upload_origin ) {
+					continue;
+				}
+
 				$tmp = download_url( $file_url, 60 );
 				if ( is_wp_error( $tmp ) ) {
-					// Skip files that can't be fetched — log and continue.
 					continue;
 				}
 
@@ -55,7 +70,7 @@ class MediaImporter {
 
 				$sideload = wp_handle_sideload( $file_array, [ 'test_form' => false ] );
 				if ( isset( $sideload['error'] ) ) {
-					@unlink( $tmp );
+					@unlink( $tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 					continue;
 				}
 
@@ -77,7 +92,7 @@ class MediaImporter {
 
 				$dest_att_id = wp_insert_attachment( $attachment_data, $sideload['file'], $post_parent, true );
 				if ( is_wp_error( $dest_att_id ) ) {
-					@unlink( $sideload['file'] );
+					@unlink( $sideload['file'] ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 					continue;
 				}
 
@@ -88,7 +103,9 @@ class MediaImporter {
 					update_post_meta( $dest_att_id, '_wp_attachment_image_alt', $att['alt_text'] );
 				}
 
-				IdMap::set( $site_job_id, 'attachment', (int) $att['source_attachment_id'], $dest_att_id );
+				if ( $source_att_id ) {
+					IdMap::set( $site_job_id, 'attachment', $source_att_id, $dest_att_id );
+				}
 			}
 
 			restore_current_blog();
@@ -107,7 +124,7 @@ class MediaImporter {
 			// Media done — import options.
 			as_enqueue_async_action(
 				'hbm_import_options',
-				[ 'site_job_id' => $site_job_id, 'attempt' => 0 ],
+				[ 'site_job_id' => $site_job_id, 'offset' => 0, 'attempt' => 0 ],
 				'hb-migrator'
 			);
 

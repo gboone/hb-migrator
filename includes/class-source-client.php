@@ -2,6 +2,16 @@
 
 namespace HBMigrator;
 
+class SourceClientException extends \RuntimeException {
+	public function __construct(
+		string $message,
+		public readonly int $http_status = 0,
+		public readonly bool $retryable = true
+	) {
+		parent::__construct( $message );
+	}
+}
+
 class SourceClient {
 
 	public static function get( string $source_url, string $api_key, string $path, array $params = [] ): array {
@@ -15,15 +25,16 @@ class SourceClient {
 			'sslverify' => true,
 		] );
 		if ( is_wp_error( $response ) ) {
-			throw new \RuntimeException( 'Source request failed: ' . $response->get_error_message() );
+			throw new SourceClientException( 'Source request failed: ' . $response->get_error_message(), 0, true );
 		}
-		$code = wp_remote_retrieve_response_code( $response );
+		$code = (int) wp_remote_retrieve_response_code( $response );
 		if ( 200 !== $code ) {
-			throw new \RuntimeException( "Source returned HTTP $code for $path" );
+			$retryable = $code >= 500 || 429 === $code;
+			throw new SourceClientException( "Source returned HTTP {$code} for {$path}", $code, $retryable );
 		}
 		$body = json_decode( wp_remote_retrieve_body( $response ), true );
 		if ( ! is_array( $body ) ) {
-			throw new \RuntimeException( "Source returned non-JSON for $path" );
+			throw new SourceClientException( "Source returned non-JSON for {$path}", 200, false );
 		}
 		return $body;
 	}

@@ -11,35 +11,22 @@ class IdMap {
 		global $wpdb;
 		$table = $wpdb->base_prefix . 'hbm_id_map';
 
-		// Upsert: replace if exists to handle re-runs.
-		$existing = $wpdb->get_var( $wpdb->prepare(
-			"SELECT id FROM `$table` WHERE site_job_id = %d AND object_type = %s AND source_id = %d",
+		$wpdb->query( $wpdb->prepare(
+			"INSERT INTO `{$table}` (site_job_id, object_type, source_id, dest_id)
+			 VALUES (%d, %s, %d, %d)
+			 ON DUPLICATE KEY UPDATE dest_id = VALUES(dest_id)",
 			$site_job_id,
 			$type,
-			$source_id
+			$source_id,
+			$dest_id
 		) );
-
-		if ( $existing ) {
-			$wpdb->update(
-				$table,
-				[ 'dest_id' => $dest_id ],
-				[ 'id' => (int) $existing ]
-			);
-		} else {
-			$wpdb->insert( $table, [
-				'site_job_id' => $site_job_id,
-				'object_type' => $type,
-				'source_id'   => $source_id,
-				'dest_id'     => $dest_id,
-			] );
-		}
 	}
 
 	public static function get( int $site_job_id, string $type, int $source_id ): ?int {
 		global $wpdb;
 		$table = $wpdb->base_prefix . 'hbm_id_map';
 		$val   = $wpdb->get_var( $wpdb->prepare(
-			"SELECT dest_id FROM `$table` WHERE site_job_id = %d AND object_type = %s AND source_id = %d",
+			"SELECT dest_id FROM `{$table}` WHERE site_job_id = %d AND object_type = %s AND source_id = %d",
 			$site_job_id,
 			$type,
 			$source_id

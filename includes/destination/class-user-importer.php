@@ -6,13 +6,12 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\UserSiteRoles;
 
 class UserImporter {
 
 	public static function process( int $migration_id, int $offset, int $attempt ): void {
 		try {
-			global $wpdb;
-
 			$migration = MigrationRegistry::get_migration( $migration_id );
 			if ( ! $migration ) {
 				return;
@@ -48,26 +47,20 @@ class UserImporter {
 					if ( is_wp_error( $dest_user_id ) ) {
 						continue;
 					}
-
-					// Restore the original password hash directly — avoids double-hashing.
-					$wpdb->update(
-						$wpdb->users,
-						[ 'user_pass' => $u['user_pass'] ],
-						[ 'ID' => $dest_user_id ]
-					);
-					clean_user_cache( $dest_user_id );
 				}
 
-				// Map source user ID → dest user ID at network level (site_job_id = 0).
 				IdMap::set( IdMap::NETWORK, 'user', (int) $u['source_user_id'], $dest_user_id );
-				// Blog role assignment happens in TermImporter after each subsite is created,
-				// since dest_blog_id is NULL until that point.
+
+				// Store per-site roles so TermImporter can assign them after subsite creation
+				// without making additional HTTP requests.
+				foreach ( $u['site_roles'] as $sr ) {
+					UserSiteRoles::store( $migration_id, (int) $u['source_user_id'], (int) $sr['blog_id'], $sr['role'] );
+				}
 			}
 
 			wp_suspend_cache_invalidation( false );
 
 			if ( count( $users ) >= 100 ) {
-				// More pages to process.
 				as_enqueue_async_action(
 					'hbm_import_network_users',
 					[ 'migration_id' => $migration_id, 'offset' => $offset + 100, 'attempt' => 0 ],
@@ -88,11 +81,20 @@ class UserImporter {
 
 		} catch ( \Throwable $e ) {
 			wp_suspend_cache_invalidation( false );
-			PipelineController::handle_batch_failure(
-				'hbm_import_network_users',
-				[ 'migration_id' => $migration_id, 'offset' => $offset, 'attempt' => $attempt ],
-				$e
-			);
+
+			// UserImporter is network-level; on retry exhaustion, fail the whole migration.
+			$max = (int) apply_filters( 'hbm_max_retries', 3 );
+			if ( $attempt < $max ) {
+				$delay = 60 * ( 2 ** $attempt );
+				as_schedule_single_action(
+					time() + $delay,
+					'hbm_import_network_users',
+					[ 'migration_id' => $migration_id, 'offset' => $offset, 'attempt' => $attempt + 1 ],
+					'hb-migrator'
+				);
+			} else {
+				MigrationRegistry::fail_migration( $migration_id, $e->getMessage() );
+			}
 		}
 	}
 

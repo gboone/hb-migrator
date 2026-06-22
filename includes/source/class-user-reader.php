@@ -39,7 +39,6 @@ class UserReader {
 			$data[] = [
 				'user_login'      => $user->user_login,
 				'user_email'      => $user->user_email,
-				'user_pass'       => $user->user_pass,
 				'display_name'    => $user->display_name,
 				'user_registered' => $user->user_registered,
 				'user_url'        => $user->user_url,

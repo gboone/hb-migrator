@@ -83,9 +83,14 @@ class PostImporter {
 
 				IdMap::set( $site_job_id, 'post', $source_id, (int) $dest_id );
 
-				// Insert meta.
+				// Insert meta. Use safe unserialize (no class instantiation) to guard
+				// against PHP object injection from a compromised source.
 				foreach ( $p['meta'] as $meta ) {
-					update_post_meta( $dest_id, $meta['key'], maybe_unserialize( $meta['value'] ) );
+					$raw = $meta['value'];
+					$val = is_serialized( $raw )
+						? unserialize( $raw, [ 'allowed_classes' => false ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
+						: $raw;
+					update_post_meta( $dest_id, $meta['key'], $val );
 				}
 
 				// Set terms by slug.
