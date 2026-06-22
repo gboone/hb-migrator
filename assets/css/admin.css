@@ -1,0 +1,90 @@
+/* HB Migrator admin styles */
+
+#hbm-wrap h1 {
+	margin-bottom: 1rem;
+}
+
+/* Stage table */
+.hbm-stages {
+	margin-top: 1rem;
+}
+
+.hbm-stages td,
+.hbm-stages th {
+	vertical-align: middle;
+}
+
+/* Status badges */
+.hbm-status {
+	display: inline-block;
+	padding: 2px 8px;
+	border-radius: 3px;
+	font-size: 12px;
+	font-weight: 600;
+	text-transform: uppercase;
+	letter-spacing: 0.04em;
+}
+
+.hbm-status-pending {
+	background: #f0f0f0;
+	color: #555;
+}
+
+.hbm-status-running {
+	background: #d7e8f7;
+	color: #0073aa;
+}
+
+.hbm-status-complete {
+	background: #d4edda;
+	color: #155724;
+}
+
+.hbm-status-failed {
+	background: #f8d7da;
+	color: #721c24;
+}
+
+/* Progress bar */
+.hbm-progress-bar {
+	background: #e0e0e0;
+	border-radius: 3px;
+	height: 12px;
+	width: 200px;
+	overflow: hidden;
+	display: inline-block;
+	vertical-align: middle;
+}
+
+.hbm-progress-fill {
+	background: #0073aa;
+	height: 100%;
+	border-radius: 3px;
+	transition: width 0.3s ease;
+}
+
+.hbm-progress-label {
+	display: inline-block;
+	margin-left: 8px;
+	font-size: 12px;
+	color: #555;
+	vertical-align: middle;
+}
+
+/* Inline retry form */
+.hbm-inline-form {
+	display: inline;
+}
+
+/* Error message below failed stage row */
+.hbm-error-message {
+	color: #721c24;
+	font-size: 12px;
+	margin: 4px 0 0;
+	word-break: break-word;
+}
+
+/* Reset button */
+.hbm-reset-btn {
+	margin-top: 12px;
+}
