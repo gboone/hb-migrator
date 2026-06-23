@@ -117,6 +117,9 @@ class PostImporter {
 					}
 				}
 
+				// Preserve comment_count — wp_insert_post ignores this field.
+				$wpdb->update( $wpdb->posts, [ 'comment_count' => (int) ( $p['comment_count'] ?? 0 ) ], [ 'ID' => $dest_id ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+
 				// Set terms by slug.
 				$terms_by_tax = [];
 				foreach ( $p['terms'] as $t ) {

@@ -31,11 +31,50 @@ class Test_MigrationRegistry extends WP_UnitTestCase {
 	}
 
 	public function test_complete_migration(): void {
-		$id = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
-		MigrationRegistry::complete_migration( $id );
+		$id  = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $id, 1, 'example.com', 'https://example.com', '', '/example.com/' );
+		MigrationRegistry::update_migration_status( $id, 'running' );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete' ] );
+		$this->assertTrue( MigrationRegistry::complete_migration( $id ) );
 		$m = MigrationRegistry::get_migration( $id );
 		$this->assertSame( 'complete', $m->status );
 		$this->assertNotNull( $m->completed_at );
+	}
+
+	public function test_complete_migration_requires_running_status(): void {
+		// Migration in 'pending' state should not be completed — it was never started.
+		$id  = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $id, 1, 'example.com', 'https://example.com', '', '/example.com/' );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete' ] );
+		$this->assertFalse( MigrationRegistry::complete_migration( $id ) );
+		$this->assertSame( 'pending', MigrationRegistry::get_migration( $id )->status );
+	}
+
+	public function test_complete_migration_blocked_when_job_incomplete(): void {
+		$id  = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $id, 1, 'example.com', 'https://example.com', '', '/example.com/' );
+		MigrationRegistry::update_migration_status( $id, 'running' );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => 'running' ] );
+		$this->assertFalse( MigrationRegistry::complete_migration( $id ) );
+		$this->assertSame( 'running', MigrationRegistry::get_migration( $id )->status );
+	}
+
+	public function test_complete_migration_clears_source_api_key(): void {
+		$id  = MigrationRegistry::create_migration( 'https://source.example.com', 'supersecretkey', null );
+		$jid = MigrationRegistry::create_site_job( $id, 1, 'example.com', 'https://example.com', '', '/example.com/' );
+		MigrationRegistry::update_migration_status( $id, 'running' );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete' ] );
+		MigrationRegistry::complete_migration( $id );
+		$this->assertSame( '', MigrationRegistry::get_migration( $id )->source_api_key );
+	}
+
+	public function test_complete_migration_is_idempotent(): void {
+		$id  = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $id, 1, 'example.com', 'https://example.com', '', '/example.com/' );
+		MigrationRegistry::update_migration_status( $id, 'running' );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete' ] );
+		$this->assertTrue( MigrationRegistry::complete_migration( $id ) );
+		$this->assertFalse( MigrationRegistry::complete_migration( $id ) );
 	}
 
 	public function test_create_site_job(): void {

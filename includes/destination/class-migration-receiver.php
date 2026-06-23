@@ -60,13 +60,15 @@ class MigrationReceiver {
 			$all_pending = ! empty( $jobs ) && count( $jobs ) === count(
 				array_filter( $jobs, fn( $j ) => 'pending' === $j->status )
 			);
-			if ( $all_pending ) {
+			$restarted = false;
+		if ( $all_pending ) {
 				// AS wasn't installed when the migration was first triggered. Re-enqueue the kickoff.
 				as_enqueue_async_action(
 					'hbm_import_network_users',
 					[ 'migration_id' => (int) $existing->id, 'offset' => 0, 'attempt' => 0 ],
 					'hb-migrator'
 				);
+				$restarted = true;
 			} else {
 				// Restart failed jobs from their last checkpoint, and restart orphaned
 				// pending jobs (mixed-status batch where their AS action was dropped).
@@ -102,6 +104,7 @@ class MigrationReceiver {
 							// Null or unknown stage (pending job never started) — restart from terms.
 							as_enqueue_async_action( 'hbm_import_terms', [ 'site_job_id' => (int) $job->id, 'offset' => 0, 'attempt' => 0 ], 'hb-migrator' );
 					}
+					$restarted = true;
 				}
 			}
 
@@ -118,6 +121,7 @@ class MigrationReceiver {
 				'migration_id' => (int) $existing->id,
 				'status'       => $existing->status,
 				'status_token' => $status_token,
+				'restarted'    => $restarted,
 			], 200 );
 		}
 

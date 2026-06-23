@@ -52,6 +52,14 @@ class SiteIndex {
 		if ( ! is_array( $body ) ) {
 			return new \WP_REST_Response( [ 'error' => 'Unexpected response from destination.' ], 502 );
 		}
+
+		// Strip the Bearer token from sitemeta once the migration is done — it is no
+		// longer needed for polling and should not persist on disk indefinitely.
+		if ( 'complete' === ( $body['status'] ?? '' ) ) {
+			$active['dest_key'] = '';
+			update_site_option( 'hbm_active_migration', $active );
+		}
+
 		return new \WP_REST_Response( $body, wp_remote_retrieve_response_code( $response ) );
 	}
 }
