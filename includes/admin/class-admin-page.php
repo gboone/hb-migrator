@@ -10,6 +10,7 @@ class AdminPage {
 	public static function init(): void {
 		add_action( 'network_admin_menu', [ self::class, 'register_page' ] );
 		add_action( 'network_admin_enqueue_scripts', [ self::class, 'enqueue_assets' ] );
+		add_action( 'admin_enqueue_scripts',         [ self::class, 'enqueue_assets' ] );
 		add_action( 'admin_post_hbm_save_config', [ self::class, 'handle_save_config' ] );
 		add_action( 'admin_post_hbm_start_migration', [ self::class, 'handle_start_migration' ] );
 		add_action( 'admin_post_hbm_clear_migration', [ self::class, 'handle_clear_migration' ] );
@@ -27,7 +28,8 @@ class AdminPage {
 	}
 
 	public static function enqueue_assets( string $hook ): void {
-		if ( 'settings_page_hb-migrator' !== $hook ) {
+		$screen = get_current_screen();
+		if ( ! $screen || false === strpos( $screen->id, 'hb-migrator' ) ) {
 			return;
 		}
 		wp_enqueue_style( 'hb-migrator-admin', HBM_PLUGIN_URL . 'assets/css/admin.css', [], HBM_VERSION );
