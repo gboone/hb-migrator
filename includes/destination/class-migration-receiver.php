@@ -142,11 +142,12 @@ class MigrationReceiver {
 			return new \WP_REST_Response( [ 'error' => 'None of the provided site_ids were found on the source.' ], 422 );
 		}
 
-		$migration_id = MigrationRegistry::create_migration( $source_url, $source_api_key, $email ?: null );
+		$migration_id   = MigrationRegistry::create_migration( $source_url, $source_api_key, $email ?: null );
+		$network_domain = get_network()->domain ?? '';
 
 		foreach ( $valid_ids as $blog_id ) {
 			$s         = $sites_by_id[ $blog_id ];
-			$dest_path = MultisiteHandler::dest_path_for_siteurl( $s['siteurl'] );
+			$dest_path = MultisiteHandler::dest_path_for_siteurl( $s['siteurl'], $network_domain );
 
 			MigrationRegistry::create_site_job(
 				$migration_id,
