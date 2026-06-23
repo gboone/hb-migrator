@@ -17,6 +17,13 @@ class UserImporter {
 				return;
 			}
 
+			// On a fresh start (or restart), clear any role rows from a prior run before
+			// re-inserting. Mid-batch retries (offset > 0) skip this so already-stored
+			// roles from earlier batches are preserved.
+			if ( 0 === $offset ) {
+				UserSiteRoles::delete_for_migration( $migration_id );
+			}
+
 			$users = SourceClient::get(
 				$migration->source_url,
 				$migration->source_api_key,
