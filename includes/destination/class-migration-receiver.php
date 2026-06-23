@@ -44,27 +44,80 @@ class MigrationReceiver {
 			return new \WP_REST_Response( [ 'error' => 'source_url must use https and must not point to a private network address.' ], 400 );
 		}
 
-		// Idempotency: return existing running/pending migration for the same source.
+		// Soft mutex: prevents parallel POST /destination/begin calls from both passing
+		// the idempotency check and creating duplicate migrations. Not perfectly atomic
+		// (set_transient is not CAS), but reduces the race window to near-zero in practice.
+		$lock_key = 'hbm_begin_' . md5( $source_url );
+		if ( get_transient( $lock_key ) ) {
+			return new \WP_REST_Response( [ 'error' => 'Migration start already in progress for this source. Retry in a moment.' ], 429 );
+		}
+		set_transient( $lock_key, 1, 10 );
+
+		// Idempotency: return existing running/pending/failed migration for the same source.
 		$existing = MigrationRegistry::find_active_migration_for_source( $source_url );
 		if ( $existing ) {
-			// If every site job is still pending, the initial AS action was never queued
-			// (e.g. AS wasn't installed when the migration was first triggered). Re-enqueue.
 			$jobs       = MigrationRegistry::get_site_jobs_for_migration( (int) $existing->id );
 			$all_pending = ! empty( $jobs ) && count( $jobs ) === count(
 				array_filter( $jobs, fn( $j ) => 'pending' === $j->status )
 			);
 			if ( $all_pending ) {
+				// AS wasn't installed when the migration was first triggered. Re-enqueue the kickoff.
 				as_enqueue_async_action(
 					'hbm_import_network_users',
 					[ 'migration_id' => (int) $existing->id, 'offset' => 0, 'attempt' => 0 ],
 					'hb-migrator'
 				);
+			} else {
+				// Restart failed jobs from their last checkpoint, and restart orphaned
+				// pending jobs (mixed-status batch where their AS action was dropped).
+				// Status is NOT set to 'running' here; each importer sets it when it fires.
+				foreach ( $jobs as $job ) {
+					$restartable = in_array( $job->status, [ 'failed', 'pending' ], true );
+					if ( ! $restartable || 'complete' === $job->status ) {
+						continue;
+					}
+
+					if ( 'failed' === $job->status ) {
+						MigrationRegistry::update_site_job( (int) $job->id, [ 'error_message' => null ] );
+					}
+
+					$offset = (int) $job->stage_offset;
+					switch ( $job->current_stage ) {
+						case 'posts':
+							as_enqueue_async_action( 'hbm_import_posts', [ 'site_job_id' => (int) $job->id, 'last_id' => $offset, 'attempt' => 0 ], 'hb-migrator' );
+							break;
+						case 'media':
+							as_enqueue_async_action( 'hbm_import_media', [ 'site_job_id' => (int) $job->id, 'offset' => $offset, 'attempt' => 0 ], 'hb-migrator' );
+							break;
+						case 'options':
+							as_enqueue_async_action( 'hbm_import_options', [ 'site_job_id' => (int) $job->id, 'offset' => $offset, 'attempt' => 0 ], 'hb-migrator' );
+							break;
+						case 'search_replace':
+							as_enqueue_async_action( 'hbm_search_replace', [ 'site_job_id' => (int) $job->id, 'attempt' => 0 ], 'hb-migrator' );
+							break;
+						case 'terms':
+							as_enqueue_async_action( 'hbm_import_terms', [ 'site_job_id' => (int) $job->id, 'offset' => $offset, 'attempt' => 0 ], 'hb-migrator' );
+							break;
+						default:
+							// Null or unknown stage (pending job never started) — restart from terms.
+							as_enqueue_async_action( 'hbm_import_terms', [ 'site_job_id' => (int) $job->id, 'offset' => 0, 'attempt' => 0 ], 'hb-migrator' );
+					}
+				}
 			}
 
+			// Backfill status_token for rows created before the column existed.
+			// A null token causes the admin.js poll loop to receive 403 on every request.
+			$status_token = $existing->status_token;
+			if ( empty( $status_token ) ) {
+				$status_token = bin2hex( random_bytes( 16 ) );
+				MigrationRegistry::update_migration( (int) $existing->id, [ 'status_token' => $status_token ] );
+			}
+
+			delete_transient( $lock_key );
 			return new \WP_REST_Response( [
 				'migration_id' => (int) $existing->id,
 				'status'       => $existing->status,
-				'status_token' => $existing->status_token,
+				'status_token' => $status_token,
 			], 200 );
 		}
 
@@ -111,6 +164,7 @@ class MigrationReceiver {
 
 		$migration = MigrationRegistry::get_migration( $migration_id );
 
+		delete_transient( $lock_key );
 		return new \WP_REST_Response( [
 			'migration_id' => $migration_id,
 			'status'       => 'queued',

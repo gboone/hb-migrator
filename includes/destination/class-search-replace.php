@@ -18,7 +18,7 @@ class SearchReplace {
 				return;
 			}
 
-			MigrationRegistry::update_site_job( $site_job_id, [ 'current_stage' => 'search_replace' ] );
+			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'search_replace', 'error_message' => null ] );
 
 			switch_to_blog( (int) $job->dest_blog_id );
 
@@ -29,10 +29,11 @@ class SearchReplace {
 
 			restore_current_blog();
 
+			// Filter on the KEY (source URL) — replacing an empty source string would corrupt all content.
 			$replacements = array_filter( [
 				$source_siteurl => rtrim( $dest_siteurl, '/' ),
 				$source_upload  => rtrim( $dest_upload_url, '/' ),
-			], fn( $old ) => ! empty( $old ) );
+			], fn( $key ) => ! empty( $key ), ARRAY_FILTER_USE_KEY );
 
 			if ( ! empty( $replacements ) ) {
 				self::run_on_site( (int) $job->dest_blog_id, $replacements );
@@ -182,7 +183,9 @@ class SearchReplace {
 		}
 
 		if ( is_serialized( $value ) ) {
-			$data = @unserialize( $value ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+			// Use allowed_classes:false to prevent object instantiation (PHP object injection).
+			// Incomplete-class objects round-trip correctly through serialize/unserialize.
+			$data = unserialize( $value, [ 'allowed_classes' => false ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
 			if ( false !== $data || 'b:0;' === $value ) {
 				$replaced = self::safe_replace( $data, $replacements );
 				return serialize( $replaced );

@@ -110,7 +110,9 @@ class TermImporter {
 			);
 
 		} catch ( \Throwable $e ) {
-			restore_current_blog();
+			if ( isset( $job ) && $job ) {
+				restore_current_blog();
+			}
 			PipelineController::handle_batch_failure(
 				'hbm_import_terms',
 				[ 'site_job_id' => $site_job_id, 'offset' => $offset, 'attempt' => $attempt ],

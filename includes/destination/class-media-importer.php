@@ -21,7 +21,7 @@ class MediaImporter {
 				return;
 			}
 
-			MigrationRegistry::update_site_job( $site_job_id, [ 'current_stage' => 'media' ] );
+			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'media', 'error_message' => null ] );
 
 			$media = SourceClient::get(
 				$migration->source_url,

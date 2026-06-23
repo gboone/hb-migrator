@@ -32,10 +32,17 @@ class MigrationRegistry {
 	public static function find_active_migration_for_source( string $source_url ): ?object {
 		global $wpdb;
 		$table = $wpdb->base_prefix . 'hbm_migrations';
+		// Include 'failed' so begin() can restart a failed migration rather than
+		// silently creating a second one that duplicates all content.
 		return $wpdb->get_row( $wpdb->prepare(
-			"SELECT * FROM `{$table}` WHERE source_url = %s AND status IN ('pending', 'running') ORDER BY id DESC LIMIT 1",
+			"SELECT * FROM `{$table}` WHERE source_url = %s AND status IN ('pending', 'running', 'failed') ORDER BY id DESC LIMIT 1",
 			$source_url
 		) );
+	}
+
+	public static function update_migration( int $id, array $fields ): void {
+		global $wpdb;
+		$wpdb->update( $wpdb->base_prefix . 'hbm_migrations', $fields, [ 'id' => $id ] );
 	}
 
 	public static function update_migration_status( int $id, string $status ): void {
@@ -63,8 +70,9 @@ class MigrationRegistry {
 	public static function complete_migration( int $id ): bool {
 		global $wpdb;
 		$table  = $wpdb->base_prefix . 'hbm_migrations';
+		// Zero out source_api_key on completion — it's only needed while jobs are running.
 		$result = $wpdb->query( $wpdb->prepare(
-			"UPDATE `{$table}` SET status = 'complete', completed_at = NOW() WHERE id = %d AND status = 'running'",
+			"UPDATE `{$table}` SET status = 'complete', completed_at = NOW(), source_api_key = '' WHERE id = %d AND status = 'running'",
 			$id
 		) );
 		if ( $result ) {

@@ -60,7 +60,10 @@ class UserImporter {
 
 			wp_suspend_cache_invalidation( false );
 
-			if ( count( $users ) >= 100 ) {
+			// Circuit breaker: cap at 100k users to prevent a looping source from
+			// holding the pipeline open indefinitely.
+			$max_users = 100000;
+			if ( count( $users ) >= 100 && ( $offset + 100 ) < $max_users ) {
 				as_enqueue_async_action(
 					'hbm_import_network_users',
 					[ 'migration_id' => $migration_id, 'offset' => $offset + 100, 'attempt' => 0 ],

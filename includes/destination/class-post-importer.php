@@ -10,6 +10,7 @@ use HBMigrator\SourceClient;
 class PostImporter {
 
 	public static function process( int $site_job_id, int $last_id, int $attempt ): void {
+		global $wpdb;
 		try {
 			$job = MigrationRegistry::get_site_job( $site_job_id );
 			if ( ! $job || ! $job->dest_blog_id ) {
@@ -21,7 +22,7 @@ class PostImporter {
 				return;
 			}
 
-			MigrationRegistry::update_site_job( $site_job_id, [ 'current_stage' => 'posts' ] );
+			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'posts', 'error_message' => null ] );
 
 			$posts = SourceClient::get(
 				$migration->source_url,
@@ -39,58 +40,81 @@ class PostImporter {
 			foreach ( $posts as $p ) {
 				$source_id = (int) $p['ID'];
 
-				// Resolve author.
-				$author_id = 1;
-				if ( ! empty( $p['post_author_email'] ) ) {
-					$user = get_user_by( 'email', $p['post_author_email'] );
-					if ( $user ) {
-						$author_id = $user->ID;
+				$existing_dest_id = IdMap::get( $site_job_id, 'post', $source_id );
+				if ( null !== $existing_dest_id ) {
+					// Post row already exists from a prior attempt. Re-sync its meta in a
+					// transaction so we never have a window where the post has zero meta.
+					$dest_id = $existing_dest_id;
+					$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+					$wpdb->delete( $wpdb->postmeta, [ 'post_id' => $dest_id ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+					foreach ( $p['meta'] as $meta ) {
+						$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+							$wpdb->postmeta,
+							[
+								'post_id'    => $dest_id,
+								'meta_key'   => $meta['key'], // phpcs:ignore WordPress.DB.SlowDBQuery
+								'meta_value' => $meta['value'],
+							]
+						);
 					}
-				}
+					$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				} else {
+					// Resolve author.
+					$author_id = 1;
+					if ( ! empty( $p['post_author_email'] ) ) {
+						$user = get_user_by( 'email', $p['post_author_email'] );
+						if ( $user ) {
+							$author_id = $user->ID;
+						}
+					}
 
-				// Resolve post_parent.
-				$post_parent = 0;
-				if ( $p['post_parent'] > 0 ) {
-					$dest_parent = IdMap::get( $site_job_id, 'post', (int) $p['post_parent'] );
-					$post_parent = $dest_parent ?? 0;
-				}
+					// Resolve post_parent.
+					$post_parent = 0;
+					if ( $p['post_parent'] > 0 ) {
+						$dest_parent = IdMap::get( $site_job_id, 'post', (int) $p['post_parent'] );
+						$post_parent = $dest_parent ?? 0;
+					}
 
-				$post_data = wp_slash( [
-					'import_id'        => $source_id,
-					'post_author'      => $author_id,
-					'post_date'        => $p['post_date'],
-					'post_date_gmt'    => $p['post_date_gmt'],
-					'post_content'     => $p['post_content'],
-					'post_title'       => $p['post_title'],
-					'post_excerpt'     => $p['post_excerpt'],
-					'post_status'      => $p['post_status'],
-					'comment_status'   => $p['comment_status'],
-					'ping_status'      => $p['ping_status'],
-					'post_password'    => $p['post_password'],
-					'post_name'        => $p['post_name'],
-					'post_modified'    => $p['post_modified'],
-					'post_modified_gmt' => $p['post_modified_gmt'],
-					'post_parent'      => $post_parent,
-					'menu_order'       => (int) $p['menu_order'],
-					'post_type'        => $p['post_type'],
-					'post_mime_type'   => $p['post_mime_type'],
-				] );
+					$post_data = wp_slash( [
+						'import_id'         => $source_id,
+						'post_author'       => $author_id,
+						'post_date'         => $p['post_date'],
+						'post_date_gmt'     => $p['post_date_gmt'],
+						'post_content'      => $p['post_content'],
+						'post_title'        => $p['post_title'],
+						'post_excerpt'      => $p['post_excerpt'],
+						'post_status'       => $p['post_status'],
+						'comment_status'    => $p['comment_status'],
+						'ping_status'       => $p['ping_status'],
+						'post_password'     => $p['post_password'],
+						'post_name'         => $p['post_name'],
+						'post_modified'     => $p['post_modified'],
+						'post_modified_gmt' => $p['post_modified_gmt'],
+						'post_parent'       => $post_parent,
+						'menu_order'        => (int) $p['menu_order'],
+						'post_type'         => $p['post_type'],
+						'post_mime_type'    => $p['post_mime_type'],
+					] );
 
-				$dest_id = wp_insert_post( $post_data, false, false );
-				if ( is_wp_error( $dest_id ) || ! $dest_id ) {
-					continue;
-				}
+					$dest_id = wp_insert_post( $post_data, false, false );
+					if ( is_wp_error( $dest_id ) || ! $dest_id ) {
+						continue;
+					}
 
-				IdMap::set( $site_job_id, 'post', $source_id, (int) $dest_id );
+					IdMap::set( $site_job_id, 'post', $source_id, (int) $dest_id );
 
-				// Insert meta. Use safe unserialize (no class instantiation) to guard
-				// against PHP object injection from a compromised source.
-				foreach ( $p['meta'] as $meta ) {
-					$raw = $meta['value'];
-					$val = is_serialized( $raw )
-						? unserialize( $raw, [ 'allowed_classes' => false ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
-						: $raw;
-					update_post_meta( $dest_id, $meta['key'], $val );
+					// Insert meta directly to avoid maybe_serialize() double-serializing
+					// already-serialized values and to preserve raw bytes from the source DB.
+					foreach ( $p['meta'] as $meta ) {
+						$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+							$wpdb->postmeta,
+							[
+								'post_id'    => $dest_id,
+								'meta_key'   => $meta['key'], // phpcs:ignore WordPress.DB.SlowDBQuery
+								'meta_value' => $meta['value'],
+							]
+						);
+					}
 				}
 
 				// Set terms by slug.

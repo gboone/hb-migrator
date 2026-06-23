@@ -10,7 +10,7 @@ class ProgressEndpoint {
 		register_rest_route( HBM_API_NAMESPACE, '/admin/migrations', [
 			'methods'             => \WP_REST_Server::READABLE,
 			'callback'            => [ self::class, 'list_migrations' ],
-			'permission_callback' => fn() => current_user_can( 'manage_options' ),
+			'permission_callback' => fn() => current_user_can( 'manage_network' ),
 		] );
 	}
 

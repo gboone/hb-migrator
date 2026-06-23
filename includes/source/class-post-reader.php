@@ -27,12 +27,16 @@ class PostReader {
 				$author_email = $author->user_email;
 			}
 
-			$meta  = [];
-			$raw   = get_post_meta( (int) $post->ID );
-			foreach ( $raw as $key => $values ) {
-				foreach ( $values as $value ) {
-					$meta[] = [ 'key' => $key, 'value' => $value ];
-				}
+			// Read raw DB bytes so serialized values arrive at the destination intact.
+			// get_post_meta() unserializes before returning; JSON-encoding that loses the
+			// PHP serialization layer and corrupts array/object meta on the destination.
+			$meta     = [];
+			$meta_rows = $wpdb->get_results( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				$wpdb->prepare( "SELECT meta_key, meta_value FROM {$wpdb->postmeta} WHERE post_id = %d", $post->ID ),
+				ARRAY_A
+			);
+			foreach ( $meta_rows ?? [] as $row ) {
+				$meta[] = [ 'key' => $row['meta_key'], 'value' => $row['meta_value'] ];
 			}
 
 			$terms_data  = [];

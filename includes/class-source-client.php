@@ -19,6 +19,23 @@ class SourceClient {
 		if ( $params ) {
 			$url = add_query_arg( $params, $url );
 		}
+
+		// Re-validate the resolved IP before each async HTTP call to prevent DNS rebinding.
+		// MigrationReceiver::is_safe_source_url() checks only at begin()-time; Action Scheduler
+		// jobs re-resolve DNS independently, so an attacker who passed validation with a public
+		// IP could flip their DNS to an internal address before the first job fires.
+		$host = wp_parse_url( $url, PHP_URL_HOST );
+		if ( $host ) {
+			$ip = gethostbyname( $host );
+			if ( ! filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) ) {
+				throw new SourceClientException(
+					"Source hostname {$host} resolved to a private/reserved IP address.",
+					0,
+					false // not retryable — re-resolving won't fix a rebinding attempt
+				);
+			}
+		}
+
 		$response = wp_remote_get( $url, [
 			'headers'   => [ 'Authorization' => 'Bearer ' . $api_key ],
 			'timeout'   => 60,
