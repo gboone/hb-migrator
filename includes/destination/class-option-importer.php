@@ -96,10 +96,10 @@ class OptionImporter {
 				return;
 			}
 
-			// Options done — run search-replace.
+			// Options done — start search-replace from phase 0.
 			as_enqueue_async_action(
 				'hbm_search_replace',
-				[ 'site_job_id' => $site_job_id, 'attempt' => 0 ],
+				[ 'site_job_id' => $site_job_id, 'attempt' => 0, 'phase' => 0, 'last_pk' => 0 ],
 				'hb-migrator'
 			);
 

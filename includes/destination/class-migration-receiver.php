@@ -93,7 +93,7 @@ class MigrationReceiver {
 							as_enqueue_async_action( 'hbm_import_options', [ 'site_job_id' => (int) $job->id, 'offset' => $offset, 'attempt' => 0 ], 'hb-migrator' );
 							break;
 						case 'search_replace':
-							as_enqueue_async_action( 'hbm_search_replace', [ 'site_job_id' => (int) $job->id, 'attempt' => 0 ], 'hb-migrator' );
+							as_enqueue_async_action( 'hbm_search_replace', [ 'site_job_id' => (int) $job->id, 'attempt' => 0, 'phase' => 0, 'last_pk' => 0 ], 'hb-migrator' );
 							break;
 						case 'terms':
 							as_enqueue_async_action( 'hbm_import_terms', [ 'site_job_id' => (int) $job->id, 'offset' => $offset, 'attempt' => 0 ], 'hb-migrator' );

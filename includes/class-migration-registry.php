@@ -64,15 +64,30 @@ class MigrationRegistry {
 	}
 
 	/**
-	 * Atomically marks the migration complete. Returns true only if this call
-	 * won the race (rows_affected = 1), preventing duplicate completion emails.
+	 * Atomically marks the migration complete only when ALL site jobs are 'complete'.
+	 * Returns true only if this call won (rows_affected = 1).
+	 *
+	 * The NOT EXISTS subquery replaces the previous two-step all_sites_complete()
+	 * + UPDATE pattern. On WordPress VIP, HyperDB can route a read to a replica that
+	 * hasn't caught up, causing all_sites_complete() to return false even after every
+	 * job finished and leaving the migration permanently stuck in 'running'. A single
+	 * UPDATE statement eliminates that replica-lag window entirely.
 	 */
 	public static function complete_migration( int $id ): bool {
 		global $wpdb;
-		$table  = $wpdb->base_prefix . 'hbm_migrations';
-		// Zero out source_api_key on completion — it's only needed while jobs are running.
-		$result = $wpdb->query( $wpdb->prepare(
-			"UPDATE `{$table}` SET status = 'complete', completed_at = NOW(), source_api_key = '' WHERE id = %d AND status = 'running'",
+		$table      = $wpdb->base_prefix . 'hbm_migrations';
+		$jobs_table = $wpdb->base_prefix . 'hbm_site_jobs';
+		$result     = $wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"UPDATE `{$table}`
+			    SET status = 'complete', completed_at = NOW(), source_api_key = ''
+			  WHERE id = %d
+			    AND status = 'running'
+			    AND NOT EXISTS (
+			        SELECT 1 FROM `{$jobs_table}` j
+			         WHERE j.migration_id = %d
+			           AND j.status != 'complete'
+			    )",
+			$id,
 			$id
 		) );
 		if ( $result ) {
