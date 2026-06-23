@@ -24,6 +24,31 @@ class MigrationReceiver {
 			'callback'            => [ self::class, 'status' ],
 			'permission_callback' => $auth,
 		] );
+
+		register_rest_route( $ns, '/destination/preflight', [
+			'methods'             => \WP_REST_Server::CREATABLE,
+			'callback'            => [ self::class, 'preflight' ],
+			'permission_callback' => $auth,
+		] );
+	}
+
+	public static function preflight( \WP_REST_Request $request ): \WP_REST_Response {
+		// Compute dest_paths from source_siteurls on the destination side so the
+		// network domain slug-stripping (MultisiteHandler) uses the correct domain.
+		$source_siteurls = (array) ( $request->get_param( 'source_siteurls' ) ?: [] );
+		$network_domain  = get_network() ? get_network()->domain : '';
+		$site_paths      = array_map(
+			fn( $url ) => MultisiteHandler::dest_path_for_siteurl( (string) $url, $network_domain ),
+			$source_siteurls
+		);
+
+		$checker = new PreflightChecker();
+		$result  = $checker->check( [
+			'user_emails' => (array) ( $request->get_param( 'user_emails' ) ?: [] ),
+			'site_paths'  => $site_paths,
+			'media'       => (array) ( $request->get_param( 'media' )       ?: [] ),
+		] );
+		return new \WP_REST_Response( $result );
 	}
 
 	public static function begin( \WP_REST_Request $request ): \WP_REST_Response {
@@ -142,7 +167,12 @@ class MigrationReceiver {
 			return new \WP_REST_Response( [ 'error' => 'None of the provided site_ids were found on the source.' ], 422 );
 		}
 
-		$migration_id   = MigrationRegistry::create_migration( $source_url, $source_api_key, $email ?: null );
+		$policies = [
+			'user_conflict_policy'  => sanitize_key( (string) ( $request->get_param( 'user_conflict_policy' )  ?: 'merge' ) ),
+			'site_conflict_policy'  => sanitize_key( (string) ( $request->get_param( 'site_conflict_policy' )  ?: 'generate_new' ) ),
+			'media_conflict_policy' => sanitize_key( (string) ( $request->get_param( 'media_conflict_policy' ) ?: 'import_all' ) ),
+		];
+		$migration_id   = MigrationRegistry::create_migration( $source_url, $source_api_key, $email ?: null, $policies );
 		$network_domain = get_network()->domain ?? '';
 
 		foreach ( $valid_ids as $blog_id ) {

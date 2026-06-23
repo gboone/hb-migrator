@@ -62,5 +62,11 @@ class SourceEndpoints {
 			'callback'            => [ SiteIndex::class, 'proxy_migration_status' ],
 			'permission_callback' => fn() => current_user_can( 'manage_network' ),
 		] );
+
+		register_rest_route( $ns, '/source/run-preflight', [
+			'methods'             => \WP_REST_Server::CREATABLE,
+			'callback'            => [ PreflightService::class, 'handle_request' ],
+			'permission_callback' => fn() => current_user_can( 'manage_network' ),
+		] );
 	}
 }

@@ -21,6 +21,8 @@ class MediaImporter {
 				return;
 			}
 
+			$media_policy = $migration->media_conflict_policy ?? 'import_all';
+
 			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'media', 'error_message' => null ] );
 
 			$media = SourceClient::get(
@@ -45,6 +47,27 @@ class MediaImporter {
 				// Skip if already imported (idempotency on retry).
 				if ( $source_att_id && IdMap::get( $site_job_id, 'attachment', $source_att_id ) ) {
 					continue;
+				}
+
+				// skip_duplicates: reuse existing destination attachment matched by filename.
+				if ( 'skip_duplicates' === $media_policy && $source_att_id ) {
+					$post_name = $att['post_name'] ?? '';
+					if ( ! $post_name ) {
+						$post_name = sanitize_title( basename( wp_parse_url( $att['file_url'] ?? '', PHP_URL_PATH ) ) );
+					}
+					if ( $post_name ) {
+						$existing_atts = get_posts( [
+							'post_type'   => 'attachment',
+							'name'        => $post_name,
+							'post_status' => 'any',
+							'numberposts' => 1,
+							'fields'      => 'ids',
+						] );
+						if ( ! empty( $existing_atts ) ) {
+							IdMap::set( $site_job_id, 'attachment', $source_att_id, (int) $existing_atts[0] );
+							continue;
+						}
+					}
 				}
 
 				$file_url = $att['file_url'] ?? '';

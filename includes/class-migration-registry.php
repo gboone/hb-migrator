@@ -8,19 +8,31 @@ class MigrationRegistry {
 	// Migrations
 	// -----------------------------------------------------------------------
 
-	public static function create_migration( string $source_url, string $source_api_key, ?string $email ): int {
+	public static function create_migration( string $source_url, string $source_api_key, ?string $email, array $policies = [] ): int {
 		global $wpdb;
 		$wpdb->insert(
 			$wpdb->base_prefix . 'hbm_migrations',
 			[
-				'source_url'         => $source_url,
-				'source_api_key'     => $source_api_key,
-				'status'             => 'pending',
-				'status_token'       => bin2hex( random_bytes( 16 ) ),
-				'notification_email' => $email,
+				'source_url'            => $source_url,
+				'source_api_key'        => $source_api_key,
+				'status'                => 'pending',
+				'status_token'          => bin2hex( random_bytes( 16 ) ),
+				'notification_email'    => $email,
+				'user_conflict_policy'  => $policies['user_conflict_policy']  ?? 'merge',
+				'site_conflict_policy'  => $policies['site_conflict_policy']  ?? 'generate_new',
+				'media_conflict_policy' => $policies['media_conflict_policy'] ?? 'import_all',
 			]
 		);
 		return (int) $wpdb->insert_id;
+	}
+
+	public static function get_conflict_policies( int $migration_id ): array {
+		$migration = self::get_migration( $migration_id );
+		return [
+			'user_conflict_policy'  => $migration->user_conflict_policy  ?? 'merge',
+			'site_conflict_policy'  => $migration->site_conflict_policy  ?? 'generate_new',
+			'media_conflict_policy' => $migration->media_conflict_policy ?? 'import_all',
+		];
 	}
 
 	public static function get_migration( int $id ): ?object {

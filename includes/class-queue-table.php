@@ -38,6 +38,9 @@ class QueueTable {
   notification_email varchar(200) DEFAULT NULL,
   created_at datetime NOT NULL DEFAULT CURRENT_TIMESTAMP,
   completed_at datetime DEFAULT NULL,
+  user_conflict_policy varchar(20) NOT NULL DEFAULT 'merge',
+  site_conflict_policy varchar(20) NOT NULL DEFAULT 'generate_new',
+  media_conflict_policy varchar(20) NOT NULL DEFAULT 'import_all',
   PRIMARY KEY  (id)
 ) $charset;";
 

@@ -24,11 +24,13 @@ class TermImporter {
 
 			// Create destination subsite on first batch.
 			if ( null === $job->dest_blog_id || 0 === (int) $job->dest_blog_id ) {
-				$dest_blog_id = self::create_subsite( $job );
+				$site_policy  = $migration->site_conflict_policy ?? 'generate_new';
+				$dest_blog_id = self::create_subsite( $job, $site_policy );
 				MigrationRegistry::update_site_job( $site_job_id, [
 					'dest_blog_id'  => $dest_blog_id,
 					'status'        => 'running',
 					'current_stage' => 'terms',
+					'dest_path'     => $job->dest_path, // may have been updated by generate_new suffix
 				] );
 				$job->dest_blog_id = $dest_blog_id;
 				// Assign roles from DB — no HTTP calls needed.
@@ -132,7 +134,7 @@ class TermImporter {
 		}
 	}
 
-	private static function create_subsite( object $job ): int {
+	private static function create_subsite( object $job, string $policy = 'generate_new' ): int {
 		$network = get_network();
 		if ( ! $network ) {
 			throw new \RuntimeException( 'No network found on destination.' );
@@ -146,19 +148,51 @@ class TermImporter {
 			'user_id'    => get_current_user_id(),
 		] );
 
-		if ( is_wp_error( $result ) ) {
-			// Permanent failures (e.g. path collision) should not be retried.
-			$code = $result->get_error_code();
-			if ( 'blog_slug_already_exists' === $code ) {
-				MigrationRegistry::update_site_job(
-					(int) $job->id,
-					[ 'status' => 'failed', 'error_message' => 'Destination path ' . $job->dest_path . ' already exists.' ]
-				);
-				throw new \RuntimeException( 'Subsite path collision — marked failed, not retrying.' );
-			}
+		if ( ! is_wp_error( $result ) ) {
+			return (int) $result;
+		}
+
+		$code = $result->get_error_code();
+		if ( 'blog_slug_already_exists' !== $code ) {
 			throw new \RuntimeException( 'Could not create subsite: ' . $result->get_error_message() );
 		}
 
-		return (int) $result;
+		// Path collision — apply the site conflict policy.
+		if ( 'use_existing' === $policy ) {
+			$matches = get_sites( [
+				'domain'     => $network->domain,
+				'path'       => $job->dest_path,
+				'network_id' => $network->id,
+				'number'     => 1,
+				'fields'     => 'ids',
+			] );
+			if ( ! empty( $matches ) ) {
+				return (int) $matches[0];
+			}
+			// Path not found (race or stale conflict) — fall through to generate_new.
+		}
+
+		// generate_new: append -2, -3, … up to 10 attempts.
+		$base = rtrim( $job->dest_path, '/' );
+		for ( $i = 2; $i <= 11; $i++ ) {
+			$candidate = $base . '-' . $i . '/';
+			$retry     = wp_insert_site( [
+				'domain'     => $network->domain,
+				'path'       => $candidate,
+				'network_id' => get_current_network_id(),
+				'title'      => $job->source_domain,
+				'user_id'    => get_current_user_id(),
+			] );
+			if ( ! is_wp_error( $retry ) ) {
+				$job->dest_path = $candidate; // bubble updated path back to caller
+				return (int) $retry;
+			}
+		}
+
+		MigrationRegistry::update_site_job(
+			(int) $job->id,
+			[ 'status' => 'failed', 'error_message' => 'Could not create unique subsite path after 10 attempts for: ' . $job->dest_path ]
+		);
+		throw new \RuntimeException( 'Subsite path exhausted — marked failed, not retrying.' );
 	}
 }

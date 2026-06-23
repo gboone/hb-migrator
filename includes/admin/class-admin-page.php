@@ -35,9 +35,10 @@ class AdminPage {
 		wp_enqueue_style( 'hb-migrator-admin', HBM_PLUGIN_URL . 'assets/css/admin.css', [], HBM_VERSION );
 		wp_enqueue_script( 'hb-migrator-admin', HBM_PLUGIN_URL . 'assets/js/admin.js', [], HBM_VERSION, true );
 		wp_localize_script( 'hb-migrator-admin', 'hbmAdmin', [
-			'statusEndpoint' => rest_url( HBM_API_NAMESPACE . '/source/migration-status' ),
-			'nonce'          => wp_create_nonce( 'wp_rest' ),
-			'activeMigration' => (bool) get_site_option( 'hbm_active_migration' ),
+			'statusEndpoint'   => rest_url( HBM_API_NAMESPACE . '/source/migration-status' ),
+			'preflightEndpoint' => rest_url( HBM_API_NAMESPACE . '/source/run-preflight' ),
+			'nonce'            => wp_create_nonce( 'wp_rest' ),
+			'activeMigration'  => (bool) get_site_option( 'hbm_active_migration' ),
 		] );
 	}
 
@@ -119,51 +120,62 @@ class AdminPage {
 				</form>
 
 				<?php if ( $dest_url && $dest_key && ! empty( $sites ) ) : ?>
-					<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" id="hbm-migration-form">
-						<input type="hidden" name="action" value="hbm_start_migration">
-						<?php wp_nonce_field( 'hbm_start_migration' ); ?>
+					<h3><?php esc_html_e( 'Select Sites to Migrate', 'hb-migrator' ); ?></h3>
+					<p class="description"><?php esc_html_e( 'Archived sites are deselected by default.', 'hb-migrator' ); ?></p>
 
-						<h3><?php esc_html_e( 'Select Sites to Migrate', 'hb-migrator' ); ?></h3>
-						<p class="description"><?php esc_html_e( 'Archived sites are deselected by default.', 'hb-migrator' ); ?></p>
+					<table class="widefat hbm-site-table" id="hbm-site-select-table">
+						<thead>
+							<tr>
+								<th style="width:30px"></th>
+								<th><?php esc_html_e( 'Domain', 'hb-migrator' ); ?></th>
+								<th><?php esc_html_e( 'Name', 'hb-migrator' ); ?></th>
+								<th><?php esc_html_e( 'Path', 'hb-migrator' ); ?></th>
+								<th><?php esc_html_e( 'Status', 'hb-migrator' ); ?></th>
+							</tr>
+						</thead>
+						<tbody>
+							<?php foreach ( $sites as $site ) :
+								switch_to_blog( $site->blog_id );
+								$blogname    = get_option( 'blogname' );
+								$is_archived = (bool) $site->archived;
+								restore_current_blog();
+							?>
+							<tr>
+								<td><input type="checkbox" class="hbm-site-checkbox" value="<?php echo (int) $site->blog_id; ?>" <?php checked( ! $is_archived ); ?>></td>
+								<td><?php echo esc_html( $site->domain ); ?></td>
+								<td><?php echo esc_html( $blogname ); ?></td>
+								<td><?php echo esc_html( $site->path ); ?></td>
+								<td>
+									<?php if ( $is_archived ) : ?>
+										<span class="hbm-status hbm-status-archived"><?php esc_html_e( 'Archived', 'hb-migrator' ); ?></span>
+									<?php else : ?>
+										<span class="hbm-status hbm-status-complete"><?php esc_html_e( 'Active', 'hb-migrator' ); ?></span>
+									<?php endif; ?>
+								</td>
+							</tr>
+							<?php endforeach; ?>
+						</tbody>
+					</table>
 
-						<table class="widefat hbm-site-table">
-							<thead>
-								<tr>
-									<th style="width:30px"></th>
-									<th><?php esc_html_e( 'Domain', 'hb-migrator' ); ?></th>
-									<th><?php esc_html_e( 'Name', 'hb-migrator' ); ?></th>
-									<th><?php esc_html_e( 'Path', 'hb-migrator' ); ?></th>
-									<th><?php esc_html_e( 'Status', 'hb-migrator' ); ?></th>
-								</tr>
-							</thead>
-							<tbody>
-								<?php foreach ( $sites as $site ) :
-									switch_to_blog( $site->blog_id );
-									$blogname    = get_option( 'blogname' );
-									$is_archived = (bool) $site->archived;
-									restore_current_blog();
-								?>
-								<tr>
-									<td><input type="checkbox" name="site_ids[]" value="<?php echo (int) $site->blog_id; ?>" <?php checked( ! $is_archived ); ?>></td>
-									<td><?php echo esc_html( $site->domain ); ?></td>
-									<td><?php echo esc_html( $blogname ); ?></td>
-									<td><?php echo esc_html( $site->path ); ?></td>
-									<td>
-										<?php if ( $is_archived ) : ?>
-											<span class="hbm-status hbm-status-archived"><?php esc_html_e( 'Archived', 'hb-migrator' ); ?></span>
-										<?php else : ?>
-											<span class="hbm-status hbm-status-complete"><?php esc_html_e( 'Active', 'hb-migrator' ); ?></span>
-										<?php endif; ?>
-									</td>
-								</tr>
-								<?php endforeach; ?>
-							</tbody>
-						</table>
+					<p class="submit">
+						<button type="button" class="button button-primary" id="hbm-preflight-btn"><?php esc_html_e( 'Run Pre-flight Checks', 'hb-migrator' ); ?></button>
+					</p>
 
-						<p class="submit">
-							<button type="submit" class="button button-primary"><?php esc_html_e( 'Start Migration', 'hb-migrator' ); ?></button>
-						</p>
-					</form>
+					<div id="hbm-preflight-results" hidden></div>
+
+					<div id="hbm-preflight-start" hidden>
+						<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" id="hbm-start-form">
+							<input type="hidden" name="action" value="hbm_start_migration">
+							<?php wp_nonce_field( 'hbm_start_migration' ); ?>
+							<div id="hbm-start-site-ids"></div>
+							<input type="hidden" name="user_conflict_policy"  id="hbm-user-policy"  value="merge">
+							<input type="hidden" name="site_conflict_policy"  id="hbm-site-policy"  value="generate_new">
+							<input type="hidden" name="media_conflict_policy" id="hbm-media-policy" value="import_all">
+							<p class="submit">
+								<button type="submit" class="button button-primary"><?php esc_html_e( 'Start Migration', 'hb-migrator' ); ?></button>
+							</p>
+						</form>
+					</div>
 				<?php elseif ( ! $dest_url || ! $dest_key ) : ?>
 					<p class="description"><?php esc_html_e( 'Enter and save your destination URL and API key above to select sites.', 'hb-migrator' ); ?></p>
 				<?php endif; ?>
@@ -200,6 +212,10 @@ class AdminPage {
 			exit;
 		}
 
+		$user_conflict_policy  = sanitize_key( wp_unslash( $_POST['user_conflict_policy']  ?? 'merge' ) );
+		$site_conflict_policy  = sanitize_key( wp_unslash( $_POST['site_conflict_policy']  ?? 'generate_new' ) );
+		$media_conflict_policy = sanitize_key( wp_unslash( $_POST['media_conflict_policy'] ?? 'import_all' ) );
+
 		$source_api_key = \HBMigrator\ApiAuth::get_or_create_key();
 
 		$response = wp_remote_post(
@@ -210,10 +226,13 @@ class AdminPage {
 					'Content-Type'  => 'application/json',
 				],
 				'body'      => wp_json_encode( [
-					'source_url'         => network_site_url(),
-					'source_api_key'     => $source_api_key,
-					'site_ids'           => $site_ids,
-					'notification_email' => $dest_email,
+					'source_url'            => network_site_url(),
+					'source_api_key'        => $source_api_key,
+					'site_ids'              => $site_ids,
+					'notification_email'    => $dest_email,
+					'user_conflict_policy'  => $user_conflict_policy,
+					'site_conflict_policy'  => $site_conflict_policy,
+					'media_conflict_policy' => $media_conflict_policy,
 				] ),
 				'timeout'   => 30,
 				'sslverify' => true,

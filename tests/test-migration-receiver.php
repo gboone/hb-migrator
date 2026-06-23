@@ -154,6 +154,85 @@ class Test_MigrationReceiver extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// Conflict policies — stored on create, passed through begin().
+	// -------------------------------------------------------------------------
+
+	public function test_create_migration_stores_default_policies_when_none_provided(): void {
+		$mid       = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$migration = MigrationRegistry::get_migration( $mid );
+
+		$this->assertSame( 'merge',        $migration->user_conflict_policy );
+		$this->assertSame( 'generate_new', $migration->site_conflict_policy );
+		$this->assertSame( 'import_all',   $migration->media_conflict_policy );
+	}
+
+	public function test_create_migration_stores_explicit_policies(): void {
+		$mid       = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null, [
+			'user_conflict_policy'  => 'create',
+			'site_conflict_policy'  => 'use_existing',
+			'media_conflict_policy' => 'skip_duplicates',
+		] );
+		$migration = MigrationRegistry::get_migration( $mid );
+
+		$this->assertSame( 'create',          $migration->user_conflict_policy );
+		$this->assertSame( 'use_existing',    $migration->site_conflict_policy );
+		$this->assertSame( 'skip_duplicates', $migration->media_conflict_policy );
+	}
+
+	public function test_get_conflict_policies_returns_defaults_for_old_migration(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$policies = MigrationRegistry::get_conflict_policies( $mid );
+
+		$this->assertSame( 'merge',        $policies['user_conflict_policy'] );
+		$this->assertSame( 'generate_new', $policies['site_conflict_policy'] );
+		$this->assertSame( 'import_all',   $policies['media_conflict_policy'] );
+	}
+
+	public function test_begin_passes_user_conflict_policy_from_request(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'Destination must be multisite.' );
+		}
+		$source_url = 'https://93.184.216.34';
+
+		// Pre-seed a running migration so begin() takes the idempotency path and
+		// returns 200 without reaching SourceClient. We check the policy on a
+		// freshly created migration via create_migration() directly.
+		$mid = MigrationRegistry::create_migration( $source_url, 'key', null, [
+			'user_conflict_policy' => 'create',
+		] );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		MigrationRegistry::create_site_job( $mid, 1, 'example.com', $source_url, '', '/example.com/' );
+
+		$migration = MigrationRegistry::get_migration( $mid );
+		$this->assertSame( 'create', $migration->user_conflict_policy );
+	}
+
+	public function test_begin_omitting_policies_uses_defaults(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'Destination must be multisite.' );
+		}
+		$source_url = 'https://93.184.216.34';
+		$mid        = MigrationRegistry::create_migration( $source_url, 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		MigrationRegistry::create_site_job( $mid, 1, 'example.com', $source_url, '', '/example.com/' );
+
+		// begin() should return 200 without error (existing migration idempotency path).
+		$req = new WP_REST_Request( 'POST', '/' . HBM_API_NAMESPACE . '/destination/begin' );
+		$req->set_param( 'source_url', $source_url );
+		$req->set_param( 'source_api_key', 'key' );
+		$req->set_param( 'site_ids', [ 1 ] );
+		// No policy params — omitted intentionally.
+		$response = MigrationReceiver::begin( $req );
+
+		$this->assertSame( 200, $response->get_status() );
+
+		$migration = MigrationRegistry::get_migration( $mid );
+		$this->assertSame( 'merge',        $migration->user_conflict_policy );
+		$this->assertSame( 'generate_new', $migration->site_conflict_policy );
+		$this->assertSame( 'import_all',   $migration->media_conflict_policy );
+	}
+
+	// -------------------------------------------------------------------------
 	// status_token — always present in 200 response.
 	// -------------------------------------------------------------------------
 
