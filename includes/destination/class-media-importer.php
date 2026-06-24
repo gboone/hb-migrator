@@ -86,12 +86,15 @@ class MediaImporter {
 					continue;
 				}
 
-				$file_array = [
+				$file_array    = [
 					'name'     => basename( wp_parse_url( $file_url, PHP_URL_PATH ) ),
 					'tmp_name' => $tmp,
 				];
-
-				$sideload = wp_handle_sideload( $file_array, [ 'test_form' => false ] );
+				$date_filter   = self::upload_dir_filter_for_date( $att['post_date'] ?? '' );
+				$sideload      = wp_handle_sideload( $file_array, [ 'test_form' => false ] );
+				if ( $date_filter ) {
+					remove_filter( 'upload_dir', $date_filter );
+				}
 				if ( isset( $sideload['error'] ) ) {
 					@unlink( $tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 					continue;
@@ -162,5 +165,29 @@ class MediaImporter {
 				$site_job_id
 			);
 		}
+	}
+
+	/**
+	 * Registers a one-shot upload_dir filter for the given post date and returns the callable
+	 * so the caller can remove it immediately after wp_handle_sideload(). Returns null when
+	 * post_date is absent or unparseable (WordPress default upload dir is used in that case).
+	 */
+	private static function upload_dir_filter_for_date( string $post_date ): ?callable {
+		if ( ! $post_date ) {
+			return null;
+		}
+		$ts = strtotime( $post_date );
+		if ( ! $ts ) {
+			return null;
+		}
+		$subdir = '/' . gmdate( 'Y/m', $ts );
+		$filter = function ( array $dirs ) use ( $subdir ): array {
+			$dirs['subdir'] = $subdir;
+			$dirs['path']   = $dirs['basedir'] . $subdir;
+			$dirs['url']    = $dirs['baseurl'] . $subdir;
+			return $dirs;
+		};
+		add_filter( 'upload_dir', $filter );
+		return $filter;
 	}
 }

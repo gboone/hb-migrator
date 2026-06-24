@@ -18,6 +18,69 @@ class Test_Media_Importer extends WP_UnitTestCase {
 	public function tear_down(): void {
 		parent::tear_down();
 		remove_all_filters( 'pre_http_request' );
+		remove_all_filters( 'upload_dir' );
+	}
+
+	// -------------------------------------------------------------------------
+	// upload_dir_filter_for_date() — private helper, accessed via ReflectionClass
+	// -------------------------------------------------------------------------
+
+	private function call_upload_dir_filter_for_date( string $post_date ): mixed {
+		$method = ( new \ReflectionClass( MediaImporter::class ) )
+			->getMethod( 'upload_dir_filter_for_date' );
+		$method->setAccessible( true );
+		return $method->invoke( null, $post_date );
+	}
+
+	public function test_upload_dir_filter_returns_null_for_empty_date(): void {
+		$filter = $this->call_upload_dir_filter_for_date( '' );
+		$this->assertNull( $filter );
+	}
+
+	public function test_upload_dir_filter_returns_null_for_invalid_date(): void {
+		$filter = $this->call_upload_dir_filter_for_date( 'not-a-date' );
+		$this->assertNull( $filter );
+	}
+
+	public function test_upload_dir_filter_sets_correct_subdir_for_april(): void {
+		$filter = $this->call_upload_dir_filter_for_date( '2026/04/15 10:00:00' );
+		$this->assertIsCallable( $filter );
+
+		$dirs = wp_upload_dir();
+		$this->assertStringEndsWith( '/2026/04', $dirs['subdir'] );
+
+		remove_filter( 'upload_dir', $filter );
+	}
+
+	public function test_upload_dir_filter_sets_correct_subdir_for_different_year(): void {
+		$filter = $this->call_upload_dir_filter_for_date( '2023/11/01 00:00:00' );
+		$this->assertIsCallable( $filter );
+
+		$dirs = wp_upload_dir();
+		$this->assertStringEndsWith( '/2023/11', $dirs['subdir'] );
+
+		remove_filter( 'upload_dir', $filter );
+	}
+
+	public function test_upload_dir_filter_sets_path_and_url_consistently(): void {
+		$filter = $this->call_upload_dir_filter_for_date( '2024/03/15 10:00:00' );
+		$this->assertIsCallable( $filter );
+
+		$dirs = wp_upload_dir();
+		$this->assertStringEndsWith( '/2024/03', $dirs['path'] );
+		$this->assertStringEndsWith( '/2024/03', $dirs['url'] );
+
+		remove_filter( 'upload_dir', $filter );
+	}
+
+	public function test_upload_dir_filter_is_removed_after_call(): void {
+		$filter = $this->call_upload_dir_filter_for_date( '2026/04/15 10:00:00' );
+		$this->assertIsCallable( $filter );
+		remove_filter( 'upload_dir', $filter );
+
+		// After removal, wp_upload_dir() should return current-date subdir (not 2026/04).
+		$dirs = wp_upload_dir();
+		$this->assertStringNotContainsString( '2026/04', $dirs['subdir'] );
 	}
 
 	private function make_migration( array $policies = [] ): int {
