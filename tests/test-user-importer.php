@@ -178,6 +178,60 @@ class Test_User_Importer extends WP_UnitTestCase {
 		wp_delete_user( $mapped_id );
 	}
 
+	// -------------------------------------------------------------------------
+	// Email suppression during import
+	// -------------------------------------------------------------------------
+
+	public function test_pre_wp_mail_filter_active_during_user_registration(): void {
+		$suppressed = false;
+
+		// user_register fires inside wp_insert_user — check if suppress filter is live then.
+		add_action( 'user_register', function () use ( &$suppressed ) {
+			$result     = apply_filters( 'pre_wp_mail', null, [] );
+			$suppressed = ( $result instanceof \WP_Error );
+		} );
+
+		$mid = $this->make_migration();
+		$this->mock_users( [
+			$this->make_source_user( [ 'source_user_id' => 201, 'user_email' => 'suppress-check@example.test', 'user_login' => 'suppresscheckuser' ] ),
+		] );
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$this->assertTrue( $suppressed, 'pre_wp_mail must be filtered during user_register action.' );
+
+		wp_delete_user( IdMap::get( IdMap::NETWORK, 'user', 201 ) );
+	}
+
+	public function test_pre_wp_mail_filter_removed_after_process_completes(): void {
+		$mid = $this->make_migration();
+		$this->mock_users( [
+			$this->make_source_user( [ 'source_user_id' => 202, 'user_email' => 'cleanupcheck@example.test', 'user_login' => 'cleanupcheckuser' ] ),
+		] );
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$result = apply_filters( 'pre_wp_mail', null, [] );
+		$this->assertNull( $result, 'pre_wp_mail suppress filter must be removed after process() returns normally.' );
+
+		wp_delete_user( IdMap::get( IdMap::NETWORK, 'user', 202 ) );
+	}
+
+	public function test_user_creation_still_succeeds_with_suppression_active(): void {
+		$mid = $this->make_migration();
+		$this->mock_users( [
+			$this->make_source_user( [ 'source_user_id' => 203, 'user_email' => 'suppress-succeed@example.test', 'user_login' => 'suppresssucceeduser' ] ),
+		] );
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$mapped = IdMap::get( IdMap::NETWORK, 'user', 203 );
+		$this->assertNotNull( $mapped, 'User must still be created even though mail is suppressed.' );
+		$this->assertNotFalse( get_user_by( 'id', $mapped ) );
+
+		wp_delete_user( $mapped );
+	}
+
 	public function test_create_policy_retries_with_counter_when_modified_email_also_conflicts(): void {
 		$mid = $this->make_migration( [ 'user_conflict_policy' => 'create' ] );
 

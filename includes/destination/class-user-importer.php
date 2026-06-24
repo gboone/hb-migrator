@@ -35,6 +35,14 @@ class UserImporter {
 
 			$policy = $migration->user_conflict_policy ?? 'merge';
 
+			// Suppress all outgoing mail during user creation — core and plugins alike
+			// hook user_register and send new-user notifications; pre_wp_mail short-
+			// circuits wp_mail() before any message is composed (available since WP 5.7).
+			$suppress_mail = static function (): \WP_Error {
+				return new \WP_Error( 'hbm_suppressed', '' );
+			};
+			add_filter( 'pre_wp_mail', $suppress_mail );
+
 			foreach ( $users as $u ) {
 				$dest_user_id = null;
 
@@ -86,6 +94,7 @@ class UserImporter {
 				}
 			}
 
+			remove_filter( 'pre_wp_mail', $suppress_mail );
 			wp_suspend_cache_invalidation( false );
 
 			// Circuit breaker: cap at 100k users to prevent a looping source from
@@ -111,6 +120,9 @@ class UserImporter {
 			}
 
 		} catch ( \Throwable $e ) {
+			if ( isset( $suppress_mail ) ) {
+				remove_filter( 'pre_wp_mail', $suppress_mail );
+			}
 			wp_suspend_cache_invalidation( false );
 
 			// UserImporter is network-level; on retry exhaustion, fail the whole migration.
