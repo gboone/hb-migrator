@@ -39,7 +39,7 @@ class Plugin {
 		add_action( 'hbm_import_network_users', [ Destination\UserImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_import_terms',         [ Destination\TermImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_import_posts',         [ Destination\PostImporter::class, 'process' ], 10, 3 );
-		add_action( 'hbm_import_media',         [ Destination\MediaImporter::class, 'process' ], 10, 3 );
+		add_action( 'hbm_import_media',         [ Destination\MediaImporter::class, 'process' ], 10, 4 );
 		add_action( 'hbm_import_options',       [ Destination\OptionImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_search_replace',       [ Destination\SearchReplace::class, 'process' ], 10, 4 );
 	}

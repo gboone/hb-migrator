@@ -9,7 +9,13 @@ use HBMigrator\SourceClient;
 
 class MediaImporter {
 
-	public static function process( int $site_job_id, int $offset, int $attempt ): void {
+	/**
+	 * @param array $source_attachment_ids When non-empty, this is a targeted retry pass — only
+	 *                                     these source attachment IDs are fetched and attempted.
+	 *                                     stage_offset is not updated and no next-batch action
+	 *                                     is scheduled.
+	 */
+	public static function process( int $site_job_id, int $offset, int $attempt, array $source_attachment_ids = [] ): void {
 		try {
 			$job = MigrationRegistry::get_site_job( $site_job_id );
 			if ( ! $job || ! $job->dest_blog_id ) {
@@ -21,15 +27,20 @@ class MediaImporter {
 				return;
 			}
 
-			$media_policy = $migration->media_conflict_policy ?? 'import_all';
+			$media_policy   = $migration->media_conflict_policy ?? 'import_all';
+			$is_retry_pass  = ! empty( $source_attachment_ids );
 
-			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'media', 'error_message' => null ] );
+			if ( ! $is_retry_pass ) {
+				MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'media', 'error_message' => null ] );
+			}
 
 			$media = SourceClient::get(
 				$migration->source_url,
 				$migration->source_api_key,
 				'source/sites/' . (int) $job->source_blog_id . '/media',
-				[ 'per_page' => 50, 'offset' => $offset ]
+				$is_retry_pass
+					? [ 'ids' => $source_attachment_ids ]
+					: [ 'per_page' => 50, 'offset' => $offset ]
 			);
 
 			// Allowed download origin: the source site's upload URL (prevents SSRF via crafted file_url).
@@ -40,6 +51,8 @@ class MediaImporter {
 			require_once ABSPATH . 'wp-admin/includes/media.php';
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 			require_once ABSPATH . 'wp-admin/includes/image.php';
+
+			$failed_source_ids = [];
 
 			foreach ( $media as $att ) {
 				$source_att_id = (int) ( $att['source_attachment_id'] ?? 0 );
@@ -72,17 +85,20 @@ class MediaImporter {
 
 				$file_url = $att['file_url'] ?? '';
 				if ( ! $file_url ) {
-					continue;
+					continue; // permanent skip — no file to download
 				}
 
 				// Validate file_url origin against the source's upload directory to prevent SSRF.
 				$file_host = wp_parse_url( $file_url, PHP_URL_HOST );
 				if ( ! $allowed_upload_origin || $file_host !== $allowed_upload_origin ) {
-					continue;
+					continue; // permanent skip — SSRF guard
 				}
 
 				$tmp = download_url( $file_url, 60 );
 				if ( is_wp_error( $tmp ) ) {
+					if ( $source_att_id ) {
+						$failed_source_ids[] = $source_att_id;
+					}
 					continue;
 				}
 
@@ -97,6 +113,9 @@ class MediaImporter {
 				}
 				if ( isset( $sideload['error'] ) ) {
 					@unlink( $tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+					if ( $source_att_id ) {
+						$failed_source_ids[] = $source_att_id;
+					}
 					continue;
 				}
 
@@ -119,6 +138,9 @@ class MediaImporter {
 				$dest_att_id = wp_insert_attachment( $attachment_data, $sideload['file'], $post_parent, true );
 				if ( is_wp_error( $dest_att_id ) ) {
 					@unlink( $sideload['file'] ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
+					if ( $source_att_id ) {
+						$failed_source_ids[] = $source_att_id;
+					}
 					continue;
 				}
 
@@ -135,6 +157,37 @@ class MediaImporter {
 			}
 
 			restore_current_blog();
+
+			// Retry any items that failed to download or import.
+			if ( ! empty( $failed_source_ids ) ) {
+				$max_retries = (int) apply_filters( 'hbm_max_retries', 3 );
+				if ( $attempt < $max_retries ) {
+					$delay = 60 * (int) pow( 2, $attempt );
+					as_schedule_single_action( time() + $delay, 'hbm_import_media', [
+						'site_job_id'           => $site_job_id,
+						'offset'                => 0,
+						'attempt'               => $attempt + 1,
+						'source_attachment_ids' => $failed_source_ids,
+					], 'hb-migrator' );
+				} else {
+					$existing     = MigrationRegistry::get_site_job( $site_job_id );
+					$prefix       = ! empty( $existing->error_message ) ? $existing->error_message . "\n" : '';
+					$count        = count( $failed_source_ids );
+					MigrationRegistry::update_site_job( $site_job_id, [
+						'error_message' => $prefix . sprintf(
+							'%d media item%s permanently failed to import (source IDs: %s).',
+							$count,
+							1 === $count ? '' : 's',
+							implode( ', ', $failed_source_ids )
+						),
+					] );
+				}
+			}
+
+			// Retry passes don't advance the pipeline — the original batch already did.
+			if ( $is_retry_pass ) {
+				return;
+			}
 
 			MigrationRegistry::update_site_job( $site_job_id, [ 'stage_offset' => $offset + count( $media ) ] );
 
