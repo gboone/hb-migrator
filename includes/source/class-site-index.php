@@ -58,6 +58,7 @@ class SiteIndex {
 		if ( 'complete' === ( $body['status'] ?? '' ) ) {
 			$active['dest_key'] = '';
 			update_site_option( 'hbm_active_migration', $active );
+			\HBMigrator\Admin\AdminPage::save_history_entry( $body );
 		}
 
 		return new \WP_REST_Response( $body, wp_remote_retrieve_response_code( $response ) );

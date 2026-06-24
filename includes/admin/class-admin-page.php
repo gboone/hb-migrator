@@ -180,6 +180,49 @@ class AdminPage {
 					<p class="description"><?php esc_html_e( 'Enter and save your destination URL and API key above to select sites.', 'hb-migrator' ); ?></p>
 				<?php endif; ?>
 			<?php endif; ?>
+
+			<?php
+			$history = (array) get_site_option( 'hbm_migration_history', [] );
+			if ( ! empty( $history ) ) :
+			?>
+			<hr>
+			<h2><?php esc_html_e( 'Past Migrations', 'hb-migrator' ); ?></h2>
+			<table class="widefat hbm-history-table">
+				<thead>
+					<tr>
+						<th><?php esc_html_e( 'Date', 'hb-migrator' ); ?></th>
+						<th><?php esc_html_e( 'Destination', 'hb-migrator' ); ?></th>
+						<th><?php esc_html_e( 'Status', 'hb-migrator' ); ?></th>
+						<th><?php esc_html_e( 'Sites', 'hb-migrator' ); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php foreach ( $history as $entry ) :
+						$started    = ! empty( $entry['started_at'] ) ? date_i18n( 'Y-m-d H:i', (int) $entry['started_at'] ) : esc_html__( '—', 'hb-migrator' );
+						$status_key = $entry['status'] ?? 'unknown';
+						$status_lbl = ucfirst( $status_key );
+					?>
+					<tr>
+						<td><?php echo esc_html( $started ); ?></td>
+						<td><?php echo esc_html( $entry['dest_url'] ?? '' ); ?></td>
+						<td><span class="hbm-status hbm-status-<?php echo esc_attr( $status_key ); ?>"><?php echo esc_html( $status_lbl ); ?></span></td>
+						<td>
+							<?php foreach ( (array) ( $entry['sites'] ?? [] ) as $site ) : ?>
+								<div class="hbm-history-site">
+									<span class="hbm-history-site-label"><?php echo esc_html( $site['source_domain'] ?? '' ); ?> &rarr; <?php echo esc_html( $site['dest_path'] ?? '' ); ?></span>
+									<span class="hbm-status hbm-status-<?php echo esc_attr( $site['status'] ?? '' ); ?>"><?php echo esc_html( ucfirst( $site['status'] ?? '' ) ); ?></span>
+									<?php if ( ! empty( $site['error_message'] ) ) : ?>
+										<p class="hbm-error-message"><?php echo esc_html( $site['error_message'] ); ?></p>
+									<?php endif; ?>
+								</div>
+							<?php endforeach; ?>
+						</td>
+					</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
+			<?php endif; ?>
+
 		</div>
 		<?php
 	}
@@ -258,6 +301,7 @@ class AdminPage {
 			'status_token' => $body['status_token'] ?? '',
 			'dest_url'     => $dest_url,
 			'dest_key'     => $dest_key,
+			'started_at'   => time(),
 		] );
 
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&started=1' ) );
@@ -269,8 +313,79 @@ class AdminPage {
 		if ( ! current_user_can( 'manage_network' ) ) {
 			wp_die( esc_html__( 'Insufficient permissions.', 'hb-migrator' ), 403 );
 		}
+
+		$active = get_site_option( 'hbm_active_migration' );
+		if ( $active ) {
+			self::save_history_entry( self::fetch_migration_status( $active ) );
+		}
+
 		delete_site_option( 'hbm_active_migration' );
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator' ) );
 		exit;
+	}
+
+	/**
+	 * Fetch current status from the destination for the given active migration.
+	 * Returns [ 'status' => 'unknown', 'sites' => [] ] on any failure.
+	 */
+	private static function fetch_migration_status( array $active ): array {
+		if ( empty( $active['migration_id'] ) || empty( $active['dest_url'] ) ) {
+			return [ 'status' => 'unknown', 'sites' => [] ];
+		}
+		$url = add_query_arg(
+			[ 'status_token' => $active['status_token'] ?? '' ],
+			trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/status/' . (int) $active['migration_id']
+		);
+		$response = wp_remote_get( $url, [
+			'headers'   => [ 'Authorization' => 'Bearer ' . ( $active['dest_key'] ?? '' ) ],
+			'timeout'   => 15,
+			'sslverify' => true,
+		] );
+		if ( is_wp_error( $response ) ) {
+			return [ 'status' => 'unknown', 'sites' => [] ];
+		}
+		$body = json_decode( wp_remote_retrieve_body( $response ), true );
+		return is_array( $body ) ? $body : [ 'status' => 'unknown', 'sites' => [] ];
+	}
+
+	/**
+	 * Persist a migration summary to hbm_migration_history (last 10 entries).
+	 * No-op when there is no active migration or the migration_id is already recorded.
+	 */
+	public static function save_history_entry( array $status_body ): void {
+		$active = get_site_option( 'hbm_active_migration' );
+		if ( ! $active || empty( $active['migration_id'] ) ) {
+			return;
+		}
+
+		$migration_id = (int) $active['migration_id'];
+		$history      = (array) get_site_option( 'hbm_migration_history', [] );
+
+		foreach ( $history as $entry ) {
+			if ( (int) ( $entry['migration_id'] ?? 0 ) === $migration_id ) {
+				return; // already recorded — no duplicate
+			}
+		}
+
+		$sites = [];
+		foreach ( (array) ( $status_body['sites'] ?? [] ) as $site ) {
+			$sites[] = [
+				'source_domain' => $site['source_domain'] ?? '',
+				'dest_path'     => $site['dest_path'] ?? '',
+				'status'        => $site['status'] ?? 'unknown',
+				'error_message' => $site['error_message'] ?? '',
+			];
+		}
+
+		array_unshift( $history, [
+			'migration_id' => $migration_id,
+			'dest_url'     => $active['dest_url'] ?? '',
+			'started_at'   => (int) ( $active['started_at'] ?? 0 ),
+			'saved_at'     => time(),
+			'status'       => $status_body['status'] ?? 'unknown',
+			'sites'        => $sites,
+		] );
+
+		update_site_option( 'hbm_migration_history', array_slice( $history, 0, 10 ) );
 	}
 }

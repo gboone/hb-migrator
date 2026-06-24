@@ -198,3 +198,21 @@
 #hbm-preflight-results {
 	margin-top: 1rem;
 }
+
+/* Past Migrations history table */
+.hbm-history-table td {
+	vertical-align: top;
+}
+
+.hbm-history-site {
+	margin-bottom: 6px;
+}
+
+.hbm-history-site:last-child {
+	margin-bottom: 0;
+}
+
+.hbm-history-site-label {
+	font-size: 13px;
+	margin-right: 6px;
+}
