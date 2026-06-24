@@ -162,6 +162,15 @@
 	font-weight: 600;
 }
 
+.hbm-conflict-items {
+	margin: 0 0 10px;
+	padding: 0 0 0 1.25em;
+	max-height: 120px;
+	overflow-y: auto;
+	font-size: 12px;
+	color: #50575e;
+}
+
 .hbm-conflict-section fieldset {
 	border: none;
 	padding: 0;

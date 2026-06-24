@@ -47,19 +47,15 @@ class PreflightService {
 
 			foreach ( $attachments as $attachment_id ) {
 				$file = get_attached_file( (int) $attachment_id );
-				if ( ! $file || ! is_readable( $file ) ) {
-					continue;
-				}
-				$md5 = hash_file( 'md5', $file );
-				if ( ! $md5 ) {
+				if ( ! $file ) {
 					continue;
 				}
 				$media_items[] = [
 					'blog_id'   => $blog_id,
 					'post_name' => get_post( (int) $attachment_id )->post_name ?? sanitize_title( basename( $file ) ),
 					'filename'  => basename( $file ),
-					'filesize'  => (int) filesize( $file ),
-					'md5'       => $md5,
+					'filesize'  => is_readable( $file ) ? (int) filesize( $file ) : 0,
+					'md5'       => '',
 				];
 			}
 
@@ -90,7 +86,7 @@ class PreflightService {
 
 		$result = self::run( $blog_ids );
 		if ( is_wp_error( $result ) ) {
-			return new \WP_REST_Response( [ 'error' => $result->get_error_message() ], 502 );
+			return new \WP_REST_Response( [ 'error' => $result->get_error_message() ], 200 );
 		}
 
 		return new \WP_REST_Response( $result );

@@ -133,7 +133,8 @@
 					{ value: 'merge',  label: 'Merge — map incoming users to existing accounts (current behavior)' },
 					{ value: 'create', label: 'Create — import as a new user with a modified email address' },
 				],
-				'merge'
+				'merge',
+				userConflicts
 			);
 		}
 
@@ -146,7 +147,8 @@
 					{ value: 'generate_new', label: 'Generate new — append -2, -3, etc. to create a unique path (recommended)' },
 					{ value: 'use_existing', label: 'Use existing — import content into the already-existing destination subsite' },
 				],
-				'generate_new'
+				'generate_new',
+				siteConflicts
 			);
 		}
 
@@ -159,7 +161,8 @@
 					{ value: 'import_all',      label: 'Import all — always import (current behavior)' },
 					{ value: 'skip_duplicates', label: 'Skip duplicates — reuse existing files matched by filename' },
 				],
-				'import_all'
+				'import_all',
+				mediaConflicts.map( function ( m ) { return m.post_name || m.filename || ''; } )
 			);
 		}
 
@@ -171,10 +174,21 @@
 		preflightStart.hidden = false;
 	}
 
-	function renderConflictSection( title, count, radioName, options, defaultValue ) {
+	function renderConflictSection( title, count, radioName, options, defaultValue, items ) {
 		let html = '<div class="hbm-conflict-section">' +
-			'<h4>' + esc( title ) + ' <span class="hbm-conflict-badge">' + esc( count ) + '</span></h4>' +
-			'<fieldset>';
+			'<h4>' + esc( title ) + ' <span class="hbm-conflict-badge">' + esc( count ) + '</span></h4>';
+
+		if ( items && items.length ) {
+			html += '<ul class="hbm-conflict-items">';
+			items.forEach( function ( item ) {
+				if ( item ) {
+					html += '<li>' + esc( String( item ) ) + '</li>';
+				}
+			} );
+			html += '</ul>';
+		}
+
+		html += '<fieldset>';
 		options.forEach( function ( opt ) {
 			const checked = opt.value === defaultValue ? ' checked' : '';
 			html += '<label class="hbm-policy-label">' +

@@ -10,7 +10,7 @@ class PreflightChecker {
 	 * @param array $payload {
 	 *   @type string[] $user_emails  Source user email addresses to check.
 	 *   @type string[] $site_paths   Computed dest_path values for source sites.
-	 *   @type array[]  $media        Each entry: {blog_id, filename, post_name, md5, filesize}.
+	 *   @type array[]  $media        Each entry: {blog_id, filename, post_name, filesize}.
 	 * }
 	 * @return array {conflicts: {users: string[], sites: string[], media: array[]}}
 	 */
@@ -85,18 +85,16 @@ class PreflightChecker {
 		foreach ( $media_items as $item ) {
 			$blog_id   = isset( $item['blog_id'] ) ? (int) $item['blog_id'] : 0;
 			$post_name = sanitize_title( (string) ( $item['post_name'] ?? $item['filename'] ?? '' ) );
-			$md5       = (string) ( $item['md5'] ?? '' );
 
-			if ( ! $blog_id || ! $post_name || ! $md5 ) {
+			if ( ! $blog_id || ! $post_name ) {
 				continue;
 			}
 
-			$match = $this->find_attachment_by_name_and_hash( $blog_id, $post_name, $md5 );
+			$match = $this->find_attachment_by_name( $blog_id, $post_name );
 			if ( $match ) {
 				$matched[] = [
 					'blog_id'   => $blog_id,
 					'post_name' => $post_name,
-					'md5'       => $md5,
 					'dest_id'   => $match,
 				];
 			}
@@ -105,7 +103,7 @@ class PreflightChecker {
 		return $matched;
 	}
 
-	private function find_attachment_by_name_and_hash( int $blog_id, string $post_name, string $expected_md5 ): int {
+	private function find_attachment_by_name( int $blog_id, string $post_name ): int {
 		switch_to_blog( $blog_id );
 
 		$posts = get_posts( [
@@ -116,22 +114,8 @@ class PreflightChecker {
 			'fields'      => 'ids',
 		] );
 
-		if ( empty( $posts ) ) {
-			restore_current_blog();
-			return 0;
-		}
-
-		$attachment_id = (int) $posts[0];
-		$file_path     = get_attached_file( $attachment_id );
-
-		if ( ! $file_path || ! is_readable( $file_path ) ) {
-			restore_current_blog();
-			return 0;
-		}
-
-		$actual_md5 = hash_file( 'md5', $file_path );
 		restore_current_blog();
 
-		return ( $actual_md5 && hash_equals( $expected_md5, $actual_md5 ) ) ? $attachment_id : 0;
+		return ! empty( $posts ) ? (int) $posts[0] : 0;
 	}
 }

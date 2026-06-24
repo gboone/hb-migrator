@@ -3,7 +3,7 @@
  * Plugin Name: HB Migrator
  * Plugin URI:  https://github.com/Automattic/hb-migrator
  * Description: End-to-end multisite migration via REST. Works as source and destination.
- * Version:     2.0.0
+ * Version:     2.1.0
  * Requires at least: 6.4
  * Requires PHP: 7.4
  * Network:     true
@@ -13,7 +13,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 	exit;
 }
 
-define( 'HBM_VERSION', '2.0.0' );
+define( 'HBM_VERSION', '2.1.0' );
 define( 'HBM_DB_VERSION', 4 );
 define( 'HBM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'HBM_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
