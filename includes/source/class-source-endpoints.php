@@ -46,7 +46,11 @@ class SourceEndpoints {
 			'methods'             => \WP_REST_Server::READABLE,
 			'callback'            => [ MediaReader::class, 'get_media' ],
 			'permission_callback' => $auth,
-			'args'                => $blog_id_args,
+			'args'                => array_merge( $blog_id_args, [
+				'ids' => [
+					'sanitize_callback' => fn( $v ) => array_values( array_filter( array_map( 'absint', (array) $v ) ) ),
+				],
+			] ),
 		] );
 
 		register_rest_route( $ns, '/source/sites/(?P<blog_id>\d+)/options', [

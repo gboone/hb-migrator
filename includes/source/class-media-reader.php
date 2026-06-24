@@ -9,16 +9,32 @@ class MediaReader {
 		$per_page = min( (int) ( $request->get_param( 'per_page' ) ?: 50 ), 200 );
 		$offset   = max( 0, (int) $request->get_param( 'offset' ) );
 
+		// When specific IDs are requested, fetch only those attachments.
+		$raw_ids = $request->get_param( 'ids' );
+		$ids     = [];
+		if ( ! empty( $raw_ids ) ) {
+			$ids = array_values( array_filter( array_map( 'absint', (array) $raw_ids ) ) );
+			$ids = array_slice( $ids, 0, 200 );
+		}
+
 		switch_to_blog( $blog_id );
 
-		$attachments = get_posts( [
-			'post_type'      => 'attachment',
-			'post_status'    => 'any',
-			'posts_per_page' => $per_page,
-			'offset'         => $offset,
-			'orderby'        => 'ID',
-			'order'          => 'ASC',
-		] );
+		$query_args = [
+			'post_type'   => 'attachment',
+			'post_status' => 'any',
+			'orderby'     => 'ID',
+			'order'       => 'ASC',
+		];
+
+		if ( ! empty( $ids ) ) {
+			$query_args['post__in']      = $ids;
+			$query_args['numberposts']   = count( $ids );
+		} else {
+			$query_args['posts_per_page'] = $per_page;
+			$query_args['offset']         = $offset;
+		}
+
+		$attachments = get_posts( $query_args );
 
 		$data = [];
 		foreach ( $attachments as $att ) {
