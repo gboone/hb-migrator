@@ -62,6 +62,31 @@ class MediaImporter {
 					continue;
 				}
 
+				// Cross-run deduplication: find attachments created by a previous migration run
+				// for this same source attachment. IdMap is per-site_job_id so it doesn't survive
+				// a Clear + re-run; post meta does.
+				if ( $source_att_id ) {
+					$prev_atts = get_posts( [
+						'post_type'   => 'attachment',
+						'post_status' => 'any',
+						'numberposts' => 1,
+						'fields'      => 'ids',
+						'meta_key'    => '_hbm_source_attachment_id',
+						'meta_value'  => $source_att_id,
+					] );
+					if ( ! empty( $prev_atts ) ) {
+						$prev_id   = (int) $prev_atts[0];
+						$prev_meta = wp_get_attachment_metadata( $prev_id );
+						if ( ! empty( $prev_meta ) ) {
+							// Healthy prior import — record in IdMap and skip re-download.
+							IdMap::set( $site_job_id, 'attachment', $source_att_id, $prev_id );
+							continue;
+						}
+						// Broken prior import — delete it so the re-sideload won't get a -1 suffix.
+						wp_delete_attachment( $prev_id, true );
+					}
+				}
+
 				// skip_duplicates: reuse existing destination attachment matched by filename.
 				if ( 'skip_duplicates' === $media_policy && $source_att_id ) {
 					$post_name = $att['post_name'] ?? '';
@@ -144,7 +169,18 @@ class MediaImporter {
 					continue;
 				}
 
+				if ( $source_att_id ) {
+					update_post_meta( $dest_att_id, '_hbm_source_attachment_id', $source_att_id );
+				}
+
 				$meta = wp_generate_attachment_metadata( $dest_att_id, $sideload['file'] );
+				if ( empty( $meta ) ) {
+					wp_delete_attachment( $dest_att_id, true );
+					if ( $source_att_id ) {
+						$failed_items[ $source_att_id ] = 'metadata generation failed — image may be corrupt or unprocessable';
+					}
+					continue;
+				}
 				wp_update_attachment_metadata( $dest_att_id, $meta );
 
 				if ( ! empty( $att['alt_text'] ) ) {

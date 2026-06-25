@@ -19,6 +19,7 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		parent::tear_down();
 		remove_all_filters( 'pre_http_request' );
 		remove_all_filters( 'upload_dir' );
+		remove_all_filters( 'wp_generate_attachment_metadata' );
 	}
 
 	// -------------------------------------------------------------------------
@@ -402,6 +403,182 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		}
 
 		$this->assertFalse( $ssrf_retry, 'SSRF-blocked items must not be queued for retry.' );
+	}
+
+	// Intercepts download_url by writing a minimal valid 1x1 PNG to the temp file WordPress
+	// pre-creates, then returns a 200 response. This lets wp_handle_sideload and wp_insert_attachment
+	// run normally so tests can reach wp_generate_attachment_metadata.
+	private function mock_successful_png_download(): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/wp-content/uploads/' ) ) {
+				if ( ! empty( $args['filename'] ) ) {
+					// Minimal 1×1 transparent PNG (67 bytes).
+					file_put_contents( $args['filename'], base64_decode(
+						'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+					) );
+				}
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => $args['filename'] ?? null,
+				];
+			}
+			return $preempt;
+		}, 20, 3 );
+	}
+
+	// -------------------------------------------------------------------------
+	// U2: Metadata generation failure → delete attachment and retry
+	// -------------------------------------------------------------------------
+
+	public function test_empty_metadata_schedules_retry(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 801, 'corrupt-image.png' ) ] );
+		$this->mock_successful_png_download();
+		add_filter( 'wp_generate_attachment_metadata', '__return_empty_array', 99 );
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		$this->assertNull( IdMap::get( $jid, 'attachment', 801 ), 'Empty metadata must not produce an IdMap entry.' );
+
+		$scheduled  = as_get_scheduled_actions( [ 'hook' => 'hbm_import_media', 'status' => \ActionScheduler_Store::STATUS_PENDING, 'per_page' => 50 ] );
+		$retry_found = false;
+		foreach ( $scheduled as $action ) {
+			$args = $action->get_args();
+			if ( isset( $args['source_attachment_ids'] ) && in_array( 801, (array) $args['source_attachment_ids'], true ) ) {
+				$retry_found = true;
+				break;
+			}
+		}
+		$this->assertTrue( $retry_found, 'Metadata failure must schedule a retry.' );
+	}
+
+	public function test_false_metadata_schedules_retry(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 802, 'corrupt-false.png' ) ] );
+		$this->mock_successful_png_download();
+		add_filter( 'wp_generate_attachment_metadata', '__return_false', 99 );
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		$this->assertNull( IdMap::get( $jid, 'attachment', 802 ), 'False metadata must not produce an IdMap entry.' );
+	}
+
+	public function test_metadata_failure_reason_in_permanent_error_message(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$max = (int) apply_filters( 'hbm_max_retries', 3 );
+
+		$this->mock_media( [ $this->make_attachment_item( 803, 'corrupt-exhausted.png' ) ] );
+		$this->mock_successful_png_download();
+		add_filter( 'wp_generate_attachment_metadata', '__return_empty_array', 99 );
+
+		MediaImporter::process( $jid, 0, $max, [ 803 ] );
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertNotEmpty( $job->error_message, 'error_message must be set when metadata retries are exhausted.' );
+		$this->assertStringContainsString( '803', $job->error_message );
+		$this->assertStringContainsString( 'metadata generation failed', $job->error_message );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: Cross-run deduplication by _hbm_source_attachment_id
+	// -------------------------------------------------------------------------
+
+	public function test_cross_run_healthy_prior_import_reuses_existing_attachment(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		// Simulate a healthy attachment left by a previous migration run.
+		$prior_att_id = wp_insert_post( [
+			'post_type'   => 'attachment',
+			'post_status' => 'inherit',
+			'post_title'  => 'Prior Healthy Attachment',
+		] );
+		update_post_meta( $prior_att_id, '_hbm_source_attachment_id', 901 );
+		wp_update_attachment_metadata( $prior_att_id, [ 'width' => 1200, 'height' => 800, 'file' => '2023/09/prior-healthy.jpg' ] );
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 901, 'prior-healthy.jpg' ) ] );
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		$this->assertSame( $prior_att_id, IdMap::get( $jid, 'attachment', 901 ), 'Healthy prior attachment must be reused via IdMap — no re-download.' );
+
+		wp_delete_post( $prior_att_id, true );
+	}
+
+	public function test_cross_run_broken_prior_import_is_deleted_before_reimport(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		// Simulate a broken attachment: post exists with source meta, but metadata is empty.
+		$broken_att_id = wp_insert_post( [
+			'post_type'   => 'attachment',
+			'post_status' => 'inherit',
+			'post_title'  => 'Prior Broken Attachment',
+		] );
+		update_post_meta( $broken_att_id, '_hbm_source_attachment_id', 902 );
+		// Deliberately leave _wp_attachment_metadata unset (empty).
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 902, 'prior-broken.jpg' ) ] );
+		$this->mock_download_failure(); // re-import attempt expected; let it fail for simplicity
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		// The broken attachment must have been deleted.
+		$this->assertNull( get_post( $broken_att_id ), 'Broken prior attachment must be deleted before re-import attempt.' );
+		// IdMap must not point to the old broken post.
+		$this->assertNotSame( $broken_att_id, IdMap::get( $jid, 'attachment', 902 ) );
+	}
+
+	public function test_cross_run_no_prior_import_proceeds_normally(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 903, 'fresh-import.jpg' ) ] );
+		$this->mock_download_failure();
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		// No prior attachment → download attempted normally (fails here); no IdMap entry.
+		$this->assertNull( IdMap::get( $jid, 'attachment', 903 ), 'Fresh import with no prior attachment must leave no IdMap entry after failed download.' );
 	}
 
 	public function test_skip_duplicates_with_multiple_items_maps_matched_and_skips_unmatched(): void {
