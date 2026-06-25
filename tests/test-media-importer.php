@@ -358,6 +358,8 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		$job = MigrationRegistry::get_site_job( $jid );
 		$this->assertNotEmpty( $job->error_message, 'error_message must be set when retries are exhausted.' );
 		$this->assertStringContainsString( '601', $job->error_message, 'error_message must include the permanently-failed source ID.' );
+		$this->assertStringContainsString( 'download failed', $job->error_message, 'error_message must include the failure reason.' );
+		$this->assertStringContainsString( 'Connection timed out', $job->error_message, 'error_message must include the underlying error from download_url.' );
 	}
 
 	public function test_ssrf_failure_is_not_retried(): void {

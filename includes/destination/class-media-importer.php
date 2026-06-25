@@ -52,7 +52,7 @@ class MediaImporter {
 			require_once ABSPATH . 'wp-admin/includes/file.php';
 			require_once ABSPATH . 'wp-admin/includes/image.php';
 
-			$failed_source_ids = [];
+			$failed_items = []; // source_att_id => human-readable failure reason
 
 			foreach ( $media as $att ) {
 				$source_att_id = (int) ( $att['source_attachment_id'] ?? 0 );
@@ -97,7 +97,7 @@ class MediaImporter {
 				$tmp = download_url( $file_url, 60 );
 				if ( is_wp_error( $tmp ) ) {
 					if ( $source_att_id ) {
-						$failed_source_ids[] = $source_att_id;
+						$failed_items[ $source_att_id ] = 'download failed: ' . $tmp->get_error_message();
 					}
 					continue;
 				}
@@ -114,7 +114,7 @@ class MediaImporter {
 				if ( isset( $sideload['error'] ) ) {
 					@unlink( $tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 					if ( $source_att_id ) {
-						$failed_source_ids[] = $source_att_id;
+						$failed_items[ $source_att_id ] = 'sideload failed: ' . $sideload['error'];
 					}
 					continue;
 				}
@@ -139,7 +139,7 @@ class MediaImporter {
 				if ( is_wp_error( $dest_att_id ) ) {
 					@unlink( $sideload['file'] ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 					if ( $source_att_id ) {
-						$failed_source_ids[] = $source_att_id;
+						$failed_items[ $source_att_id ] = 'insert failed: ' . $dest_att_id->get_error_message();
 					}
 					continue;
 				}
@@ -159,7 +159,7 @@ class MediaImporter {
 			restore_current_blog();
 
 			// Retry any items that failed to download or import.
-			if ( ! empty( $failed_source_ids ) ) {
+			if ( ! empty( $failed_items ) ) {
 				$max_retries = (int) apply_filters( 'hbm_max_retries', 3 );
 				if ( $attempt < $max_retries ) {
 					$delay = 60 * (int) pow( 2, $attempt );
@@ -167,19 +167,22 @@ class MediaImporter {
 						'site_job_id'           => $site_job_id,
 						'offset'                => 0,
 						'attempt'               => $attempt + 1,
-						'source_attachment_ids' => $failed_source_ids,
+						'source_attachment_ids' => array_keys( $failed_items ),
 					], 'hb-migrator' );
 				} else {
-					$existing     = MigrationRegistry::get_site_job( $site_job_id );
-					$prefix       = ! empty( $existing->error_message ) ? $existing->error_message . "\n" : '';
-					$count        = count( $failed_source_ids );
+					$existing = MigrationRegistry::get_site_job( $site_job_id );
+					$prefix   = ! empty( $existing->error_message ) ? $existing->error_message . "\n" : '';
+					$count    = count( $failed_items );
+					$lines    = [];
+					foreach ( $failed_items as $id => $reason ) {
+						$lines[] = "  {$id}: {$reason}";
+					}
 					MigrationRegistry::update_site_job( $site_job_id, [
 						'error_message' => $prefix . sprintf(
-							'%d media item%s permanently failed to import (source IDs: %s).',
+							'%d media item%s permanently failed to import:',
 							$count,
-							1 === $count ? '' : 's',
-							implode( ', ', $failed_source_ids )
-						),
+							1 === $count ? '' : 's'
+						) . "\n" . implode( "\n", $lines ),
 					] );
 				}
 			}
