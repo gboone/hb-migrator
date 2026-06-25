@@ -194,7 +194,7 @@ class MediaImporter {
 			if ( count( $media ) >= 50 ) {
 				as_enqueue_async_action(
 					'hbm_import_media',
-					[ 'site_job_id' => $site_job_id, 'offset' => $offset + 50, 'attempt' => 0 ],
+					[ 'site_job_id' => $site_job_id, 'offset' => $offset + 50, 'attempt' => 0, 'source_attachment_ids' => [] ],
 					'hb-migrator'
 				);
 				return;
@@ -213,7 +213,7 @@ class MediaImporter {
 			}
 			PipelineController::handle_batch_failure(
 				'hbm_import_media',
-				[ 'site_job_id' => $site_job_id, 'offset' => $offset, 'attempt' => $attempt ],
+				[ 'site_job_id' => $site_job_id, 'offset' => $offset, 'attempt' => $attempt, 'source_attachment_ids' => $source_attachment_ids ],
 				$e,
 				$site_job_id
 			);

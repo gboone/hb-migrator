@@ -197,10 +197,18 @@ class AdminPage {
 					</tr>
 				</thead>
 				<tbody>
-					<?php foreach ( $history as $entry ) :
+					<?php
+					$status_labels = [
+						'complete' => __( 'Complete', 'hb-migrator' ),
+						'running'  => __( 'Running', 'hb-migrator' ),
+						'failed'   => __( 'Failed', 'hb-migrator' ),
+						'pending'  => __( 'Pending', 'hb-migrator' ),
+						'unknown'  => __( 'Unknown', 'hb-migrator' ),
+					];
+					foreach ( $history as $entry ) :
 						$started    = ! empty( $entry['started_at'] ) ? date_i18n( 'Y-m-d H:i', (int) $entry['started_at'] ) : esc_html__( '—', 'hb-migrator' );
 						$status_key = $entry['status'] ?? 'unknown';
-						$status_lbl = ucfirst( $status_key );
+						$status_lbl = $status_labels[ $status_key ] ?? ucfirst( $status_key );
 					?>
 					<tr>
 						<td><?php echo esc_html( $started ); ?></td>
@@ -210,7 +218,7 @@ class AdminPage {
 							<?php foreach ( (array) ( $entry['sites'] ?? [] ) as $site ) : ?>
 								<div class="hbm-history-site">
 									<span class="hbm-history-site-label"><?php echo esc_html( $site['source_domain'] ?? '' ); ?> &rarr; <?php echo esc_html( $site['dest_path'] ?? '' ); ?></span>
-									<span class="hbm-status hbm-status-<?php echo esc_attr( $site['status'] ?? '' ); ?>"><?php echo esc_html( ucfirst( $site['status'] ?? '' ) ); ?></span>
+									<span class="hbm-status hbm-status-<?php echo esc_attr( $site['status'] ?? '' ); ?>"><?php echo esc_html( $status_labels[ $site['status'] ?? '' ] ?? ucfirst( $site['status'] ?? '' ) ); ?></span>
 									<?php if ( ! empty( $site['error_message'] ) ) : ?>
 										<p class="hbm-error-message"><?php echo esc_html( $site['error_message'] ); ?></p>
 									<?php endif; ?>
@@ -316,7 +324,7 @@ class AdminPage {
 
 		$active = get_site_option( 'hbm_active_migration' );
 		if ( $active ) {
-			self::save_history_entry( self::fetch_migration_status( $active ) );
+			self::save_history_entry( self::fetch_migration_status( $active ), $active );
 		}
 
 		delete_site_option( 'hbm_active_migration' );
@@ -332,6 +340,15 @@ class AdminPage {
 		if ( empty( $active['migration_id'] ) || empty( $active['dest_url'] ) ) {
 			return [ 'status' => 'unknown', 'sites' => [] ];
 		}
+		$host = wp_parse_url( $active['dest_url'], PHP_URL_HOST );
+		if ( ! $host ) {
+			return [ 'status' => 'unknown', 'sites' => [] ];
+		}
+		$resolved_ip = gethostbyname( $host );
+		if ( ! filter_var( $resolved_ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) ) {
+			return [ 'status' => 'unknown', 'sites' => [] ];
+		}
+
 		$url = add_query_arg(
 			[ 'status_token' => $active['status_token'] ?? '' ],
 			trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/status/' . (int) $active['migration_id']
@@ -351,9 +368,17 @@ class AdminPage {
 	/**
 	 * Persist a migration summary to hbm_migration_history (last 10 entries).
 	 * No-op when there is no active migration or the migration_id is already recorded.
+	 *
+	 * @param array      $status_body Response body from the destination status endpoint.
+	 * @param array|null $active      hbm_active_migration snapshot. When null the option is read
+	 *                                from the DB; pass it explicitly to avoid a second read and
+	 *                                the TOCTOU race if handle_clear_migration deletes the option
+	 *                                between the caller's read and this function's read.
 	 */
-	public static function save_history_entry( array $status_body ): void {
-		$active = get_site_option( 'hbm_active_migration' );
+	public static function save_history_entry( array $status_body, ?array $active = null ): void {
+		if ( null === $active ) {
+			$active = get_site_option( 'hbm_active_migration' );
+		}
 		if ( ! $active || empty( $active['migration_id'] ) ) {
 			return;
 		}
@@ -379,7 +404,7 @@ class AdminPage {
 
 		array_unshift( $history, [
 			'migration_id' => $migration_id,
-			'dest_url'     => $active['dest_url'] ?? '',
+			'dest_url'     => esc_url_raw( $active['dest_url'] ?? '' ),
 			'started_at'   => (int) ( $active['started_at'] ?? 0 ),
 			'saved_at'     => time(),
 			'status'       => $status_body['status'] ?? 'unknown',
