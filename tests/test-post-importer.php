@@ -123,4 +123,61 @@ class Test_PostImporter extends WP_UnitTestCase {
 		$this->assertNotEmpty( $posts );
 		$this->assertSame( 'custom-value', get_post_meta( $posts[0]->ID, '_custom_field', true ) );
 	}
+
+	public function test_attachment_post_type_is_skipped(): void {
+		$attachment = $this->make_source_post( [
+			'ID'            => 999,
+			'post_type'     => 'attachment',
+			'post_mime_type' => 'image/jpeg',
+			'post_name'     => 'photo-jpg',
+		] );
+		$this->mock_posts_response( [ $attachment ] );
+
+		PostImporter::process( $this->jid, 0, 0 );
+
+		// No attachment post should have been created.
+		$created = get_posts( [
+			'post_type'   => 'attachment',
+			'post_status' => 'any',
+			'numberposts' => -1,
+		] );
+		$this->assertEmpty( $created, 'PostImporter must not create attachment posts.' );
+	}
+
+	public function test_attachment_skipped_and_regular_post_imported_in_mixed_batch(): void {
+		$attachment = $this->make_source_post( [
+			'ID'        => 801,
+			'post_type' => 'attachment',
+			'post_name' => 'image-jpg',
+		] );
+		$post = $this->make_source_post( [
+			'ID'        => 802,
+			'post_type' => 'post',
+			'post_name' => 'my-article',
+		] );
+		$this->mock_posts_response( [ $attachment, $post ] );
+
+		PostImporter::process( $this->jid, 0, 0 );
+
+		// The attachment must be absent.
+		$att_posts = get_posts( [ 'post_type' => 'attachment', 'post_status' => 'any', 'numberposts' => -1 ] );
+		$this->assertEmpty( $att_posts );
+
+		// The regular post must be present.
+		$reg_posts = get_posts( [ 'post_type' => 'post', 'post_status' => 'any', 'numberposts' => -1 ] );
+		$this->assertCount( 1, $reg_posts );
+		$this->assertSame( 'my-article', $reg_posts[0]->post_name );
+	}
+
+	public function test_attachment_source_id_not_in_idmap(): void {
+		$attachment = $this->make_source_post( [
+			'ID'        => 501,
+			'post_type' => 'attachment',
+		] );
+		$this->mock_posts_response( [ $attachment ] );
+
+		PostImporter::process( $this->jid, 0, 0 );
+
+		$this->assertNull( \HBMigrator\IdMap::get( $this->jid, 'post', 501 ) );
+	}
 }

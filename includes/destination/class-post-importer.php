@@ -38,6 +38,12 @@ class PostImporter {
 			$max_id = $last_id;
 
 			foreach ( $posts as $p ) {
+				// Attachment posts are handled by the media pipeline with file sideloading.
+				// Creating them here produces hollow records that cause -1 filename collisions.
+				if ( 'attachment' === ( $p['post_type'] ?? '' ) ) {
+					continue;
+				}
+
 				$source_id = (int) $p['ID'];
 
 				$existing_dest_id = IdMap::get( $site_job_id, 'post', $source_id );

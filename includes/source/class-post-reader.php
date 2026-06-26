@@ -14,7 +14,7 @@ class PostReader {
 		switch_to_blog( $blog_id );
 
 		$posts = $wpdb->get_results( $wpdb->prepare(
-			"SELECT * FROM {$wpdb->posts} WHERE ID > %d ORDER BY ID LIMIT %d",
+			"SELECT * FROM {$wpdb->posts} WHERE ID > %d AND post_type != 'attachment' ORDER BY ID LIMIT %d",
 			$last_id,
 			$per_page
 		) );
