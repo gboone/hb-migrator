@@ -14,7 +14,7 @@ if ( ! defined( 'ABSPATH' ) ) {
 }
 
 define( 'HBM_VERSION', '2.1.0' );
-define( 'HBM_DB_VERSION', 4 );
+define( 'HBM_DB_VERSION', 5 );
 define( 'HBM_PLUGIN_DIR', plugin_dir_path( __FILE__ ) );
 define( 'HBM_PLUGIN_URL', plugin_dir_url( __FILE__ ) );
 define( 'HBM_API_NAMESPACE', 'hb-migrator/v1' );

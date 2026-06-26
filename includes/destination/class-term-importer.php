@@ -22,6 +22,13 @@ class TermImporter {
 				return;
 			}
 
+			// If dest_blog_id is set but the blog was deleted (e.g. user cleared and restarted),
+			// reset it so a fresh subsite is created rather than silently skipping creation.
+			if ( $job->dest_blog_id && ! get_site( (int) $job->dest_blog_id ) ) {
+				MigrationRegistry::update_site_job( $site_job_id, [ 'dest_blog_id' => null ] );
+				$job->dest_blog_id = null;
+			}
+
 			// Create destination subsite on first batch.
 			if ( null === $job->dest_blog_id || 0 === (int) $job->dest_blog_id ) {
 				$site_policy  = $migration->site_conflict_policy ?? 'generate_new';

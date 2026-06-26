@@ -68,6 +68,14 @@ class MigrationRegistry {
 		);
 	}
 
+	public static function cancel_migration( int $id ): void {
+		global $wpdb;
+		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"UPDATE `{$wpdb->base_prefix}hbm_migrations` SET status = 'cancelled' WHERE id = %d AND status != 'complete'",
+			$id
+		) );
+	}
+
 	public static function fail_migration( int $id, string $error_message ): void {
 		global $wpdb;
 		$wpdb->update(

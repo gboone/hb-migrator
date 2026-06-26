@@ -351,6 +351,24 @@ class AdminPage {
 		$active = get_site_option( 'hbm_active_migration' );
 		if ( $active ) {
 			self::save_history_entry( self::fetch_migration_status( $active ), $active );
+
+			// Cancel on destination so the old migration record is not restarted if the
+			// user starts a fresh migration for the same source. Best-effort — don't block
+			// the clear if the destination is temporarily unreachable.
+			if ( ! empty( $active['migration_id'] ) && ! empty( $active['dest_url'] ) && ! empty( $active['dest_key'] ) ) {
+				wp_remote_post(
+					trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/migrations/' . (int) $active['migration_id'] . '/cancel',
+					[
+						'headers'   => [
+							'Authorization' => 'Bearer ' . $active['dest_key'],
+							'Content-Type'  => 'application/json',
+						],
+						'body'      => '{}',
+						'timeout'   => 10,
+						'sslverify' => true,
+					]
+				);
+			}
 		}
 
 		delete_site_option( 'hbm_active_migration' );

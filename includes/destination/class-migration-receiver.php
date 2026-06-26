@@ -30,6 +30,12 @@ class MigrationReceiver {
 			'callback'            => [ self::class, 'preflight' ],
 			'permission_callback' => $auth,
 		] );
+
+		register_rest_route( $ns, '/destination/migrations/(?P<id>\d+)/cancel', [
+			'methods'             => \WP_REST_Server::CREATABLE,
+			'callback'            => [ self::class, 'cancel' ],
+			'permission_callback' => $auth,
+		] );
 	}
 
 	public static function preflight( \WP_REST_Request $request ): \WP_REST_Response {
@@ -49,6 +55,19 @@ class MigrationReceiver {
 			'media'       => (array) ( $request->get_param( 'media' )       ?: [] ),
 		] );
 		return new \WP_REST_Response( $result );
+	}
+
+	public static function cancel( \WP_REST_Request $request ): \WP_REST_Response {
+		$id        = (int) $request->get_param( 'id' );
+		$migration = MigrationRegistry::get_migration( $id );
+		if ( ! $migration ) {
+			return new \WP_REST_Response( [ 'error' => 'Migration not found.' ], 404 );
+		}
+		if ( 'complete' === $migration->status ) {
+			return new \WP_REST_Response( [ 'status' => 'already_complete' ], 200 );
+		}
+		MigrationRegistry::cancel_migration( $id );
+		return new \WP_REST_Response( [ 'status' => 'cancelled' ], 200 );
 	}
 
 	public static function begin( \WP_REST_Request $request ): \WP_REST_Response {
