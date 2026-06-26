@@ -68,12 +68,20 @@ class MigrationRegistry {
 		);
 	}
 
-	public static function cancel_migration( int $id ): void {
+	public static function cancel_migration( int $id ): bool {
 		global $wpdb;
 		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
 			"UPDATE `{$wpdb->base_prefix}hbm_migrations` SET status = 'cancelled' WHERE id = %d AND status NOT IN ('complete', 'cancelled')",
 			$id
 		) );
+		$cancelled = (bool) $wpdb->rows_affected;
+		if ( $cancelled ) {
+			// Stop any pending AS actions so importers that haven't fired yet are also halted.
+			// In-flight actions that are already executing will exit via the status guard at the
+			// top of each importer's process() method.
+			as_unschedule_all_actions( 'hb-migrator' );
+		}
+		return $cancelled;
 	}
 
 	public static function fail_migration( int $id, string $error_message ): void {

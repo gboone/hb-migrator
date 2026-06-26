@@ -295,7 +295,7 @@ class AdminPage {
 		$source_api_key = \HBMigrator\ApiAuth::get_or_create_key();
 
 		$response = wp_remote_post(
-			trailingslashit( $dest_url ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/begin',
+			self::dest_api_url( $dest_url, '/destination/begin' ),
 			[
 				'headers'   => [
 					'Authorization' => 'Bearer ' . $dest_key,
@@ -357,7 +357,7 @@ class AdminPage {
 			// the clear if the destination is temporarily unreachable.
 			if ( ! empty( $active['migration_id'] ) && ! empty( $active['dest_url'] ) && ! empty( $active['dest_key'] ) ) {
 				$cancel_response = wp_remote_post(
-					trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/migrations/' . (int) $active['migration_id'] . '/cancel',
+					self::dest_api_url( $active['dest_url'], '/destination/migrations/' . (int) $active['migration_id'] . '/cancel' ),
 					[
 						'headers'   => [
 							'Authorization' => 'Bearer ' . $active['dest_key'],
@@ -399,7 +399,7 @@ class AdminPage {
 
 		$url = add_query_arg(
 			[ 'status_token' => $active['status_token'] ?? '' ],
-			trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/status/' . (int) $active['migration_id']
+			self::dest_api_url( $active['dest_url'], '/destination/status/' . (int) $active['migration_id'] )
 		);
 		$response = wp_remote_get( $url, [
 			'headers'   => [ 'Authorization' => 'Bearer ' . ( $active['dest_key'] ?? '' ) ],
@@ -460,5 +460,9 @@ class AdminPage {
 		] );
 
 		update_site_option( 'hbm_migration_history', array_slice( $history, 0, 10 ) );
+	}
+
+	private static function dest_api_url( string $dest_url, string $path ): string {
+		return trailingslashit( $dest_url ) . 'wp-json/' . HBM_API_NAMESPACE . $path;
 	}
 }

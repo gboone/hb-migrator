@@ -70,7 +70,14 @@ class MigrationReceiver {
 			return new \WP_REST_Response( [ 'error' => 'Forbidden.' ], 403 );
 		}
 
-		MigrationRegistry::cancel_migration( $id );
+		// Already in a terminal state — nothing to do, report success.
+		if ( in_array( $migration->status, [ 'complete', 'cancelled' ], true ) ) {
+			return new \WP_REST_Response( [ 'status' => 'cancelled' ], 200 );
+		}
+
+		if ( ! MigrationRegistry::cancel_migration( $id ) ) {
+			return new \WP_REST_Response( [ 'error' => 'Could not cancel migration.' ], 500 );
+		}
 		return new \WP_REST_Response( [ 'status' => 'cancelled' ], 200 );
 	}
 

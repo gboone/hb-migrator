@@ -21,6 +21,9 @@ class PostImporter {
 			if ( ! $migration ) {
 				return;
 			}
+			if ( 'cancelled' === $migration->status ) {
+				return;
+			}
 
 			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'posts', 'error_message' => null ] );
 

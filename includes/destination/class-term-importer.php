@@ -21,6 +21,9 @@ class TermImporter {
 			if ( ! $migration ) {
 				return;
 			}
+			if ( 'cancelled' === $migration->status ) {
+				return;
+			}
 
 			// If dest_blog_id is set but the blog was deleted or soft-deleted, reset it so a
 			// fresh subsite is created. get_site() returns non-null for soft-deleted blogs

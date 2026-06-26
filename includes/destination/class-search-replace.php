@@ -34,6 +34,11 @@ class SearchReplace {
 				return;
 			}
 
+			$migration = MigrationRegistry::get_migration( (int) $job->migration_id );
+			if ( ! $migration || 'cancelled' === $migration->status ) {
+				return;
+			}
+
 			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'search_replace', 'error_message' => null ] );
 
 			switch_to_blog( (int) $job->dest_blog_id );

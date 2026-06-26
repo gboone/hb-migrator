@@ -16,6 +16,9 @@ class UserImporter {
 			if ( ! $migration ) {
 				return;
 			}
+			if ( 'cancelled' === $migration->status ) {
+				return;
+			}
 
 			// On a fresh start (or restart), clear any role rows from a prior run before
 			// re-inserting. Mid-batch retries (offset > 0) skip this so already-stored

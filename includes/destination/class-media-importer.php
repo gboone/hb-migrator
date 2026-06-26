@@ -26,6 +26,9 @@ class MediaImporter {
 			if ( ! $migration ) {
 				return;
 			}
+			if ( 'cancelled' === $migration->status ) {
+				return;
+			}
 
 			$media_policy   = $migration->media_conflict_policy ?? 'import_all';
 			$media_scope    = $migration->media_import_scope    ?? 'all';
