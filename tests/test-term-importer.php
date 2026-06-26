@@ -139,4 +139,44 @@ class Test_Term_Importer extends WP_UnitTestCase {
 
 		wp_delete_site( $existing_id );
 	}
+
+	// -------------------------------------------------------------------------
+	// Email suppression tests
+	// -------------------------------------------------------------------------
+
+	public function test_create_subsite_does_not_trigger_mail_send(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'create_subsite() requires multisite.' );
+		}
+
+		$phpmailer_fired = false;
+		$sentinel        = function() use ( &$phpmailer_fired ) {
+			$phpmailer_fired = true;
+		};
+		add_action( 'phpmailer_init', $sentinel );
+
+		$job    = $this->make_job( [ 'dest_path' => '/mail-suppress-test/' ] );
+		$new_id = $this->call_create_subsite( $job );
+		$this->assertGreaterThan( 0, $new_id );
+
+		remove_action( 'phpmailer_init', $sentinel );
+		wp_delete_site( $new_id );
+
+		$this->assertFalse( $phpmailer_fired, 'phpmailer must not be initialized during subsite creation.' );
+	}
+
+	public function test_create_subsite_removes_pre_wp_mail_filter_on_success(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'create_subsite() requires multisite.' );
+		}
+
+		$count_before = count( array_keys( $GLOBALS['wp_filter']['pre_wp_mail']->callbacks ?? [] ) );
+
+		$job    = $this->make_job( [ 'dest_path' => '/filter-cleanup-test/' ] );
+		$new_id = $this->call_create_subsite( $job );
+		wp_delete_site( $new_id );
+
+		$count_after = count( array_keys( $GLOBALS['wp_filter']['pre_wp_mail']->callbacks ?? [] ) );
+		$this->assertSame( $count_before, $count_after, 'pre_wp_mail filter must not remain registered after create_subsite() returns.' );
+	}
 }

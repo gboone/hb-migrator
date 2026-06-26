@@ -126,11 +126,24 @@ class TermImporter {
 
 	private static function assign_user_roles( int $migration_id, int $source_blog_id, int $dest_blog_id ): void {
 		$rows = UserSiteRoles::get_for_migration_blog( $migration_id, $source_blog_id );
-		foreach ( $rows as $row ) {
-			$dest_user_id = IdMap::get( IdMap::NETWORK, 'user', (int) $row['source_user_id'] );
-			if ( $dest_user_id ) {
-				add_user_to_blog( $dest_blog_id, $dest_user_id, $row['role'] );
+		if ( empty( $rows ) ) {
+			return;
+		}
+
+		$suppress_mail = static function (): \WP_Error {
+			return new \WP_Error( 'hbm_suppressed', '' );
+		};
+		add_filter( 'pre_wp_mail', $suppress_mail );
+
+		try {
+			foreach ( $rows as $row ) {
+				$dest_user_id = IdMap::get( IdMap::NETWORK, 'user', (int) $row['source_user_id'] );
+				if ( $dest_user_id ) {
+					add_user_to_blog( $dest_blog_id, $dest_user_id, $row['role'] );
+				}
 			}
+		} finally {
+			remove_filter( 'pre_wp_mail', $suppress_mail );
 		}
 	}
 
@@ -140,6 +153,19 @@ class TermImporter {
 			throw new \RuntimeException( 'No network found on destination.' );
 		}
 
+		$suppress_mail = static function (): \WP_Error {
+			return new \WP_Error( 'hbm_suppressed', '' );
+		};
+		add_filter( 'pre_wp_mail', $suppress_mail );
+
+		try {
+			return self::create_subsite_inner( $job, $policy, $network );
+		} finally {
+			remove_filter( 'pre_wp_mail', $suppress_mail );
+		}
+	}
+
+	private static function create_subsite_inner( object $job, string $policy, \WP_Network $network ): int {
 		$result = wp_insert_site( [
 			'domain'     => $network->domain,
 			'path'       => $job->dest_path,
