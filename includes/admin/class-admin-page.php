@@ -356,18 +356,22 @@ class AdminPage {
 			// user starts a fresh migration for the same source. Best-effort — don't block
 			// the clear if the destination is temporarily unreachable.
 			if ( ! empty( $active['migration_id'] ) && ! empty( $active['dest_url'] ) && ! empty( $active['dest_key'] ) ) {
-				wp_remote_post(
+				$cancel_response = wp_remote_post(
 					trailingslashit( $active['dest_url'] ) . 'wp-json/' . HBM_API_NAMESPACE . '/destination/migrations/' . (int) $active['migration_id'] . '/cancel',
 					[
 						'headers'   => [
 							'Authorization' => 'Bearer ' . $active['dest_key'],
 							'Content-Type'  => 'application/json',
 						],
-						'body'      => '{}',
-						'timeout'   => 10,
+						'body'      => wp_json_encode( [ 'status_token' => $active['status_token'] ?? '' ] ),
+						'timeout'   => 5,
 						'sslverify' => true,
 					]
 				);
+				if ( is_wp_error( $cancel_response ) ) {
+					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+					error_log( 'HB Migrator: destination cancel failed for migration ' . (int) $active['migration_id'] . ': ' . $cancel_response->get_error_message() );
+				}
 			}
 		}
 

@@ -274,9 +274,21 @@ class MediaImporter {
 		if ( ! $source_mime ) {
 			return null;
 		}
-		$ext    = strtolower( pathinfo( $filename, PATHINFO_EXTENSION ) );
+		$ext = strtolower( pathinfo( $filename, PATHINFO_EXTENSION ) );
+
+		// Never override WP's intentional block on server-executable file types.
+		// WordPress sets both ext and type to the boolean false (not empty string) when blocking
+		// a file — using strict false === comparison avoids clobbering partial results from other
+		// filters and avoids overriding WP's finfo-based content-integrity check.
+		$blocked = [ 'php', 'php3', 'php4', 'php5', 'php7', 'phps', 'phtml', 'phar', 'asp', 'aspx', 'cgi', 'pl', 'py', 'rb', 'sh', 'shtml', 'htaccess', 'exe', 'dll' ];
+		if ( in_array( $ext, $blocked, true ) ) {
+			return null;
+		}
+
 		$filter = static function ( array $data ) use ( $source_mime, $ext ): array {
-			if ( empty( $data['ext'] ) || empty( $data['type'] ) ) {
+			// WP returns false (not empty string) for both when it fully rejects a type.
+			// Only override when WP produced a complete rejection — not a partial result.
+			if ( false === $data['ext'] && false === $data['type'] ) {
 				$data['ext']  = $ext;
 				$data['type'] = $source_mime;
 			}

@@ -71,7 +71,7 @@ class MigrationRegistry {
 	public static function cancel_migration( int $id ): void {
 		global $wpdb;
 		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-			"UPDATE `{$wpdb->base_prefix}hbm_migrations` SET status = 'cancelled' WHERE id = %d AND status != 'complete'",
+			"UPDATE `{$wpdb->base_prefix}hbm_migrations` SET status = 'cancelled' WHERE id = %d AND status NOT IN ('complete', 'cancelled')",
 			$id
 		) );
 	}

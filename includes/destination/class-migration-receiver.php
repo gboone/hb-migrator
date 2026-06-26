@@ -31,7 +31,7 @@ class MigrationReceiver {
 			'permission_callback' => $auth,
 		] );
 
-		register_rest_route( $ns, '/destination/migrations/(?P<id>\d+)/cancel', [
+		register_rest_route( $ns, '/destination/migrations/(?P<migration_id>\d+)/cancel', [
 			'methods'             => \WP_REST_Server::CREATABLE,
 			'callback'            => [ self::class, 'cancel' ],
 			'permission_callback' => $auth,
@@ -58,14 +58,18 @@ class MigrationReceiver {
 	}
 
 	public static function cancel( \WP_REST_Request $request ): \WP_REST_Response {
-		$id        = (int) $request->get_param( 'id' );
+		$id        = (int) $request->get_param( 'migration_id' );
 		$migration = MigrationRegistry::get_migration( $id );
 		if ( ! $migration ) {
 			return new \WP_REST_Response( [ 'error' => 'Migration not found.' ], 404 );
 		}
-		if ( 'complete' === $migration->status ) {
-			return new \WP_REST_Response( [ 'status' => 'already_complete' ], 200 );
+
+		// IDOR guard: only the source that started this migration can cancel it.
+		$provided_token = sanitize_text_field( (string) $request->get_param( 'status_token' ) );
+		if ( empty( $migration->status_token ) || ! hash_equals( $migration->status_token, $provided_token ) ) {
+			return new \WP_REST_Response( [ 'error' => 'Forbidden.' ], 403 );
 		}
+
 		MigrationRegistry::cancel_migration( $id );
 		return new \WP_REST_Response( [ 'status' => 'cancelled' ], 200 );
 	}
