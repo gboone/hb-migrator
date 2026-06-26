@@ -194,6 +194,15 @@ class Test_Admin_Page extends WP_UnitTestCase {
 					'filename' => null,
 				];
 			}
+			if ( false !== strpos( $url, '/cancel' ) ) {
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => wp_json_encode( [ 'status' => 'cancelled' ] ),
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
 			return $preempt;
 		}, 10, 3 );
 
@@ -223,7 +232,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			'started_at'   => 0,
 		] );
 
-		// Destination is unreachable.
+		// Destination is unreachable — both status and cancel requests fail.
 		add_filter( 'pre_http_request', function () {
 			return new \WP_Error( 'http_request_failed', 'Connection refused.' );
 		} );

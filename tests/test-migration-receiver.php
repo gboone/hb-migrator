@@ -233,6 +233,117 @@ class Test_MigrationReceiver extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// cancel() endpoint
+	// -------------------------------------------------------------------------
+
+	private function make_running_migration(): array {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		$migration = MigrationRegistry::get_migration( $mid );
+		return [ 'id' => $mid, 'token' => $migration->status_token ];
+	}
+
+	private function cancel_request( int $migration_id, string $status_token = '' ): \WP_REST_Response {
+		$req = new WP_REST_Request( 'POST', '/' . HBM_API_NAMESPACE . '/destination/migrations/' . $migration_id . '/cancel' );
+		$req->set_param( 'migration_id', $migration_id );
+		$req->set_param( 'status_token', $status_token );
+		return MigrationReceiver::cancel( $req );
+	}
+
+	public function test_cancel_returns_404_for_unknown_migration(): void {
+		$response = $this->cancel_request( 999999 );
+		$this->assertSame( 404, $response->get_status() );
+	}
+
+	public function test_cancel_returns_403_when_status_token_is_missing(): void {
+		[ 'id' => $mid ] = $this->make_running_migration();
+		$response = $this->cancel_request( $mid, '' );
+		$this->assertSame( 403, $response->get_status() );
+	}
+
+	public function test_cancel_returns_403_when_status_token_is_wrong(): void {
+		[ 'id' => $mid ] = $this->make_running_migration();
+		$response = $this->cancel_request( $mid, 'wrong-token' );
+		$this->assertSame( 403, $response->get_status() );
+	}
+
+	public function test_cancel_returns_200_and_cancelled_status_for_running_migration(): void {
+		[ 'id' => $mid, 'token' => $token ] = $this->make_running_migration();
+		$response = $this->cancel_request( $mid, $token );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertSame( 'cancelled', $response->get_data()['status'] ?? null );
+
+		$migration = MigrationRegistry::get_migration( $mid );
+		$this->assertSame( 'cancelled', $migration->status );
+	}
+
+	public function test_cancel_returns_200_when_migration_already_cancelled(): void {
+		[ 'id' => $mid, 'token' => $token ] = $this->make_running_migration();
+		MigrationRegistry::cancel_migration( $mid );
+		$response = $this->cancel_request( $mid, $token );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertSame( 'cancelled', $response->get_data()['status'] ?? null );
+	}
+
+	public function test_cancel_returns_200_when_migration_already_complete(): void {
+		[ 'id' => $mid, 'token' => $token ] = $this->make_running_migration();
+		MigrationRegistry::update_migration_status( $mid, 'complete' );
+		$response = $this->cancel_request( $mid, $token );
+
+		$this->assertSame( 200, $response->get_status() );
+		// Status must remain 'complete' — cancel_migration() guard protects it.
+		$migration = MigrationRegistry::get_migration( $mid );
+		$this->assertSame( 'complete', $migration->status );
+	}
+
+	// -------------------------------------------------------------------------
+	// cancel_migration() unit tests
+	// -------------------------------------------------------------------------
+
+	public function test_cancel_migration_sets_running_to_cancelled(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+
+		$result = MigrationRegistry::cancel_migration( $mid );
+
+		$this->assertTrue( $result );
+		$this->assertSame( 'cancelled', MigrationRegistry::get_migration( $mid )->status );
+	}
+
+	public function test_cancel_migration_returns_false_and_leaves_complete_status(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'complete' );
+
+		$result = MigrationRegistry::cancel_migration( $mid );
+
+		$this->assertFalse( $result );
+		$this->assertSame( 'complete', MigrationRegistry::get_migration( $mid )->status );
+	}
+
+	public function test_cancel_migration_is_idempotent_on_already_cancelled(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		MigrationRegistry::cancel_migration( $mid );
+
+		$result = MigrationRegistry::cancel_migration( $mid );
+
+		$this->assertFalse( $result, 'Second cancel should be a no-op and return false.' );
+		$this->assertSame( 'cancelled', MigrationRegistry::get_migration( $mid )->status );
+	}
+
+	public function test_cancel_migration_cancels_failed_migration(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::fail_migration( $mid, 'something broke' );
+
+		$result = MigrationRegistry::cancel_migration( $mid );
+
+		$this->assertTrue( $result );
+		$this->assertSame( 'cancelled', MigrationRegistry::get_migration( $mid )->status );
+	}
+
+	// -------------------------------------------------------------------------
 	// status_token — always present in 200 response.
 	// -------------------------------------------------------------------------
 

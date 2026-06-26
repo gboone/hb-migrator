@@ -631,4 +631,79 @@ class Test_Media_Importer extends WP_UnitTestCase {
 
 		wp_delete_post( $existing_att_id, true );
 	}
+
+	// -------------------------------------------------------------------------
+	// filetype_override_filter() — private helper, accessed via ReflectionClass
+	// -------------------------------------------------------------------------
+
+	private function call_filetype_override_filter( string $source_mime, string $filename ): mixed {
+		$method = ( new \ReflectionClass( MediaImporter::class ) )
+			->getMethod( 'filetype_override_filter' );
+		$method->setAccessible( true );
+		return $method->invoke( null, $source_mime, $filename );
+	}
+
+	public function test_filetype_override_filter_returns_null_for_empty_mime(): void {
+		$filter = $this->call_filetype_override_filter( '', 'image.jpg' );
+		$this->assertNull( $filter );
+		$this->assertFalse( has_filter( 'wp_check_filetype_and_ext' ), 'No filter should be registered when source MIME is empty.' );
+	}
+
+	/** @dataProvider blocked_extensions_provider */
+	public function test_filetype_override_filter_returns_null_for_blocked_extension( string $filename ): void {
+		$filter = $this->call_filetype_override_filter( 'application/octet-stream', $filename );
+		$this->assertNull( $filter, "Extension in {$filename} should be blocked." );
+		$this->assertFalse( has_filter( 'wp_check_filetype_and_ext' ), 'No filter should be registered for blocked extension.' );
+	}
+
+	public static function blocked_extensions_provider(): array {
+		return [
+			'php'      => [ 'shell.php' ],
+			'phar'     => [ 'evil.phar' ],
+			'phtml'    => [ 'script.phtml' ],
+			'asp'      => [ 'page.asp' ],
+			'sh'       => [ 'run.sh' ],
+			'exe'      => [ 'program.exe' ],
+			'htaccess' => [ '.htaccess' ],
+		];
+	}
+
+	public function test_filetype_override_filter_registers_filter_for_safe_extension(): void {
+		$filter = $this->call_filetype_override_filter( 'image/svg+xml', 'logo.svg' );
+
+		$this->assertIsCallable( $filter );
+		$this->assertNotFalse( has_filter( 'wp_check_filetype_and_ext' ), 'Filter should be registered for a safe extension.' );
+
+		remove_filter( 'wp_check_filetype_and_ext', $filter );
+	}
+
+	public function test_filetype_override_filter_only_fires_when_both_ext_and_type_are_false(): void {
+		$filter = $this->call_filetype_override_filter( 'image/heic', 'photo.heic' );
+		$this->assertIsCallable( $filter );
+
+		// Simulate WP returning a partial result (another plugin already set ext).
+		$partial_data = [ 'ext' => 'heic', 'type' => false, 'proper_filename' => false ];
+		$result = $filter( $partial_data );
+		$this->assertFalse( $result['type'], 'Filter must not overwrite when ext is already set.' );
+
+		// Simulate WP's full rejection (both set to false boolean — the signal to override).
+		$rejected_data = [ 'ext' => false, 'type' => false, 'proper_filename' => false ];
+		$result = $filter( $rejected_data );
+		$this->assertSame( 'heic', $result['ext'] );
+		$this->assertSame( 'image/heic', $result['type'] );
+
+		remove_filter( 'wp_check_filetype_and_ext', $filter );
+	}
+
+	public function test_filetype_override_filter_does_not_fire_for_empty_string_ext(): void {
+		$filter = $this->call_filetype_override_filter( 'image/webp', 'animated.webp' );
+		$this->assertIsCallable( $filter );
+
+		// empty('') is true, but false === '' is false — verify strict check.
+		$empty_string_data = [ 'ext' => '', 'type' => '', 'proper_filename' => false ];
+		$result = $filter( $empty_string_data );
+		$this->assertSame( '', $result['ext'], 'Filter must not fire for empty string (only for boolean false).' );
+
+		remove_filter( 'wp_check_filetype_and_ext', $filter );
+	}
 }
