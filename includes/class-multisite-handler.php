@@ -36,7 +36,7 @@ class MultisiteHandler {
 			}
 		}
 
-		return '/' . $host . $path . '/';
+		return '/' . str_replace( '.', '-', $host ) . $path . '/';
 	}
 
 	/**
