@@ -128,14 +128,18 @@ class MediaImporter {
 					continue;
 				}
 
-				$file_array    = [
+				$file_array      = [
 					'name'     => basename( wp_parse_url( $file_url, PHP_URL_PATH ) ),
 					'tmp_name' => $tmp,
 				];
-				$date_filter   = self::upload_dir_filter_for_date( $att['post_date'] ?? '' );
-				$sideload      = wp_handle_sideload( $file_array, [ 'test_form' => false ] );
+				$date_filter     = self::upload_dir_filter_for_date( $att['post_date'] ?? '' );
+				$filetype_filter = self::filetype_override_filter( $att['post_mime_type'] ?? '', $file_array['name'] );
+				$sideload        = wp_handle_sideload( $file_array, [ 'test_form' => false ] );
 				if ( $date_filter ) {
 					remove_filter( 'upload_dir', $date_filter );
+				}
+				if ( $filetype_filter ) {
+					remove_filter( 'wp_check_filetype_and_ext', $filetype_filter );
 				}
 				if ( isset( $sideload['error'] ) ) {
 					@unlink( $tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
@@ -258,6 +262,28 @@ class MediaImporter {
 				$site_job_id
 			);
 		}
+	}
+
+	/**
+	 * Registers a wp_check_filetype_and_ext filter that trusts the source MIME type for file
+	 * types the destination site hasn't explicitly allowed (e.g. SVG, HEIC). Returns the
+	 * callable so the caller can remove it immediately after wp_handle_sideload().
+	 * Returns null when no source MIME type is available.
+	 */
+	private static function filetype_override_filter( string $source_mime, string $filename ): ?callable {
+		if ( ! $source_mime ) {
+			return null;
+		}
+		$ext    = strtolower( pathinfo( $filename, PATHINFO_EXTENSION ) );
+		$filter = static function ( array $data ) use ( $source_mime, $ext ): array {
+			if ( empty( $data['ext'] ) || empty( $data['type'] ) ) {
+				$data['ext']  = $ext;
+				$data['type'] = $source_mime;
+			}
+			return $data;
+		};
+		add_filter( 'wp_check_filetype_and_ext', $filter );
+		return $filter;
 	}
 
 	/**
