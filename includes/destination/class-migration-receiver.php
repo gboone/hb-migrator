@@ -171,6 +171,7 @@ class MigrationReceiver {
 			'user_conflict_policy'  => sanitize_key( (string) ( $request->get_param( 'user_conflict_policy' )  ?: 'merge' ) ),
 			'site_conflict_policy'  => sanitize_key( (string) ( $request->get_param( 'site_conflict_policy' )  ?: 'generate_new' ) ),
 			'media_conflict_policy' => sanitize_key( (string) ( $request->get_param( 'media_conflict_policy' ) ?: 'import_all' ) ),
+			'media_import_scope'    => sanitize_key( (string) ( $request->get_param( 'media_import_scope' )    ?: 'all' ) ),
 		];
 		$migration_id   = MigrationRegistry::create_migration( $source_url, $source_api_key, $email ?: null, $policies );
 		$network_domain = get_network()->domain ?? '';

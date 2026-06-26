@@ -168,9 +168,33 @@ class AdminPage {
 							<input type="hidden" name="action" value="hbm_start_migration">
 							<?php wp_nonce_field( 'hbm_start_migration' ); ?>
 							<div id="hbm-start-site-ids"></div>
-							<input type="hidden" name="user_conflict_policy"  id="hbm-user-policy"  value="merge">
+							<input type="hidden" name="user_conflict_policy" id="hbm-user-policy" value="merge">
 							<input type="hidden" name="site_conflict_policy"  id="hbm-site-policy"  value="generate_new">
-							<input type="hidden" name="media_conflict_policy" id="hbm-media-policy" value="import_all">
+
+							<fieldset style="margin:1em 0">
+								<legend style="font-weight:600"><?php esc_html_e( 'If a media file already exists on the destination:', 'hb-migrator' ); ?></legend>
+								<label style="display:block;margin-top:.5em">
+									<input type="radio" name="media_conflict_policy" value="import_all" checked>
+									<?php esc_html_e( 'Import anyway (allow duplicates)', 'hb-migrator' ); ?>
+								</label>
+								<label style="display:block;margin-top:.25em">
+									<input type="radio" name="media_conflict_policy" value="skip_duplicates">
+									<?php esc_html_e( 'Skip — reuse the existing file', 'hb-migrator' ); ?>
+								</label>
+							</fieldset>
+
+							<fieldset style="margin:1em 0">
+								<legend style="font-weight:600"><?php esc_html_e( 'Which media files to import:', 'hb-migrator' ); ?></legend>
+								<label style="display:block;margin-top:.5em">
+									<input type="radio" name="media_import_scope" value="all" checked>
+									<?php esc_html_e( 'All media', 'hb-migrator' ); ?>
+								</label>
+								<label style="display:block;margin-top:.25em">
+									<input type="radio" name="media_import_scope" value="attached_only">
+									<?php esc_html_e( 'Only media attached to a post', 'hb-migrator' ); ?>
+								</label>
+							</fieldset>
+
 							<p class="submit">
 								<button type="submit" class="button button-primary"><?php esc_html_e( 'Start Migration', 'hb-migrator' ); ?></button>
 							</p>
@@ -266,6 +290,7 @@ class AdminPage {
 		$user_conflict_policy  = sanitize_key( wp_unslash( $_POST['user_conflict_policy']  ?? 'merge' ) );
 		$site_conflict_policy  = sanitize_key( wp_unslash( $_POST['site_conflict_policy']  ?? 'generate_new' ) );
 		$media_conflict_policy = sanitize_key( wp_unslash( $_POST['media_conflict_policy'] ?? 'import_all' ) );
+		$media_import_scope    = sanitize_key( wp_unslash( $_POST['media_import_scope']    ?? 'all' ) );
 
 		$source_api_key = \HBMigrator\ApiAuth::get_or_create_key();
 
@@ -284,6 +309,7 @@ class AdminPage {
 					'user_conflict_policy'  => $user_conflict_policy,
 					'site_conflict_policy'  => $site_conflict_policy,
 					'media_conflict_policy' => $media_conflict_policy,
+					'media_import_scope'    => $media_import_scope,
 				] ),
 				'timeout'   => 30,
 				'sslverify' => true,

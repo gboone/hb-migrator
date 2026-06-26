@@ -41,6 +41,7 @@ class QueueTable {
   user_conflict_policy varchar(20) NOT NULL DEFAULT 'merge',
   site_conflict_policy varchar(20) NOT NULL DEFAULT 'generate_new',
   media_conflict_policy varchar(20) NOT NULL DEFAULT 'import_all',
+  media_import_scope varchar(20) NOT NULL DEFAULT 'all',
   PRIMARY KEY  (id)
 ) $charset;";
 

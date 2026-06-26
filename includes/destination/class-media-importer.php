@@ -28,6 +28,7 @@ class MediaImporter {
 			}
 
 			$media_policy   = $migration->media_conflict_policy ?? 'import_all';
+			$media_scope    = $migration->media_import_scope    ?? 'all';
 			$is_retry_pass  = ! empty( $source_attachment_ids );
 
 			if ( ! $is_retry_pass ) {
@@ -40,7 +41,7 @@ class MediaImporter {
 				'source/sites/' . (int) $job->source_blog_id . '/media',
 				$is_retry_pass
 					? [ 'ids' => $source_attachment_ids ]
-					: [ 'per_page' => 50, 'offset' => $offset ]
+					: [ 'per_page' => 50, 'offset' => $offset, 'attached_only' => ( 'attached_only' === $media_scope ) ? 1 : 0 ]
 			);
 
 			// Allowed download origin: the source site's upload URL (prevents SSRF via crafted file_url).

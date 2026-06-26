@@ -5,9 +5,12 @@ namespace HBMigrator\Source;
 class MediaReader {
 
 	public static function get_media( \WP_REST_Request $request ): \WP_REST_Response {
-		$blog_id  = (int) $request->get_param( 'blog_id' );
-		$per_page = min( (int) ( $request->get_param( 'per_page' ) ?: 50 ), 200 );
-		$offset   = max( 0, (int) $request->get_param( 'offset' ) );
+		global $wpdb;
+
+		$blog_id      = (int) $request->get_param( 'blog_id' );
+		$per_page     = min( (int) ( $request->get_param( 'per_page' ) ?: 50 ), 200 );
+		$offset       = max( 0, (int) $request->get_param( 'offset' ) );
+		$attached_only = ! empty( $request->get_param( 'attached_only' ) );
 
 		// When specific IDs are requested, fetch only those attachments.
 		$raw_ids = $request->get_param( 'ids' );
@@ -27,14 +30,28 @@ class MediaReader {
 		];
 
 		if ( ! empty( $ids ) ) {
-			$query_args['post__in']      = $ids;
-			$query_args['numberposts']   = count( $ids );
+			// IDs-based retry pass: always fetch the specific IDs regardless of scope.
+			$query_args['post__in']    = $ids;
+			$query_args['numberposts'] = count( $ids );
 		} else {
 			$query_args['posts_per_page'] = $per_page;
 			$query_args['offset']         = $offset;
 		}
 
+		// Apply attached-only scope via posts_where (only for paginated queries, not ID retries).
+		$parent_filter = null;
+		if ( $attached_only && empty( $ids ) ) {
+			$parent_filter = static function ( string $where ) use ( $wpdb ): string {
+				return $where . " AND {$wpdb->posts}.post_parent > 0";
+			};
+			add_filter( 'posts_where', $parent_filter );
+		}
+
 		$attachments = get_posts( $query_args );
+
+		if ( $parent_filter ) {
+			remove_filter( 'posts_where', $parent_filter );
+		}
 
 		$data = [];
 		foreach ( $attachments as $att ) {

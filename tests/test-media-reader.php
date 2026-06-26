@@ -40,6 +40,19 @@ class Test_Media_Reader extends WP_UnitTestCase {
 		] );
 	}
 
+	private function insert_attached_attachment( string $title = 'attached' ): int {
+		$parent_id = wp_insert_post( [
+			'post_title'  => 'parent-for-' . $title,
+			'post_status' => 'publish',
+			'post_type'   => 'post',
+		] );
+		return wp_insert_attachment( [
+			'post_title'     => $title,
+			'post_status'    => 'inherit',
+			'post_mime_type' => 'image/jpeg',
+		], false, $parent_id );
+	}
+
 	// -------------------------------------------------------------------------
 	// Offset pagination (no ids param)
 	// -------------------------------------------------------------------------
@@ -127,6 +140,54 @@ class Test_Media_Reader extends WP_UnitTestCase {
 		// The query should run (not throw) and return at most 200 items.
 		$this->assertIsArray( $response->get_data() );
 		$this->assertLessThanOrEqual( 200, count( $response->get_data() ) );
+	}
+
+	// -------------------------------------------------------------------------
+	// attached_only scope
+	// -------------------------------------------------------------------------
+
+	public function test_attached_only_excludes_orphan_attachments(): void {
+		$orphan_id   = $this->insert_attachment( 'orphan' );
+		$attached_id = $this->insert_attached_attachment( 'attached' );
+
+		$response = MediaReader::get_media( $this->make_request( [ 'attached_only' => '1' ] ) );
+		$returned = array_column( $response->get_data(), 'source_attachment_id' );
+
+		$this->assertContains( $attached_id, $returned, 'Attached attachment should be included.' );
+		$this->assertNotContains( $orphan_id, $returned, 'Orphan attachment should be excluded.' );
+	}
+
+	public function test_default_scope_includes_all_attachments(): void {
+		$orphan_id   = $this->insert_attachment( 'orphan' );
+		$attached_id = $this->insert_attached_attachment( 'attached' );
+
+		$response = MediaReader::get_media( $this->make_request() );
+		$returned = array_column( $response->get_data(), 'source_attachment_id' );
+
+		$this->assertContains( $orphan_id, $returned );
+		$this->assertContains( $attached_id, $returned );
+	}
+
+	public function test_attached_only_ignored_when_ids_param_is_set(): void {
+		$orphan_id = $this->insert_attachment( 'orphan' );
+		$this->insert_attached_attachment( 'attached' );
+
+		// IDs retry passes always fetch the specified IDs regardless of scope.
+		$response = MediaReader::get_media( $this->make_request( [ 'ids' => [ $orphan_id ], 'attached_only' => '1' ] ) );
+		$returned = array_column( $response->get_data(), 'source_attachment_id' );
+
+		$this->assertContains( $orphan_id, $returned, 'IDs path must ignore attached_only and fetch the requested ID.' );
+	}
+
+	public function test_posts_where_filter_removed_after_attached_only_query(): void {
+		global $wp_filter;
+		$this->insert_attachment( 'solo' );
+		$count_before = count( array_keys( $wp_filter['posts_where']->callbacks ?? [] ) );
+
+		MediaReader::get_media( $this->make_request( [ 'attached_only' => '1' ] ) );
+
+		$count_after = count( array_keys( $wp_filter['posts_where']->callbacks ?? [] ) );
+		$this->assertSame( $count_before, $count_after, 'posts_where filter must be removed after the query.' );
 	}
 
 	// -------------------------------------------------------------------------

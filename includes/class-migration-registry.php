@@ -21,6 +21,7 @@ class MigrationRegistry {
 				'user_conflict_policy'  => $policies['user_conflict_policy']  ?? 'merge',
 				'site_conflict_policy'  => $policies['site_conflict_policy']  ?? 'generate_new',
 				'media_conflict_policy' => $policies['media_conflict_policy'] ?? 'import_all',
+				'media_import_scope'    => $policies['media_import_scope']    ?? 'all',
 			]
 		);
 		return (int) $wpdb->insert_id;
@@ -32,6 +33,7 @@ class MigrationRegistry {
 			'user_conflict_policy'  => $migration->user_conflict_policy  ?? 'merge',
 			'site_conflict_policy'  => $migration->site_conflict_policy  ?? 'generate_new',
 			'media_conflict_policy' => $migration->media_conflict_policy ?? 'import_all',
+			'media_import_scope'    => $migration->media_import_scope    ?? 'all',
 		];
 	}
 
