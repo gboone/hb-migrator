@@ -2,6 +2,7 @@
 
 namespace HBMigrator\Destination;
 
+use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 
@@ -57,8 +58,8 @@ class SearchReplace {
 			], fn( $key ) => ! empty( $key ), ARRAY_FILTER_USE_KEY );
 
 			if ( empty( $replacements ) ) {
-				// Nothing to replace — skip straight to finalization.
-				self::finalize( $site_job_id, (int) $job->migration_id );
+				// No URL replacements — run postmeta ID remap and finalize.
+				self::finalize( $site_job_id, (int) $job->migration_id, (int) $job->dest_blog_id );
 				return;
 			}
 
@@ -91,7 +92,7 @@ class SearchReplace {
 			}
 
 			// All phases done.
-			self::finalize( $site_job_id, (int) $job->migration_id );
+			self::finalize( $site_job_id, (int) $job->migration_id, (int) $job->dest_blog_id );
 
 		} catch ( \Throwable $e ) {
 			if ( isset( $job ) && $job ) {
@@ -106,7 +107,8 @@ class SearchReplace {
 		}
 	}
 
-	private static function finalize( int $site_job_id, int $migration_id ): void {
+	private static function finalize( int $site_job_id, int $migration_id, int $blog_id ): void {
+		self::remap_postmeta_ids( $site_job_id, $blog_id );
 		MigrationRegistry::update_site_job( $site_job_id, [
 			'status'        => 'complete',
 			'current_stage' => null,
@@ -286,6 +288,27 @@ class SearchReplace {
 		}
 
 		return $value;
+	}
+
+	/**
+	 * Rewrites _thumbnail_id postmeta values from source attachment IDs to destination IDs.
+	 * Runs as the last step before marking the site job complete, when the full IdMap is available.
+	 */
+	private static function remap_postmeta_ids( int $site_job_id, int $blog_id ): void {
+		global $wpdb;
+		switch_to_blog( $blog_id );
+		$id_map_table = $wpdb->base_prefix . 'hbm_id_map';
+		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"UPDATE `{$wpdb->postmeta}` pm
+			 INNER JOIN `{$id_map_table}` im
+			     ON CAST(pm.meta_value AS UNSIGNED) = im.source_id
+			    AND im.site_job_id = %d
+			    AND im.object_type = 'attachment'
+			 SET pm.meta_value = im.dest_id
+			 WHERE pm.meta_key = '_thumbnail_id'",
+			$site_job_id
+		) );
+		restore_current_blog();
 	}
 
 	private static function maybe_send_notification( int $migration_id ): void {

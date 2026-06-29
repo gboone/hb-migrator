@@ -14,6 +14,8 @@ class OptionImporter {
 
 	// Options that must never be overwritten from the source, regardless of what the source sends.
 	// A compromised source could otherwise escalate privileges by rewriting roles or credentials.
+	// Theme and plugin state (template, stylesheet, active_plugins) are handled separately below
+	// with existence checks rather than blocked entirely.
 	private const DEST_DENYLIST = [
 		'wp_user_roles',
 		'wp_capabilities',
@@ -29,9 +31,6 @@ class OptionImporter {
 		'admin_email',
 		'siteurl',
 		'home',
-		'active_plugins',
-		'template',
-		'stylesheet',
 	];
 
 	public static function process( int $site_job_id, int $offset, int $attempt ): void {
@@ -63,10 +62,29 @@ class OptionImporter {
 
 			switch_to_blog( (int) $job->dest_blog_id );
 
+			$theme_stylesheet   = null;
+			$raw_active_plugins = null;
+
 			foreach ( $options as $name => $value ) {
 				// Destination-side guard: never import security-sensitive options even if the
 				// source includes them (the source-side OptionReader::SKIP list may differ).
 				if ( in_array( $name, self::DEST_DENYLIST, true ) ) {
+					continue;
+				}
+
+				// Theme state: collect stylesheet for conditional application after the loop.
+				// template and current_theme are set automatically by switch_theme().
+				if ( 'stylesheet' === $name ) {
+					$theme_stylesheet = (string) $value;
+					continue;
+				}
+				if ( 'template' === $name || 'current_theme' === $name ) {
+					continue;
+				}
+
+				// Plugin state: collect for conditional application after the loop.
+				if ( 'active_plugins' === $name ) {
+					$raw_active_plugins = $value;
 					continue;
 				}
 
@@ -83,6 +101,30 @@ class OptionImporter {
 					? unserialize( $value, [ 'allowed_classes' => false ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
 					: $value;
 				update_option( $name, $stored );
+			}
+
+			// Apply source theme only if it is installed at the destination.
+			if ( null !== $theme_stylesheet ) {
+				$theme = wp_get_theme( $theme_stylesheet );
+				if ( $theme->exists() ) {
+					switch_theme( $theme_stylesheet );
+				}
+			}
+
+			// Apply active plugins, keeping only those physically present at the destination.
+			// update_option() is used directly (no activation hooks) because migration restores
+			// an already-configured site's state rather than freshly installing plugins.
+			if ( null !== $raw_active_plugins ) {
+				$plugins = is_serialized( $raw_active_plugins )
+					? unserialize( $raw_active_plugins, [ 'allowed_classes' => false ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
+					: $raw_active_plugins;
+				if ( is_array( $plugins ) ) {
+					$available = array_values( array_filter(
+						$plugins,
+						fn( string $p ) => validate_file( $p ) === 0 && file_exists( WP_PLUGIN_DIR . '/' . $p )
+					) );
+					update_option( 'active_plugins', $available );
+				}
 			}
 
 			restore_current_blog();

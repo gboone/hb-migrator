@@ -5,8 +5,12 @@ namespace HBMigrator\Source;
 class OptionReader {
 
 	/**
-	 * Options always excluded from export — these are environment-specific,
-	 * sensitive, or media-path references that the destination sets itself.
+	 * Options always excluded from export.
+	 *
+	 * Environment-specific values that must not be blindly copied (siteurl, credentials, upload
+	 * paths) are excluded. Theme and plugin state (template, stylesheet, active_plugins) are
+	 * exported and applied conditionally by the importer — only when the theme/plugin is actually
+	 * installed at the destination.
 	 */
 	const SKIP = [
 		'siteurl',
@@ -16,11 +20,7 @@ class OptionReader {
 		'bloguploaddir',
 		'fileupload_url',
 		'upload_space_used',
-		'active_plugins',
 		'inactive_plugins',
-		'template',
-		'stylesheet',
-		'current_theme',
 		'theme_switched',
 		'recently_edited',
 		'auth_key',
@@ -44,7 +44,7 @@ class OptionReader {
 		switch_to_blog( $blog_id );
 
 		// Explicit name list for important options that may not be autoloaded.
-		$extra_names = "'blogname','blogdescription','permalink_structure','page_on_front','page_for_posts','show_on_front','posts_per_page','timezone_string','gmt_offset','date_format','time_format','default_category','default_comment_status','default_ping_status','comment_moderation','blog_public'";
+		$extra_names = "'blogname','blogdescription','permalink_structure','page_on_front','page_for_posts','show_on_front','posts_per_page','timezone_string','gmt_offset','date_format','time_format','default_category','default_comment_status','default_ping_status','comment_moderation','blog_public','active_plugins','template','stylesheet','current_theme'";
 
 		$rows = $wpdb->get_results( $wpdb->prepare(
 			"SELECT option_name, option_value FROM {$wpdb->options}
