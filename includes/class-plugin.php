@@ -43,6 +43,15 @@ class Plugin {
 		add_action( 'hbm_import_options',       [ Destination\OptionImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_search_replace',       [ Destination\SearchReplace::class, 'process' ], 10, 4 );
 		add_action( 'hbm_sync_pass',            [ Destination\SyncDispatcher::class, 'run_sync_pass' ], 10, 1 );
+
+		// Register U3's real 'posts' sync stage. SyncDispatcher depends only on
+		// SyncStageInterface (see class-sync-stage-interface.php); this is the wiring
+		// point U3-U6 use to plug their real implementations in without SyncDispatcher
+		// ever depending on a concrete stage class directly.
+		add_filter( 'hbm_sync_stages', static function ( array $stages ) {
+			$stages['posts'] = new Destination\PostSyncStage();
+			return $stages;
+		} );
 	}
 
 	public static function activate(): void {

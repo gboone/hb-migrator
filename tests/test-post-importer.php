@@ -180,4 +180,85 @@ class Test_PostImporter extends WP_UnitTestCase {
 
 		$this->assertNull( \HBMigrator\IdMap::get( $this->jid, 'post', 501 ) );
 	}
+
+	// -------------------------------------------------------------------------
+	// U3: existing-row branch now updates core fields, not just postmeta.
+	// -------------------------------------------------------------------------
+
+	public function test_existing_row_branch_updates_core_fields_on_edit(): void {
+		$original = $this->make_source_post( [
+			'ID'           => 42,
+			'post_title'   => 'Original Title',
+			'post_content' => 'Original content.',
+			'post_status'  => 'draft',
+		] );
+		$this->mock_posts_response( [ $original ] );
+		PostImporter::process( $this->jid, 0, 0 );
+
+		$dest_id = \HBMigrator\IdMap::get( $this->jid, 'post', 42 );
+		$this->assertNotNull( $dest_id, 'First pass must have created and mapped the post.' );
+
+		remove_all_filters( 'pre_http_request' );
+
+		$edited = $this->make_source_post( [
+			'ID'           => 42,
+			'post_title'   => 'Edited Title',
+			'post_content' => 'Edited content.',
+			'post_status'  => 'publish',
+		] );
+		$this->mock_posts_response( [ $edited ] );
+		PostImporter::process( $this->jid, 0, 0 );
+
+		$post = get_post( $dest_id );
+		$this->assertSame( 'Edited Title', $post->post_title, 'post_title must be updated on the existing-row branch, not just postmeta.' );
+		$this->assertSame( 'Edited content.', $post->post_content );
+		$this->assertSame( 'publish', $post->post_status );
+
+		// The destination post row must still map to the same source ID — an edit-sync
+		// updates in place, it does not insert a duplicate.
+		$this->assertSame( $dest_id, \HBMigrator\IdMap::get( $this->jid, 'post', 42 ) );
+		$all_posts = get_posts( [ 'post_type' => 'post', 'post_status' => 'any', 'numberposts' => -1 ] );
+		$this->assertCount( 1, $all_posts, 'An edit-sync must not create a duplicate post.' );
+	}
+
+	public function test_existing_row_branch_reapplying_unchanged_content_is_a_safe_no_op(): void {
+		$source_post = $this->make_source_post( [ 'ID' => 55, 'post_title' => 'Stable Title' ] );
+		$this->mock_posts_response( [ $source_post ] );
+		PostImporter::process( $this->jid, 0, 0 );
+
+		$dest_id = \HBMigrator\IdMap::get( $this->jid, 'post', 55 );
+
+		remove_all_filters( 'pre_http_request' );
+		$this->mock_posts_response( [ $source_post ] );
+
+		// Re-applying identical content (e.g. a post caught again within the sync
+		// overlap window) must not error and must leave the destination row equivalent.
+		PostImporter::process( $this->jid, 0, 0 );
+
+		$post = get_post( $dest_id );
+		$this->assertSame( 'Stable Title', $post->post_title );
+		$this->assertSame( $dest_id, \HBMigrator\IdMap::get( $this->jid, 'post', 55 ) );
+	}
+
+	public function test_post_missing_from_a_later_batch_is_left_untouched_on_destination(): void {
+		// Simulates a post deleted on source: it simply no longer appears in the source
+		// response. R7 — deletions are never propagated, so the destination row must be
+		// left exactly as it was.
+		$post_a = $this->make_source_post( [ 'ID' => 10, 'post_title' => 'Post A' ] );
+		$post_b = $this->make_source_post( [ 'ID' => 11, 'post_title' => 'Post B' ] );
+		$this->mock_posts_response( [ $post_a, $post_b ] );
+		PostImporter::process( $this->jid, 0, 0 );
+
+		$dest_a = \HBMigrator\IdMap::get( $this->jid, 'post', 10 );
+		$this->assertNotNull( $dest_a );
+
+		// A subsequent batch that only includes post B (post A "deleted" on source) —
+		// import_batch() is called directly here since deletion detection happens purely
+		// by a post's absence from what the source batch returns, not via any HTTP layer.
+		PostImporter::import_batch( $this->jid, [ $post_b ] );
+
+		$post = get_post( $dest_a );
+		$this->assertNotNull( $post, 'A post absent from a later batch must not be deleted on destination.' );
+		$this->assertSame( 'Post A', $post->post_title, 'A post absent from a later batch must be left completely untouched.' );
+	}
 }

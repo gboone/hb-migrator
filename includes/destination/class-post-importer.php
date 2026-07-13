@@ -10,7 +10,6 @@ use HBMigrator\SourceClient;
 class PostImporter {
 
 	public static function process( int $site_job_id, int $last_id, int $attempt ): void {
-		global $wpdb;
 		try {
 			$job = MigrationRegistry::get_site_job( $site_job_id );
 			if ( ! $job || ! $job->dest_blog_id ) {
@@ -34,118 +33,8 @@ class PostImporter {
 				[ 'per_page' => 100, 'last_id' => $last_id ]
 			);
 
-			switch_to_blog( (int) $job->dest_blog_id );
-			wp_suspend_cache_invalidation( true );
-			kses_remove_filters();
-
-			$max_id = $last_id;
-
-			foreach ( $posts as $p ) {
-				// Attachment posts are handled by the media pipeline with file sideloading.
-				// Creating them here produces hollow records that cause -1 filename collisions.
-				if ( 'attachment' === ( $p['post_type'] ?? '' ) ) {
-					continue;
-				}
-
-				$source_id = (int) $p['ID'];
-
-				$existing_dest_id = IdMap::get( $site_job_id, 'post', $source_id );
-				if ( null !== $existing_dest_id ) {
-					// Post row already exists from a prior attempt. Re-sync its meta in a
-					// transaction so we never have a window where the post has zero meta.
-					$dest_id = $existing_dest_id;
-					$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-					$wpdb->delete( $wpdb->postmeta, [ 'post_id' => $dest_id ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-					foreach ( $p['meta'] as $meta ) {
-						$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-							$wpdb->postmeta,
-							[
-								'post_id'    => $dest_id,
-								'meta_key'   => $meta['key'], // phpcs:ignore WordPress.DB.SlowDBQuery
-								'meta_value' => $meta['value'],
-							]
-						);
-					}
-					$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-				} else {
-					// Resolve author.
-					$author_id = 1;
-					if ( ! empty( $p['post_author_email'] ) ) {
-						$user = get_user_by( 'email', $p['post_author_email'] );
-						if ( $user ) {
-							$author_id = $user->ID;
-						}
-					}
-
-					// Resolve post_parent.
-					$post_parent = 0;
-					if ( $p['post_parent'] > 0 ) {
-						$dest_parent = IdMap::get( $site_job_id, 'post', (int) $p['post_parent'] );
-						$post_parent = $dest_parent ?? 0;
-					}
-
-					$post_data = wp_slash( [
-						'import_id'         => $source_id,
-						'post_author'       => $author_id,
-						'post_date'         => $p['post_date'],
-						'post_date_gmt'     => $p['post_date_gmt'],
-						'post_content'      => $p['post_content'],
-						'post_title'        => $p['post_title'],
-						'post_excerpt'      => $p['post_excerpt'],
-						'post_status'       => $p['post_status'],
-						'comment_status'    => $p['comment_status'],
-						'ping_status'       => $p['ping_status'],
-						'post_password'     => $p['post_password'],
-						'post_name'         => $p['post_name'],
-						'post_modified'     => $p['post_modified'],
-						'post_modified_gmt' => $p['post_modified_gmt'],
-						'post_parent'       => $post_parent,
-						'menu_order'        => (int) $p['menu_order'],
-						'post_type'         => $p['post_type'],
-						'post_mime_type'    => $p['post_mime_type'],
-					] );
-
-					$dest_id = wp_insert_post( $post_data, false, false );
-					if ( is_wp_error( $dest_id ) || ! $dest_id ) {
-						continue;
-					}
-
-					IdMap::set( $site_job_id, 'post', $source_id, (int) $dest_id );
-
-					// Insert meta directly to avoid maybe_serialize() double-serializing
-					// already-serialized values and to preserve raw bytes from the source DB.
-					foreach ( $p['meta'] as $meta ) {
-						$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-							$wpdb->postmeta,
-							[
-								'post_id'    => $dest_id,
-								'meta_key'   => $meta['key'], // phpcs:ignore WordPress.DB.SlowDBQuery
-								'meta_value' => $meta['value'],
-							]
-						);
-					}
-				}
-
-				// Preserve comment_count — wp_insert_post ignores this field.
-				$wpdb->update( $wpdb->posts, [ 'comment_count' => (int) ( $p['comment_count'] ?? 0 ) ], [ 'ID' => $dest_id ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-
-				// Set terms by slug.
-				$terms_by_tax = [];
-				foreach ( $p['terms'] as $t ) {
-					$terms_by_tax[ $t['taxonomy'] ][] = $t['slug'];
-				}
-				foreach ( $terms_by_tax as $taxonomy => $slugs ) {
-					wp_set_object_terms( $dest_id, $slugs, $taxonomy );
-				}
-
-				if ( $source_id > $max_id ) {
-					$max_id = $source_id;
-				}
-			}
-
-			kses_init_filters();
-			wp_suspend_cache_invalidation( false );
-			restore_current_blog();
+			$max_source_id = self::import_batch( $site_job_id, $posts );
+			$max_id         = max( $last_id, $max_source_id );
 
 			MigrationRegistry::update_site_job( $site_job_id, [ 'stage_offset' => $max_id ] );
 
@@ -166,11 +55,6 @@ class PostImporter {
 			);
 
 		} catch ( \Throwable $e ) {
-			kses_init_filters();
-			wp_suspend_cache_invalidation( false );
-			if ( isset( $job ) && $job ) {
-				restore_current_blog();
-			}
 			PipelineController::handle_batch_failure(
 				'hbm_import_posts',
 				[ 'site_job_id' => $site_job_id, 'last_id' => $last_id, 'attempt' => $attempt ],
@@ -178,5 +62,163 @@ class PostImporter {
 				$site_job_id
 			);
 		}
+	}
+
+	/**
+	 * Upserts a batch of source posts (as already fetched from PostReader, via either the
+	 * initial-migration pipeline's ID-keyset cursor or U3's sync delta-cursor) into the
+	 * destination site. Shared by process() (initial migration) and PostSyncStage (U3
+	 * ongoing sync) so both reuse the exact same Reader/Importer/IdMap upsert logic rather
+	 * than a parallel content-moving mechanism — see plan Summary.
+	 *
+	 * Wraps switch_to_blog()/kses/cache-invalidation bracketing in a try/finally so a
+	 * mid-batch exception can never leave the destination blog switched or kses filters
+	 * removed — callers no longer need to replicate that cleanup themselves.
+	 *
+	 * @return int The highest source post ID processed in this batch (0 if none), for
+	 *              callers (process()) that track an ID-keyset cursor. Sync callers
+	 *              (PostSyncStage) track their own modified-timestamp cursor separately
+	 *              and can ignore this return value.
+	 */
+	public static function import_batch( int $site_job_id, array $posts ): int {
+		global $wpdb;
+
+		$job = MigrationRegistry::get_site_job( $site_job_id );
+		if ( ! $job || ! $job->dest_blog_id ) {
+			return 0;
+		}
+
+		$max_id = 0;
+
+		switch_to_blog( (int) $job->dest_blog_id );
+		wp_suspend_cache_invalidation( true );
+		kses_remove_filters();
+
+		try {
+			foreach ( $posts as $p ) {
+				// Attachment posts are handled by the media pipeline with file sideloading.
+				// Creating them here produces hollow records that cause -1 filename collisions.
+				if ( 'attachment' === ( $p['post_type'] ?? '' ) ) {
+					continue;
+				}
+
+				$source_id = (int) $p['ID'];
+
+				// Resolve author.
+				$author_id = 1;
+				if ( ! empty( $p['post_author_email'] ) ) {
+					$user = get_user_by( 'email', $p['post_author_email'] );
+					if ( $user ) {
+						$author_id = $user->ID;
+					}
+				}
+
+				// Resolve post_parent.
+				$post_parent = 0;
+				if ( $p['post_parent'] > 0 ) {
+					$dest_parent = IdMap::get( $site_job_id, 'post', (int) $p['post_parent'] );
+					$post_parent = $dest_parent ?? 0;
+				}
+
+				$post_data = [
+					'post_author'       => $author_id,
+					'post_date'         => $p['post_date'],
+					'post_date_gmt'     => $p['post_date_gmt'],
+					'post_content'      => $p['post_content'],
+					'post_title'        => $p['post_title'],
+					'post_excerpt'      => $p['post_excerpt'],
+					'post_status'       => $p['post_status'],
+					'comment_status'    => $p['comment_status'],
+					'ping_status'       => $p['ping_status'],
+					'post_password'     => $p['post_password'],
+					'post_name'         => $p['post_name'],
+					'post_modified'     => $p['post_modified'],
+					'post_modified_gmt' => $p['post_modified_gmt'],
+					'post_parent'       => $post_parent,
+					'menu_order'        => (int) $p['menu_order'],
+					'post_type'         => $p['post_type'],
+					'post_mime_type'    => $p['post_mime_type'],
+				];
+
+				$existing_dest_id = IdMap::get( $site_job_id, 'post', $source_id );
+				if ( null !== $existing_dest_id ) {
+					// Post row already exists — either re-processed after a prior
+					// attempt failed mid-pipeline (initial migration), or this is an
+					// ongoing sync pass re-applying an edit (U3, R4/R11: source always
+					// wins). Update core fields, not just postmeta, using the same
+					// wp_slash() convention the insert branch below uses — wp_update_post()
+					// expects an already-slashed array for plain-array input, mirroring
+					// wp_insert_post()'s own expectation (see wp_update_post() source:
+					// it only wp_slash()'s for you when $postarr is an object, not an
+					// array). Re-applying identical values is a safe no-op.
+					$dest_id       = $existing_dest_id;
+					$update_result = wp_update_post( wp_slash( array_merge( $post_data, [ 'ID' => $dest_id ] ) ), true, false );
+					if ( is_wp_error( $update_result ) || ! $update_result ) {
+						// Leave the existing destination row untouched rather than partially
+						// apply — mirrors the insert branch's "skip this post" behavior on
+						// wp_insert_post() failure.
+						continue;
+					}
+
+					// Re-sync meta in a transaction so we never have a window where the
+					// post has zero meta.
+					$wpdb->query( 'START TRANSACTION' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+					$wpdb->delete( $wpdb->postmeta, [ 'post_id' => $dest_id ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+					foreach ( $p['meta'] as $meta ) {
+						$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+							$wpdb->postmeta,
+							[
+								'post_id'    => $dest_id,
+								'meta_key'   => $meta['key'], // phpcs:ignore WordPress.DB.SlowDBQuery
+								'meta_value' => $meta['value'],
+							]
+						);
+					}
+					$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				} else {
+					$dest_id = wp_insert_post( wp_slash( array_merge( $post_data, [ 'import_id' => $source_id ] ) ), false, false );
+					if ( is_wp_error( $dest_id ) || ! $dest_id ) {
+						continue;
+					}
+
+					IdMap::set( $site_job_id, 'post', $source_id, (int) $dest_id );
+
+					// Insert meta directly to avoid maybe_serialize() double-serializing
+					// already-serialized values and to preserve raw bytes from the source DB.
+					foreach ( $p['meta'] as $meta ) {
+						$wpdb->insert( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+							$wpdb->postmeta,
+							[
+								'post_id'    => $dest_id,
+								'meta_key'   => $meta['key'], // phpcs:ignore WordPress.DB.SlowDBQuery
+								'meta_value' => $meta['value'],
+							]
+						);
+					}
+				}
+
+				// Preserve comment_count — wp_insert_post/wp_update_post ignore this field.
+				$wpdb->update( $wpdb->posts, [ 'comment_count' => (int) ( $p['comment_count'] ?? 0 ) ], [ 'ID' => $dest_id ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+
+				// Set terms by slug.
+				$terms_by_tax = [];
+				foreach ( $p['terms'] as $t ) {
+					$terms_by_tax[ $t['taxonomy'] ][] = $t['slug'];
+				}
+				foreach ( $terms_by_tax as $taxonomy => $slugs ) {
+					wp_set_object_terms( $dest_id, $slugs, $taxonomy );
+				}
+
+				if ( $source_id > $max_id ) {
+					$max_id = $source_id;
+				}
+			}
+		} finally {
+			kses_init_filters();
+			wp_suspend_cache_invalidation( false );
+			restore_current_blog();
+		}
+
+		return $max_id;
 	}
 }

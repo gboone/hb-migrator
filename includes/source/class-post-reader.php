@@ -4,20 +4,63 @@ namespace HBMigrator\Source;
 
 class PostReader {
 
+	/**
+	 * Minimum safety overlap (seconds) subtracted from a delta-sync cursor before querying,
+	 * regardless of the configured cron interval — see MIN_OVERLAP_SECONDS usage below.
+	 */
+	private const MIN_OVERLAP_SECONDS = 60;
+
+	/**
+	 * Placeholder for U7's actual recurring sync-pass interval. class-sync-scheduler.php
+	 * (U7) doesn't exist yet as of this unit, so there is no real constant to reference —
+	 * 15 minutes is this plan's own Key Technical Decisions default assumption. Once U7
+	 * lands, this MUST be updated to reference (or match) its real interval: the overlap
+	 * window's correctness margin against source-side commit-visibility lag is derived
+	 * from the poll cadence, so a mismatch here silently narrows that margin.
+	 */
+	private const ASSUMED_SYNC_CRON_INTERVAL_SECONDS = 15 * MINUTE_IN_SECONDS;
+
 	public static function get_posts( \WP_REST_Request $request ): \WP_REST_Response {
 		global $wpdb;
 
-		$blog_id  = (int) $request->get_param( 'blog_id' );
-		$per_page = min( (int) ( $request->get_param( 'per_page' ) ?: 100 ), 500 );
-		$last_id  = max( 0, (int) $request->get_param( 'last_id' ) );
+		$blog_id        = (int) $request->get_param( 'blog_id' );
+		$per_page       = min( (int) ( $request->get_param( 'per_page' ) ?: 100 ), 500 );
+		$last_id        = max( 0, (int) $request->get_param( 'last_id' ) );
+		$modified_since = $request->get_param( 'modified_since' );
 
 		switch_to_blog( $blog_id );
 
-		$posts = $wpdb->get_results( $wpdb->prepare(
-			"SELECT * FROM {$wpdb->posts} WHERE ID > %d AND post_type != 'attachment' ORDER BY ID LIMIT %d",
-			$last_id,
-			$per_page
-		) );
+		$since_ts = $modified_since ? strtotime( (string) $modified_since ) : false;
+
+		if ( false !== $since_ts ) {
+			// Delta-cursor mode (sync passes): a genuinely new post is always caught via
+			// ID > last_id (its ID is higher than anything seen before); an edit to an
+			// older post is caught via post_modified clearing the overlap-adjusted floor.
+			// The overlap guards against source-side transaction-commit visibility lag —
+			// a row can commit with an earlier post_modified than a query that already ran
+			// past that timestamp — and scales with the poll cadence rather than staying
+			// fixed. See plan "Key Technical Decisions", "Posts and media use a
+			// timestamp-plus-ID delta cursor with a safety overlap that scales with the
+			// poll interval." Re-applying an unchanged post is a safe no-op (idempotent
+			// IdMap-keyed re-apply), so widening this window costs redundant work, not
+			// correctness.
+			$overlap = max( self::MIN_OVERLAP_SECONDS, self::ASSUMED_SYNC_CRON_INTERVAL_SECONDS );
+			$floor   = gmdate( 'Y-m-d H:i:s', $since_ts - $overlap );
+
+			$posts = $wpdb->get_results( $wpdb->prepare(
+				"SELECT * FROM {$wpdb->posts} WHERE post_type != 'attachment' AND ( ID > %d OR post_modified > %s ) ORDER BY ID LIMIT %d",
+				$last_id,
+				$floor,
+				$per_page
+			) );
+		} else {
+			// Initial-migration mode (unchanged): plain keyset pagination by ID.
+			$posts = $wpdb->get_results( $wpdb->prepare(
+				"SELECT * FROM {$wpdb->posts} WHERE ID > %d AND post_type != 'attachment' ORDER BY ID LIMIT %d",
+				$last_id,
+				$per_page
+			) );
+		}
 
 		if ( empty( $posts ) ) {
 			restore_current_blog();
