@@ -43,7 +43,29 @@ class CommentSyncStage implements SyncStageInterface {
 	 */
 	private const BATCH_SIZE = 100;
 
+	/**
+	 * Source comment IDs fetched (passed to CommentImporter::process()) by the most recent
+	 * process() call for a given site_job_id, keyed by site_job_id. Mirrors
+	 * PostSyncStage::$last_synced_post_ids' in-memory, single-request handoff shape exactly
+	 * — SyncDispatcher runs every stage in order within one PHP request, so no cross-request
+	 * persistence is needed or attempted. Used by U6's SyncSearchReplaceStage via
+	 * get_synced_comment_ids() to scope comment_content rewriting to the rows this pass
+	 * touched. Deliberately captures every fetched ID, not only the ones CommentImporter
+	 * actually mapped this pass (a comment skipped for an unmapped post/parent has no
+	 * destination row yet, so its IdMap lookup in SyncSearchReplaceStage naturally resolves
+	 * to null and it is simply left out of the scoped WHERE IN() set) — the same "capture
+	 * what was fetched, let the ID-map lookup filter it" contract PostSyncStage/MediaSyncStage
+	 * already use.
+	 *
+	 * @var array<int, int[]>
+	 */
+	private static array $last_synced_comment_ids = [];
+
 	public function process( int $site_job_id ): bool {
+		// Reset up front so a pass that exits early below (job/migration missing) never
+		// leaves a stale prior pass's IDs visible to get_synced_comment_ids().
+		self::$last_synced_comment_ids[ $site_job_id ] = [];
+
 		$job = MigrationRegistry::get_site_job( $site_job_id );
 		if ( ! $job || ! $job->dest_blog_id ) {
 			return false;
@@ -64,6 +86,11 @@ class CommentSyncStage implements SyncStageInterface {
 				'per_page' => self::BATCH_SIZE,
 				'last_id'  => $last_id,
 			]
+		);
+
+		self::$last_synced_comment_ids[ $site_job_id ] = array_map(
+			fn( $c ) => (int) ( $c['comment_ID'] ?? 0 ),
+			$comments
 		);
 
 		if ( empty( $comments ) ) {
@@ -109,5 +136,16 @@ class CommentSyncStage implements SyncStageInterface {
 		// pass (webhook or cron) — immediately re-requesting the exact same query would just
 		// hit the same block with no progress, so let the next scheduled pass retry instead.
 		return ! $blocked && count( $comments ) >= self::BATCH_SIZE;
+	}
+
+	/**
+	 * Source comment IDs fetched by this stage's most recent process() call for the given
+	 * site_job_id — used by U6's SyncSearchReplaceStage to scope comment_content rewriting
+	 * to exactly the comment rows this pass touched. Returns an empty array when this stage
+	 * hasn't run for this site_job_id in the current PHP process, mirroring
+	 * PostSyncStage::get_synced_post_ids()'s "nothing to add" default.
+	 */
+	public static function get_synced_comment_ids( int $site_job_id ): array {
+		return self::$last_synced_comment_ids[ $site_job_id ] ?? [];
 	}
 }

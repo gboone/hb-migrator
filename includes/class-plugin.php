@@ -76,6 +76,17 @@ class Plugin {
 			$stages['comments'] = new Destination\CommentSyncStage();
 			return $stages;
 		} );
+
+		// Register U6's real 'search_replace' sync stage — the fourth and final stage in a
+		// sync pass (see class-sync-search-replace-stage.php). Reads the posts/media/comments
+		// stages' in-memory "touched this pass" handoffs above, so registration order among
+		// these filter callbacks doesn't matter — only SyncDispatcher's fixed iteration order
+		// (posts, media, comments, search_replace — see SyncDispatcher::default_stages())
+		// does, which already runs this stage last.
+		add_filter( 'hbm_sync_stages', static function ( array $stages ) {
+			$stages['search_replace'] = new Destination\SyncSearchReplaceStage();
+			return $stages;
+		} );
 	}
 
 	public static function activate(): void {

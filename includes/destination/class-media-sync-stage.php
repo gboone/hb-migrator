@@ -39,8 +39,25 @@ class MediaSyncStage implements SyncStageInterface {
 	 */
 	private const EPOCH = '1970-01-01 00:00:00';
 
+	/**
+	 * Source attachment IDs fetched (passed to MediaImporter::import_batch()) by the most
+	 * recent process() call for a given site_job_id, keyed by site_job_id. Mirrors
+	 * PostSyncStage::$last_synced_post_ids' in-memory, single-request handoff shape exactly
+	 * (same rationale: SyncDispatcher runs every stage in order within one PHP request, so
+	 * no cross-request persistence is needed or attempted) — lets U6's SyncSearchReplaceStage
+	 * scope its URL rewrite / _thumbnail_id remap to the attachment rows this pass actually
+	 * touched, via get_synced_media_ids().
+	 *
+	 * @var array<int, int[]>
+	 */
+	private static array $last_synced_media_ids = [];
+
 	public function process( int $site_job_id ): bool {
 		global $wpdb;
+
+		// Reset up front so a pass that exits early below (job/migration missing) never
+		// leaves a stale prior pass's IDs visible to get_synced_media_ids().
+		self::$last_synced_media_ids[ $site_job_id ] = [];
 
 		$job = MigrationRegistry::get_site_job( $site_job_id );
 		if ( ! $job || ! $job->dest_blog_id ) {
@@ -85,6 +102,11 @@ class MediaSyncStage implements SyncStageInterface {
 			]
 		);
 
+		self::$last_synced_media_ids[ $site_job_id ] = array_map(
+			fn( $m ) => (int) ( $m['source_attachment_id'] ?? 0 ),
+			$media
+		);
+
 		if ( empty( $media ) ) {
 			// Nothing new, edited, or newly-parented since the last pass — already caught up.
 			return false;
@@ -116,5 +138,18 @@ class MediaSyncStage implements SyncStageInterface {
 		// A full batch means more matching media likely remain beyond this row budget —
 		// mirrors MediaImporter::process()'s own `count( $media ) >= 50` continuation check.
 		return count( $media ) >= self::BATCH_SIZE;
+	}
+
+	/**
+	 * Source attachment IDs fetched by this stage's most recent process() call for the given
+	 * site_job_id — used by U6's SyncSearchReplaceStage to scope its URL rewrite and
+	 * _thumbnail_id remap to exactly the attachment rows this pass touched (attachments are
+	 * `wp_posts` rows too, so their dest IDs join the same posts/postmeta scoped WHERE IN()
+	 * set as PostSyncStage::get_synced_post_ids()). Mirrors that method's contract exactly,
+	 * including the empty-array default for a site job this stage hasn't run for in the
+	 * current PHP process.
+	 */
+	public static function get_synced_media_ids( int $site_job_id ): array {
+		return self::$last_synced_media_ids[ $site_job_id ] ?? [];
 	}
 }

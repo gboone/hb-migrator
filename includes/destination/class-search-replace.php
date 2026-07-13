@@ -291,6 +291,167 @@ class SearchReplace {
 	}
 
 	/**
+	 * U6: scoped mode for sync passes. Runs the same safe_replace() serialization-aware
+	 * string replacement and hbm_id_map-joined _thumbnail_id remap as the whole-table mode
+	 * above, but filtered to exactly the destination post/attachment/comment rows a sync
+	 * pass just touched (dest IDs — already resolved from source IDs via IdMap by the
+	 * caller) instead of a keyset scan across the full posts/postmeta/comments tables.
+	 *
+	 * Deliberately does NOT touch the options table — options are excluded from every sync
+	 * pass (plan "Key Technical Decisions": OptionImporter wholesale-overwrites destination
+	 * values, and re-running it would clobber destination-side QA changes), so there is no
+	 * scoped counterpart to replace_in_options() here.
+	 *
+	 * No time-budget checkpointing (unlike run_phase()'s TIME_LIMIT/continuation dance):
+	 * every caller (SyncSearchReplaceStage) passes IDs already bounded by a sync stage's own
+	 * per-pass row budget (<=100 posts, <=50 media, <=100 comments — see
+	 * SyncStageInterface), so a single call here always completes in well under
+	 * self::TIME_LIMIT. The whole-table mode above (run_phase(), used at initial-migration
+	 * finalize) is completely unchanged by this addition — this method is strictly additive.
+	 *
+	 * @param int   $site_job_id
+	 * @param int[] $post_ids    Destination post IDs (posts and/or attachments — attachments
+	 *                           are `wp_posts` rows too) touched by this sync pass.
+	 * @param int[] $comment_ids Destination comment IDs touched by this sync pass.
+	 */
+	public static function replace_scoped( int $site_job_id, array $post_ids, array $comment_ids = [] ): void {
+		global $wpdb;
+
+		$post_ids    = array_values( array_unique( array_map( 'intval', $post_ids ) ) );
+		$comment_ids = array_values( array_unique( array_map( 'intval', $comment_ids ) ) );
+
+		if ( empty( $post_ids ) && empty( $comment_ids ) ) {
+			// Fast no-op — nothing touched this pass (U6 test scenario: a zero-row scoped
+			// pass must not run a query, let alone fall back to a full-table scan).
+			return;
+		}
+
+		$job = MigrationRegistry::get_site_job( $site_job_id );
+		if ( ! $job || ! $job->dest_blog_id ) {
+			return;
+		}
+
+		switch_to_blog( (int) $job->dest_blog_id );
+		$dest_siteurl    = get_option( 'siteurl' );
+		$dest_upload_url = trailingslashit( wp_upload_dir()['baseurl'] );
+		restore_current_blog();
+
+		$source_siteurl = rtrim( $job->source_siteurl, '/' );
+		$source_upload  = rtrim( $job->source_upload_url, '/' );
+
+		// Filter on the KEY (source URL) — replacing an empty source string would corrupt
+		// all content. Mirrors process()'s own $replacements construction exactly (kept as a
+		// separate, small duplication rather than a shared extraction, so the existing
+		// whole-table process()/run_phase() path above is not touched by this addition at
+		// all — see this method's docblock).
+		$replacements = array_filter( [
+			$source_siteurl => rtrim( $dest_siteurl, '/' ),
+			$source_upload  => rtrim( $dest_upload_url, '/' ),
+		], fn( $key ) => ! empty( $key ), ARRAY_FILTER_USE_KEY );
+
+		switch_to_blog( (int) $job->dest_blog_id );
+		try {
+			if ( ! empty( $post_ids ) ) {
+				if ( ! empty( $replacements ) ) {
+					self::replace_in_column_scoped( $wpdb->posts, 'post_content', $replacements, $post_ids, 'ID', 'ID' );
+					self::replace_in_column_scoped( $wpdb->posts, 'post_excerpt', $replacements, $post_ids, 'ID', 'ID' );
+					self::replace_in_column_scoped( $wpdb->posts, 'post_title', $replacements, $post_ids, 'ID', 'ID' );
+					self::replace_in_column_scoped( $wpdb->posts, 'guid', $replacements, $post_ids, 'ID', 'ID' );
+					self::replace_in_column_scoped( $wpdb->postmeta, 'meta_value', $replacements, $post_ids, 'post_id', 'meta_id' );
+				}
+				self::remap_postmeta_ids_scoped( $site_job_id, $post_ids );
+			}
+
+			if ( ! empty( $comment_ids ) && ! empty( $replacements ) ) {
+				self::replace_in_column_scoped( $wpdb->comments, 'comment_content', $replacements, $comment_ids, 'comment_ID', 'comment_ID' );
+			}
+		} finally {
+			restore_current_blog();
+		}
+	}
+
+	/**
+	 * Scoped counterpart to replace_in_column()/replace_in_options() — filters to specific
+	 * rows via `WHERE {$filter_col} IN (...)` instead of the whole-table keyset scan those
+	 * methods run. Reuses safe_replace() as-is. No pagination or time-budget checkpoint: the
+	 * caller (replace_scoped()) only ever passes an ID set already bounded by a sync stage's
+	 * own row budget, so this always finishes in one pass.
+	 *
+	 * @param string $table
+	 * @param string $col         Column to search/replace within.
+	 * @param array  $replacements
+	 * @param int[]  $ids         Row IDs to filter to.
+	 * @param string $filter_col  Column the IN() clause filters on (e.g. `post_id` for
+	 *                            postmeta, since postmeta's own PK is `meta_id` — a post can
+	 *                            have many postmeta rows).
+	 * @param string $pk_col      Primary-key column used for the UPDATE ... WHERE clause.
+	 */
+	private static function replace_in_column_scoped( string $table, string $col, array $replacements, array $ids, string $filter_col, string $pk_col ): void {
+		global $wpdb;
+
+		if ( empty( $ids ) ) {
+			return;
+		}
+
+		$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
+		$rows         = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"SELECT `{$pk_col}` AS pk, `{$col}` AS val FROM `{$table}` WHERE `{$filter_col}` IN ({$placeholders})",
+			$ids
+		), ARRAY_A );
+
+		if ( empty( $rows ) ) {
+			return;
+		}
+
+		foreach ( $rows as $row ) {
+			$original = $row['val'];
+			$replaced = self::safe_replace( $original, $replacements );
+			if ( $replaced !== $original ) {
+				$wpdb->update( $table, [ $col => $replaced ], [ $pk_col => $row['pk'] ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			}
+		}
+	}
+
+	/**
+	 * Scoped counterpart to remap_postmeta_ids() — same _thumbnail_id UPDATE...JOIN shape
+	 * against `hbm_id_map`, filtered to `pm.post_id IN (...)` so a sync pass only rescans the
+	 * postmeta rows belonging to the posts it just touched, not the whole postmeta table.
+	 * Assumes the caller has already switched to the destination blog (mirrors
+	 * replace_in_column_scoped(), unlike remap_postmeta_ids() which switches/restores itself
+	 * since it's called directly from finalize(), outside any existing switch_to_blog bracket).
+	 *
+	 * NOTE (sequencing with docs/plans/2026-07-13-001-fix-post-type-migration-audit-plan.md):
+	 * that plan, not yet implemented as of this unit, also modifies remap_postmeta_ids() (to
+	 * add nav_menu_item remap alongside _thumbnail_id). If/when it lands, its changes to the
+	 * whole-table remap_postmeta_ids() need to be reconciled with this scoped counterpart —
+	 * both should stay in sync on which postmeta keys get remapped.
+	 *
+	 * @param int   $site_job_id
+	 * @param int[] $post_ids Destination post IDs to scope the JOIN to.
+	 */
+	private static function remap_postmeta_ids_scoped( int $site_job_id, array $post_ids ): void {
+		global $wpdb;
+
+		if ( empty( $post_ids ) ) {
+			return;
+		}
+
+		$id_map_table = $wpdb->base_prefix . 'hbm_id_map';
+		$placeholders = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
+		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"UPDATE `{$wpdb->postmeta}` pm
+			 INNER JOIN `{$id_map_table}` im
+			     ON CAST(pm.meta_value AS UNSIGNED) = im.source_id
+			    AND im.site_job_id = %d
+			    AND im.object_type = 'attachment'
+			 SET pm.meta_value = im.dest_id
+			 WHERE pm.meta_key = '_thumbnail_id'
+			   AND pm.post_id IN ({$placeholders})",
+			array_merge( [ $site_job_id ], $post_ids )
+		) );
+	}
+
+	/**
 	 * Rewrites _thumbnail_id postmeta values from source attachment IDs to destination IDs.
 	 * Runs as the last step before marking the site job complete, when the full IdMap is available.
 	 */
