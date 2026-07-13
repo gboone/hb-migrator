@@ -39,8 +39,29 @@ class PostSyncStage implements SyncStageInterface {
 	 */
 	private const EPOCH = '1970-01-01 00:00:00';
 
+	/**
+	 * Source post IDs touched (fetched and passed to PostImporter::import_batch()) by the
+	 * most recent process() call for a given site_job_id, keyed by site_job_id. Lets U4's
+	 * MediaSyncStage include an attachment whose parent post was just synced this pass even
+	 * when the attachment's own post_modified didn't change (e.g. a featured image swapped
+	 * on an edited post) — see get_synced_post_ids().
+	 *
+	 * An in-memory static, not a DB column or transient: SyncDispatcher::run_sync_pass()
+	 * runs every registered stage in order (posts, then media, ...) within one PHP
+	 * request/process (see class-sync-dispatcher.php), so PostSyncStage::process() always
+	 * runs immediately before MediaSyncStage::process() reads this for the same pass — no
+	 * cross-request persistence is needed, and none is attempted.
+	 *
+	 * @var array<int, int[]>
+	 */
+	private static array $last_synced_post_ids = [];
+
 	public function process( int $site_job_id ): bool {
 		global $wpdb;
+
+		// Reset up front so a pass that exits early below (job/migration missing) never
+		// leaves a stale prior pass's IDs visible to get_synced_post_ids().
+		self::$last_synced_post_ids[ $site_job_id ] = [];
 
 		$job = MigrationRegistry::get_site_job( $site_job_id );
 		if ( ! $job || ! $job->dest_blog_id ) {
@@ -77,6 +98,8 @@ class PostSyncStage implements SyncStageInterface {
 			]
 		);
 
+		self::$last_synced_post_ids[ $site_job_id ] = array_map( fn( $p ) => (int) $p['ID'], $posts );
+
 		if ( empty( $posts ) ) {
 			// Nothing new or edited since the last pass — already caught up.
 			return false;
@@ -103,5 +126,17 @@ class PostSyncStage implements SyncStageInterface {
 		// A full batch means more matching posts likely remain beyond this row budget —
 		// mirrors PostImporter::process()'s own `count( $posts ) >= 100` continuation check.
 		return count( $posts ) >= self::BATCH_SIZE;
+	}
+
+	/**
+	 * Source post IDs fetched by this stage's most recent process() call for the given
+	 * site_job_id — used by MediaSyncStage (U4) as the `parent_ids` param passed to
+	 * MediaReader, so an attachment whose parent post was just synced this pass is included
+	 * even without its own post_modified change. Returns an empty array when this stage
+	 * hasn't run for this site_job_id in the current PHP process (e.g. isolated tests, or a
+	 * pass that exited early), which is the correct "nothing to add" default.
+	 */
+	public static function get_synced_post_ids( int $site_job_id ): array {
+		return self::$last_synced_post_ids[ $site_job_id ] ?? [];
 	}
 }
