@@ -3,9 +3,9 @@
 namespace HBMigrator\Admin;
 
 use HBMigrator\ApiAuth;
+use HBMigrator\Destination\SyncReceiver;
 use HBMigrator\Destination\SyncScheduler;
 use HBMigrator\MigrationRegistry;
-use HBMigrator\SourceClient;
 
 class AdminPage {
 
@@ -454,51 +454,16 @@ class AdminPage {
 
 		// U7: register the cron safety-net pass now that the job is actually 'syncing'.
 		SyncScheduler::schedule( $site_job_id );
-		self::deliver_sync_webhook_token( $site_job_id );
+
+		// Token delivery (U8's token-delivery gap — see Source\SyncWebhook's class docblock for
+		// the full rationale) is owned by SyncReceiver, not duplicated here: code review found
+		// this admin-page copy and SyncReceiver::enable_sync()'s copy had drifted (only the
+		// latter stamped sync_webhook_token_delivered_at on confirmed delivery), so this button
+		// path now calls the same canonical implementation the REST path uses.
+		SyncReceiver::deliver_sync_webhook_token( $site_job_id );
 
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_enabled=1' ) );
 		exit;
-	}
-
-	/**
-	 * U8 token-delivery gap: source's content-event hooks (Source\SyncWebhook) need this
-	 * site job's freshly-generated sync_webhook_token (U1) and its own site_job_id to fire
-	 * webhook calls, but "Enable Sync" is a destination-only admin action with no existing
-	 * channel telling source it happened — source's status-poll loop already stops once the
-	 * initial migration reaches 'complete' (assets/js/admin.js), well before this action is
-	 * ever available. Closed with the most minimal mechanism consistent with this plugin's
-	 * existing patterns: call a new source-side endpoint (POST /source/sync-webhook-token,
-	 * Source\SyncWebhook::receive_token()) authenticated with the migration's own
-	 * source_api_key — the SAME credential SourceClient already uses for every other
-	 * destination-to-source call, not a new bearer token. See Source\SyncWebhook's class
-	 * docblock for the full rationale.
-	 *
-	 * Best-effort: a delivery failure here does not block Enable Sync itself (destination's
-	 * state is authoritative and U7's cron poll does not depend on this token at all — only
-	 * the webhook's low-latency path does). An operator can retry by finalizing and
-	 * re-enabling, or a future admin action could resend it; no resend UI exists yet.
-	 */
-	private static function deliver_sync_webhook_token( int $site_job_id ): void {
-		$job = MigrationRegistry::get_site_job( $site_job_id );
-		if ( ! $job || empty( $job->sync_webhook_token ) ) {
-			return;
-		}
-
-		$migration = MigrationRegistry::get_migration( (int) $job->migration_id );
-		if ( ! $migration || empty( $migration->source_url ) || empty( $migration->source_api_key ) ) {
-			return;
-		}
-
-		try {
-			SourceClient::post( $migration->source_url, $migration->source_api_key, 'source/sync-webhook-token', [
-				'blog_id'             => (int) $job->source_blog_id,
-				'site_job_id'         => $site_job_id,
-				'sync_webhook_token'  => $job->sync_webhook_token,
-			] );
-		} catch ( \Throwable $e ) {
-			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			error_log( 'HB Migrator: failed to deliver sync_webhook_token to source for site job ' . $site_job_id . ': ' . $e->getMessage() );
-		}
 	}
 
 	/**

@@ -185,30 +185,29 @@ class SyncReceiver {
 	}
 
 	/**
-	 * Replicates Admin\AdminPage::deliver_sync_webhook_token()'s best-effort push of this job's
-	 * freshly-generated sync_webhook_token to source (U8's token-delivery gap — see
-	 * Source\SyncWebhook's class docblock for the full rationale), so enable_sync() above
-	 * behaves identically to the wp-admin button. That admin-only copy cannot be called
-	 * directly (private, and lives in a class this unit does not own/modify), so this is a
-	 * parallel implementation rather than a shared one — see this method's own addition below
-	 * for why that duplication is where a real fix belongs.
+	 * Best-effort push of this job's freshly-generated sync_webhook_token to source (U8's
+	 * token-delivery gap — see Source\SyncWebhook's class docblock for the full rationale).
+	 * Public and canonical: both enable_sync() above (the REST-triggered path) and
+	 * Admin\AdminPage::handle_enable_sync() (the wp-admin button path) call this same method,
+	 * so the two Enable Sync entry points can't drift on this side effect the way an earlier,
+	 * admin-page-only copy of this logic did before a code-review pass consolidated them.
 	 *
-	 * Code-review addition beyond the admin-page original: on confirmed successful delivery
-	 * (SourceClient::post() returns without throwing — i.e. source's receive_token() responded
-	 * with HTTP 200) this also stamps sync_webhook_token_delivered_at on the site job. Source
-	 * and destination are separate WordPress installs communicating only over this REST call
-	 * (see MigrationReceiver/SourceClient's cross-install credential handling), so this
-	 * timestamp can only be written from the destination side that made the call and observed
-	 * the outcome — NOT from Source\SyncWebhook::receive_token(), which runs on the source
-	 * install against its own local (and, for this site_job_id, unrelated) hbm_site_jobs
-	 * table. Previously a delivery failure here silently degraded a site job to cron-only sync
-	 * (U7's 15-minute safety net still runs) with no signal beyond the error_log() call below;
-	 * an operator or a future admin-page display can now tell "token confirmed delivered"
-	 * apart from "never confirmed" for a given site job. Failure remains non-fatal and does
-	 * not block sync being enabled: cron does not depend on this token at all, only the
-	 * webhook's low-latency path does.
+	 * On confirmed successful delivery (SourceClient::post() returns without throwing — i.e.
+	 * source's receive_token() responded with HTTP 200) this stamps
+	 * sync_webhook_token_delivered_at on the site job. Source and destination are separate
+	 * WordPress installs communicating only over this REST call (see
+	 * MigrationReceiver/SourceClient's cross-install credential handling), so this timestamp
+	 * can only be written from the destination side that made the call and observed the
+	 * outcome — NOT from Source\SyncWebhook::receive_token(), which runs on the source install
+	 * against its own local (and, for this site_job_id, unrelated) hbm_site_jobs table. Without
+	 * this, a delivery failure silently degraded a site job to cron-only sync (U7's 15-minute
+	 * safety net still runs) with no signal beyond the error_log() call below; an operator or a
+	 * future admin-page display can now tell "token confirmed delivered" apart from "never
+	 * confirmed" for a given site job. Failure remains non-fatal and does not block sync being
+	 * enabled: cron does not depend on this token at all, only the webhook's low-latency path
+	 * does.
 	 */
-	private static function deliver_sync_webhook_token( int $site_job_id ): void {
+	public static function deliver_sync_webhook_token( int $site_job_id ): void {
 		$job = MigrationRegistry::get_site_job( $site_job_id );
 		if ( ! $job || empty( $job->sync_webhook_token ) ) {
 			return;
