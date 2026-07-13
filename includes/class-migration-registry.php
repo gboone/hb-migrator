@@ -312,6 +312,76 @@ class MigrationRegistry {
 	}
 
 	/**
+	 * Atomically claims the sync-pass lock for a site job via a single UPDATE checked via
+	 * rows_affected — not a SELECT-then-UPDATE, which would have a real TOCTOU race between
+	 * a webhook request (PHP-FPM worker) and a cron tick (separate Action Scheduler worker)
+	 * both seeing the lock unclaimed before either writes it. Mirrors complete_migration()'s
+	 * atomic UPDATE + rows_affected pattern, adopted there after an earlier two-step
+	 * SELECT-then-UPDATE hit a replica-lag race in production — see that method's docblock.
+	 *
+	 * A lock older than $staleness_minutes is treated as abandoned and reclaimed, the
+	 * backstop for a process killed mid-pass (PHP timeout, OOM) that never reached its own
+	 * release — otherwise that site job would be locked out of sync permanently. See
+	 * docs/plans/2026-07-13-002-feat-post-migration-content-sync-plan.md, "Key Technical
+	 * Decisions" and "Risks & Dependencies" (U2's staleness-threshold trade-off).
+	 *
+	 * @return bool True only if THIS call claimed the lock (rows_affected === 1); false
+	 *              means another pass already holds a fresh lock, or the job is no longer
+	 *              'syncing' — both expected "someone else has it" outcomes, not errors.
+	 */
+	public static function claim_sync_lock( int $site_job_id, int $staleness_minutes ): bool {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_site_jobs';
+		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"UPDATE `{$table}`
+			    SET sync_locked_at = NOW()
+			  WHERE id = %d
+			    AND status = 'syncing'
+			    AND ( sync_locked_at IS NULL OR sync_locked_at < NOW() - INTERVAL %d MINUTE )",
+			$site_job_id,
+			$staleness_minutes
+		) );
+		return 1 === (int) $wpdb->rows_affected;
+	}
+
+	/**
+	 * Releases a sync-pass lock claimed by claim_sync_lock(), unconditionally clearing
+	 * sync_locked_at and recording the pass outcome. Callers (SyncDispatcher) invoke this
+	 * from a try/finally so a mid-pass exception can never leave sync_locked_at set —
+	 * the staleness reclaim in claim_sync_lock() is only the backstop for the cases a
+	 * caught exception can't cover (a hard process kill that skips finally entirely).
+	 *
+	 * Does not touch `status` — a sync-pass failure is non-terminal (R3): the site job
+	 * stays 'syncing' regardless of $error_message, unlike PipelineController's
+	 * handle_batch_failure(), which marks the whole job 'failed' on retry exhaustion.
+	 *
+	 * @param string|null $error_message Null clears sync_last_error (successful pass,
+	 *                                   including one that still has more work remaining);
+	 *                                   non-null records the caught exception's message.
+	 */
+	public static function release_sync_lock( int $site_job_id, ?string $error_message = null ): void {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_site_jobs';
+		if ( null === $error_message ) {
+			$sql = $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				"UPDATE `{$table}`
+				    SET sync_locked_at = NULL, sync_last_pass_at = NOW(), sync_last_error = NULL
+				  WHERE id = %d",
+				$site_job_id
+			);
+		} else {
+			$sql = $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				"UPDATE `{$table}`
+				    SET sync_locked_at = NULL, sync_last_pass_at = NOW(), sync_last_error = %s
+				  WHERE id = %d",
+				$error_message,
+				$site_job_id
+			);
+		}
+		$wpdb->query( $sql ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+	}
+
+	/**
 	 * Wipes hbm_migrations.source_api_key only once no site job on the migration is still
 	 * 'complete' or 'syncing' — i.e. no job remains that could either enable sync or is
 	 * already mid-sync and needs the credential for its next pass.
