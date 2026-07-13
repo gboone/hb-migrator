@@ -46,17 +46,29 @@ class CommentImporter {
 	 *                        comment whose post is still unmapped is skipped exactly as before
 	 *                        even when its ID appears here — forcing only ever waives the
 	 *                        parent check, never fabricates a destination post.
+	 * @return int[] Source comment_IDs that were fetched but did not end up durably synced this
+	 *               call: an unresolved comment_post_ID/comment_parent reference (see the
+	 *               resolution order above), OR a wp_insert_comment()/wp_update_comment()
+	 *               write failure (code-review addition — previously a write failure was only
+	 *               `continue`d past with no signal to the caller, so CommentSyncStage's
+	 *               cursor-advance walk had no way to distinguish "content actually updated
+	 *               this pass" from "write silently failed, old content still stands" for an
+	 *               already-IdMap-mapped comment; both now count as "not durably synced" so the
+	 *               cursor doesn't advance past a comment whose update just failed).
 	 */
-	public static function process( int $site_job_id, array $comments, array $force_top_level_ids = [] ): void {
+	public static function process( int $site_job_id, array $comments, array $force_top_level_ids = [] ): array {
 		global $wpdb;
 
+		$failed_ids = [];
+
 		if ( empty( $comments ) ) {
-			return;
+			return $failed_ids;
 		}
 
 		$job = MigrationRegistry::get_site_job( $site_job_id );
 		if ( ! $job || ! $job->dest_blog_id ) {
-			return;
+			// Job/migration missing is not a per-comment failure — nothing was attempted.
+			return $failed_ids;
 		}
 
 		// Comment/post/user IdMap lookups below are keyed by site_job_id only (not by blog),
@@ -77,6 +89,7 @@ class CommentImporter {
 					// next pass rather than drop or attach to nothing (R6, plan: "a comment
 					// whose comment_post_ID or comment_parent has no destination mapping yet
 					// is skipped this pass and retried on the next one, not dropped").
+					$failed_ids[] = $source_id;
 					continue;
 				}
 
@@ -91,6 +104,7 @@ class CommentImporter {
 						// sets), and wp_insert_comment() performs no parent-existence
 						// validation, so this check is a required defense, not
 						// defense-in-depth.
+						$failed_ids[] = $source_id;
 						continue;
 					}
 				}
@@ -143,12 +157,18 @@ class CommentImporter {
 					if ( is_wp_error( $update_result ) || ! $update_result ) {
 						// Leave the existing destination row untouched rather than partially
 						// apply — mirrors PostImporter's existing-row branch on
-						// wp_update_post() failure.
+						// wp_update_post() failure. Code-review addition: report this as a
+						// failure to the caller even though the comment IS already IdMap-mapped
+						// (from its original successful insert) — without this, CommentSyncStage
+						// had no way to tell "content updated this pass" from "update silently
+						// failed", and would advance its cursor past this comment regardless.
+						$failed_ids[] = $source_id;
 						continue;
 					}
 				} else {
 					$dest_id = wp_insert_comment( wp_slash( $comment_data ) );
 					if ( ! $dest_id ) {
+						$failed_ids[] = $source_id;
 						continue;
 					}
 					IdMap::set( $site_job_id, 'comment', $source_id, (int) $dest_id );
@@ -177,5 +197,7 @@ class CommentImporter {
 		} finally {
 			restore_current_blog();
 		}
+
+		return $failed_ids;
 	}
 }

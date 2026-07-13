@@ -484,4 +484,75 @@ class Test_CommentSyncStage extends WP_UnitTestCase {
 			"The new blocker must start its own fresh count (1), not inherit comment #2's prior count."
 		);
 	}
+
+	// -------------------------------------------------------------------------
+	// Code-review follow-up: a write failure on an already-mapped comment (distinct from an
+	// unresolved reference) must also block the cursor, without engaging the bounded-stall
+	// mechanism (forcing comment_parent=0 cannot fix a failed database write).
+	// -------------------------------------------------------------------------
+
+	public function test_cursor_does_not_advance_past_a_comment_whose_update_failed_this_pass(): void {
+		$dest_post_id = self::factory()->post->create();
+		IdMap::set( $this->jid, 'post', 1, $dest_post_id );
+
+		// Comment 5 is already mapped from a prior pass; comment 9 is new and resolvable.
+		$dest_comment_id = self::factory()->comment->create( [ 'comment_post_ID' => $dest_post_id ] );
+		IdMap::set( $this->jid, 'comment', 5, $dest_comment_id );
+
+		add_filter( 'wp_update_comment_data', function ( $data ) use ( $dest_comment_id ) {
+			if ( (int) ( $data['comment_ID'] ?? 0 ) === $dest_comment_id ) {
+				return new \WP_Error( 'forced_failure_for_test', 'Forced failure for test.' );
+			}
+			return $data;
+		} );
+
+		$this->mock_comments_response( [
+			$this->make_source_comment( [ 'comment_ID' => 5, 'comment_post_ID' => 1 ] ),
+			$this->make_source_comment( [ 'comment_ID' => 9, 'comment_post_ID' => 1 ] ),
+		] );
+
+		$stage     = new CommentSyncStage();
+		$more_work = $stage->process( $this->jid );
+
+		remove_all_filters( 'wp_update_comment_data' );
+
+		$this->assertNull( IdMap::get( $this->jid, 'comment', 9 ), 'A comment positioned after a write-failed one must not be imported this pass, mirroring the unresolved-reference case.' );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 0, (int) $job->sync_cursor_comments, 'Cursor must stop before the write-failed comment, not advance past it just because it was already IdMap-mapped.' );
+		$this->assertSame( 0, (int) $job->sync_comment_stall_id, 'A write failure must not engage the bounded-stall/force-top-level mechanism — that only helps a genuinely unresolvable reference.' );
+		$this->assertFalse( $more_work, 'A write-failure-blocked batch must not self-requeue an immediate continuation.' );
+	}
+
+	public function test_write_failed_comment_is_retried_and_synced_once_the_transient_failure_clears(): void {
+		$dest_post_id = self::factory()->post->create();
+		IdMap::set( $this->jid, 'post', 1, $dest_post_id );
+
+		$dest_comment_id = self::factory()->comment->create( [ 'comment_post_ID' => $dest_post_id ] );
+		IdMap::set( $this->jid, 'comment', 5, $dest_comment_id );
+
+		$filter = function ( $data ) use ( $dest_comment_id ) {
+			if ( (int) ( $data['comment_ID'] ?? 0 ) === $dest_comment_id ) {
+				return new \WP_Error( 'forced_failure_for_test', 'Forced failure for test.' );
+			}
+			return $data;
+		};
+		add_filter( 'wp_update_comment_data', $filter );
+
+		$this->mock_comments_response( [
+			$this->make_source_comment( [ 'comment_ID' => 5, 'comment_post_ID' => 1, 'comment_content' => 'Retried content.' ] ),
+		] );
+
+		$stage = new CommentSyncStage();
+		$stage->process( $this->jid );
+
+		remove_filter( 'wp_update_comment_data', $filter );
+
+		// The transient failure clears; a later pass re-fetches from the same (unmoved) cursor.
+		$stage->process( $this->jid );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 5, (int) $job->sync_cursor_comments, 'Cursor advances once the write succeeds.' );
+		$this->assertSame( 'Retried content.', get_comment( $dest_comment_id )->comment_content );
+	}
 }

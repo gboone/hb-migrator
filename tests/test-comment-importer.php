@@ -281,9 +281,15 @@ class Test_CommentImporter extends WP_UnitTestCase {
 			'comment_ID'      => 200,
 			'comment_content' => 'Attempted edit that must NOT apply.',
 		] );
-		CommentImporter::process( $this->jid, [ $edited ] );
+		$failed_ids = CommentImporter::process( $this->jid, [ $edited ] );
 
 		remove_all_filters( 'wp_update_comment_data' );
+
+		// Code-review follow-up: an already-IdMap-mapped comment whose update fails must be
+		// reported in the return value, not just silently `continue`d past — CommentSyncStage
+		// relies on this to keep its cursor from advancing past a comment whose re-apply just
+		// failed (see CommentSyncStage's $write_failed_ids usage).
+		$this->assertContains( 200, $failed_ids, 'A wp_update_comment() failure on an already-mapped comment must be reported as a failed ID.' );
 
 		// Actual current behavior of CommentImporter::process()'s update branch: on
 		// wp_update_comment() failure it `continue`s, which skips the rest of that loop

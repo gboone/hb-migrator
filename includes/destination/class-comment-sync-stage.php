@@ -138,7 +138,15 @@ class CommentSyncStage implements SyncStageInterface {
 		// actually mapped. An exception here propagates straight out to SyncDispatcher's
 		// catch block, so the cursor-advance loop below is never reached on failure — cursor
 		// only advances on success, mirroring U3's PostSyncStage.
-		CommentImporter::process( $site_job_id, $comments );
+		//
+		// $write_failed_ids (code-review addition): CommentImporter::process() now reports
+		// which fetched comment_IDs did NOT end up durably synced this call, including a
+		// wp_update_comment() failure on a comment that was ALREADY IdMap-mapped from a prior
+		// pass — a case the walk loop below previously had no way to see, since
+		// `IdMap::get()` still returns that comment's old (still-valid) mapping regardless of
+		// whether today's re-apply attempt actually succeeded. Without this, the cursor could
+		// advance past a comment whose update just silently failed.
+		$write_failed_ids = array_flip( CommentImporter::process( $site_job_id, $comments ) );
 
 		// The cursor cannot simply become "max comment_ID fetched in this batch": a comment
 		// whose comment_post_ID or comment_parent isn't mapped yet is skipped by
@@ -174,6 +182,18 @@ class CommentSyncStage implements SyncStageInterface {
 
 		foreach ( $comments as $c ) {
 			$id = (int) ( $c['comment_ID'] ?? 0 );
+
+			if ( null !== IdMap::get( $site_job_id, 'comment', $id ) && isset( $write_failed_ids[ $id ] ) ) {
+				// Already mapped from a prior pass, but this pass's re-apply (wp_update_comment())
+				// failed — a transient write failure, not an unresolved reference, so it is NOT
+				// eligible for the bounded-stall/force-top-level treatment below (forcing
+				// comment_parent to 0 cannot fix a failed database write). Stop the walk here and
+				// retry next pass, same as the plugin's other content types treat a per-item
+				// write failure (see PostSyncStage/MediaSyncStage's equivalent handling) — no
+				// stall bookkeeping is touched for this comment.
+				$blocked = true;
+				break;
+			}
 
 			if ( null === IdMap::get( $site_job_id, 'comment', $id ) ) {
 				$attempt = ( $id === $old_stall_id ) ? $old_stall_count + 1 : 1;
