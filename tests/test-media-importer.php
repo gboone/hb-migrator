@@ -706,4 +706,98 @@ class Test_Media_Importer extends WP_UnitTestCase {
 
 		remove_filter( 'wp_check_filetype_and_ext', $filter );
 	}
+
+	// -------------------------------------------------------------------------
+	// U4: import_batch() extraction — shared by process() (initial migration/retries) and
+	// MediaSyncStage (ongoing sync). These verify import_batch() is directly callable and
+	// that it preserves the exact same conflict-policy behavior process() already exercises.
+	// -------------------------------------------------------------------------
+
+	public function test_import_batch_directly_honors_skip_duplicates_policy(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$existing_att_id = wp_insert_post( [
+			'post_type'   => 'attachment',
+			'post_name'   => 'direct-skip-dup',
+			'post_status' => 'inherit',
+			'post_title'  => 'Direct Skip Dup',
+		] );
+
+		$mid = $this->make_migration( [ 'media_conflict_policy' => 'skip_duplicates' ] );
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$item = array_merge( $this->make_attachment_item( 950, 'direct-skip-dup.jpg' ), [ 'post_name' => 'direct-skip-dup' ] );
+		$failed = MediaImporter::import_batch( $jid, [ $item ] );
+
+		$this->assertSame( $existing_att_id, IdMap::get( $jid, 'attachment', 950 ), 'import_batch() called directly must still honor skip_duplicates.' );
+		$this->assertSame( [], $failed );
+
+		wp_delete_post( $existing_att_id, true );
+	}
+
+	public function test_import_batch_returns_failed_items_for_download_failures(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_download_failure();
+
+		$failed = MediaImporter::import_batch( $jid, [ $this->make_attachment_item( 951, 'direct-fail.jpg' ) ] );
+
+		$this->assertArrayHasKey( 951, $failed, 'import_batch() must return failed items so callers can decide whether to retry.' );
+		$this->assertNull( IdMap::get( $jid, 'attachment', 951 ) );
+	}
+
+	public function test_import_batch_restores_current_blog_on_success(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		$dest_blog_id = get_current_blog_id();
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => $dest_blog_id ] );
+
+		$before = get_current_blog_id();
+		MediaImporter::import_batch( $jid, [] );
+		$after = get_current_blog_id();
+
+		$this->assertSame( $before, $after, 'import_batch() must restore the original blog even for an empty batch.' );
+	}
+
+	public function test_import_batch_missing_job_returns_empty_without_error(): void {
+		$failed = MediaImporter::import_batch( 999999, [ $this->make_attachment_item( 952 ) ] );
+		$this->assertSame( [], $failed, 'A missing/invalid site job must be a safe no-op.' );
+	}
+
+	public function test_process_still_advances_pipeline_via_import_batch(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		// Fewer than 50 items — process() should enqueue hbm_import_options next (initial
+		// migration path is otherwise untouched by the import_batch() extraction).
+		$this->mock_media( [ $this->make_attachment_item( 953, 'pipeline.jpg' ) ] );
+		$this->mock_download_failure();
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_import_options',
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 20,
+		] );
+		$this->assertNotEmpty( $scheduled, 'process() must still enqueue hbm_import_options after import_batch() extraction.' );
+	}
 }

@@ -59,6 +59,12 @@ class Plugin {
 			$stages['posts'] = new Destination\PostSyncStage();
 			return $stages;
 		} );
+
+		// Register U4's real 'media' sync stage — see class-media-sync-stage.php.
+		add_filter( 'hbm_sync_stages', static function ( array $stages ) {
+			$stages['media'] = new Destination\MediaSyncStage();
+			return $stages;
+		} );
 	}
 
 	public static function activate(): void {
