@@ -11,14 +11,15 @@ class PostReader {
 	private const MIN_OVERLAP_SECONDS = 60;
 
 	/**
-	 * Placeholder for U7's actual recurring sync-pass interval. class-sync-scheduler.php
-	 * (U7) doesn't exist yet as of this unit, so there is no real constant to reference —
-	 * 15 minutes is this plan's own Key Technical Decisions default assumption. Once U7
-	 * lands, this MUST be updated to reference (or match) its real interval: the overlap
-	 * window's correctness margin against source-side commit-visibility lag is derived
-	 * from the poll cadence, so a mismatch here silently narrows that margin.
+	 * Default sync-pass poll cadence (seconds), used only as the `hbm_sync_interval` filter's
+	 * fallback. This is the same filter name Destination\SyncScheduler (U7) applies to its own
+	 * recurring-action interval on the destination install — PostReader runs on the source
+	 * install, a separate WordPress instance, so it cannot reference SyncScheduler's class
+	 * constant directly; sharing the filter name is the coordination point instead. An operator
+	 * who overrides the interval on the destination should apply the same `hbm_sync_interval`
+	 * filter on the source for the overlap window's correctness margin to stay matched.
 	 */
-	private const ASSUMED_SYNC_CRON_INTERVAL_SECONDS = 15 * MINUTE_IN_SECONDS;
+	private const DEFAULT_SYNC_CRON_INTERVAL_SECONDS = 15 * MINUTE_IN_SECONDS;
 
 	public static function get_posts( \WP_REST_Request $request ): \WP_REST_Response {
 		global $wpdb;
@@ -44,7 +45,8 @@ class PostReader {
 			// poll interval." Re-applying an unchanged post is a safe no-op (idempotent
 			// IdMap-keyed re-apply), so widening this window costs redundant work, not
 			// correctness.
-			$overlap = max( self::MIN_OVERLAP_SECONDS, self::ASSUMED_SYNC_CRON_INTERVAL_SECONDS );
+			$interval = (int) apply_filters( 'hbm_sync_interval', self::DEFAULT_SYNC_CRON_INTERVAL_SECONDS );
+			$overlap  = max( self::MIN_OVERLAP_SECONDS, $interval );
 			$floor   = gmdate( 'Y-m-d H:i:s', $since_ts - $overlap );
 
 			$posts = $wpdb->get_results( $wpdb->prepare(
