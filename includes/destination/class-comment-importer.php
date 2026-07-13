@@ -86,12 +86,32 @@ class CommentImporter {
 					$dest_user_id = IdMap::get( IdMap::NETWORK, 'user', (int) $c['user_id'] ) ?? 0;
 				}
 
+				// Sanitize all free-text/user-controlled comment fields before they ever reach
+				// wp_insert_comment()/wp_update_comment(). Unlike PostImporter's post_author
+				// (a vetted source-site Editor/Admin account, hence that importer's deliberate
+				// kses_remove_filters()/kses_init_filters() bracket to relax sanitization),
+				// comment_author/_email/_url/_content can originate from anonymous,
+				// unauthenticated public visitors on the source site — including
+				// never-publicly-rendered but still-stored spam/pending payloads (CommentReader
+				// deliberately does not filter by comment_approved). wp_insert_comment() and
+				// wp_update_comment() are the programmatic API and do NOT run the sanitization
+				// that WordPress core's normal comment-submission path (wp_filter_comment() and
+				// its pre_comment_content/pre_comment_author_name/etc. filters, invoked by
+				// wp_new_comment()) applies to comments submitted via the comment form or REST
+				// API. Without this, a stored-XSS payload sitting in source's wp_comments table
+				// would migrate to destination byte-for-byte and could execute if the comment is
+				// later approved/rendered there. wp_kses_post() mirrors the safe-HTML subset
+				// core allows in comment content post-moderation while stripping <script>/
+				// on-event-handler vectors; sanitize_text_field()/sanitize_email()/
+				// esc_url_raw() mirror the equivalent core sanitizers for the author triplet
+				// (esc_url_raw() routes through wp_kses_bad_protocol(), which strips
+				// non-whitelisted schemes such as javascript:).
 				$comment_data = [
 					'comment_post_ID'      => $dest_post_id,
-					'comment_author'       => (string) $c['comment_author'],
-					'comment_author_email' => (string) $c['comment_author_email'],
-					'comment_author_url'   => (string) $c['comment_author_url'],
-					'comment_content'      => (string) $c['comment_content'],
+					'comment_author'       => sanitize_text_field( (string) $c['comment_author'] ),
+					'comment_author_email' => sanitize_email( (string) $c['comment_author_email'] ),
+					'comment_author_url'   => esc_url_raw( (string) $c['comment_author_url'] ),
+					'comment_content'      => wp_kses_post( (string) $c['comment_content'] ),
 					'comment_type'         => (string) $c['comment_type'],
 					'comment_parent'       => $dest_parent_id,
 					'user_id'              => $dest_user_id,

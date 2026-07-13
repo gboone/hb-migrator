@@ -272,4 +272,117 @@ class Test_CommentImporter extends WP_UnitTestCase {
 
 		$this->assertSame( '2020-06-15 12:00:00', get_comment( $dest_id )->comment_date_gmt );
 	}
+
+	// -------------------------------------------------------------------------
+	// Security: comment fields are sanitized before insert/update (P0 fix — comments,
+	// unlike PostImporter's vetted post_author, can originate from anonymous/untrusted
+	// source-site visitors, and wp_insert_comment()/wp_update_comment() do not run the
+	// wp_filter_comment() sanitization WordPress core's normal comment-submission path
+	// applies).
+	// -------------------------------------------------------------------------
+
+	public function test_script_tag_in_comment_content_is_stripped_on_insert(): void {
+		$comment = $this->make_source_comment( [
+			'comment_ID'      => 90,
+			'comment_content' => 'Hello <script>alert(1)</script> world.',
+		] );
+		CommentImporter::process( $this->jid, [ $comment ] );
+
+		$dest_id = IdMap::get( $this->jid, 'comment', 90 );
+		$this->assertNotNull( $dest_id );
+
+		$content = get_comment( $dest_id )->comment_content;
+		$this->assertStringNotContainsString( '<script', $content );
+		$this->assertStringNotContainsString( 'alert(1)', $content );
+	}
+
+	public function test_javascript_uri_in_comment_author_url_is_sanitized_on_insert(): void {
+		$comment = $this->make_source_comment( [
+			'comment_ID'         => 91,
+			'comment_author_url' => 'javascript:alert(document.cookie)',
+		] );
+		CommentImporter::process( $this->jid, [ $comment ] );
+
+		$dest_id = IdMap::get( $this->jid, 'comment', 91 );
+		$this->assertNotNull( $dest_id );
+
+		$url = get_comment( $dest_id )->comment_author_url;
+		$this->assertStringNotContainsString( 'javascript:', $url );
+	}
+
+	public function test_ordinary_safe_content_and_author_fields_unaffected_by_sanitization(): void {
+		$comment = $this->make_source_comment( [
+			'comment_ID'           => 92,
+			'comment_content'      => 'This is a perfectly ordinary comment with no markup at all.',
+			'comment_author'       => 'Jane Doe',
+			'comment_author_email' => 'jane@example.com',
+			'comment_author_url'   => 'https://example.com/jane',
+		] );
+		CommentImporter::process( $this->jid, [ $comment ] );
+
+		$dest_id      = IdMap::get( $this->jid, 'comment', 92 );
+		$dest_comment = get_comment( $dest_id );
+
+		$this->assertSame( 'This is a perfectly ordinary comment with no markup at all.', $dest_comment->comment_content );
+		$this->assertSame( 'Jane Doe', $dest_comment->comment_author );
+		$this->assertSame( 'jane@example.com', $dest_comment->comment_author_email );
+		$this->assertSame( 'https://example.com/jane', $dest_comment->comment_author_url );
+	}
+
+	public function test_safe_html_subset_in_comment_content_is_preserved_not_over_stripped(): void {
+		// Guards against a false-positive fix that strips ALL markup (e.g. wp_strip_all_tags())
+		// rather than the safe post-context subset wp_kses_post() allows — <strong>/<a> are
+		// part of the normal, non-XSS HTML WordPress core permits in comment content.
+		$comment = $this->make_source_comment( [
+			'comment_ID'      => 93,
+			'comment_content' => 'Great post, <strong>really</strong> enjoyed <a href="https://example.com">this link</a>.',
+		] );
+		CommentImporter::process( $this->jid, [ $comment ] );
+
+		$dest_id = IdMap::get( $this->jid, 'comment', 93 );
+		$content = get_comment( $dest_id )->comment_content;
+
+		$this->assertStringContainsString( '<strong>really</strong>', $content );
+		$this->assertStringContainsString( '<a href="https://example.com">this link</a>', $content );
+	}
+
+	public function test_script_tag_in_comment_content_is_stripped_on_update(): void {
+		// Insert a clean comment first, then retry with an XSS payload — exercising the
+		// idempotent-retry update branch (IdMap::get() already resolves to an existing
+		// destination row) to confirm sanitization is applied there too, not just on insert.
+		$comment = $this->make_source_comment( [ 'comment_ID' => 94, 'comment_content' => 'Original, clean.' ] );
+		CommentImporter::process( $this->jid, [ $comment ] );
+		$dest_id = IdMap::get( $this->jid, 'comment', 94 );
+		$this->assertNotNull( $dest_id );
+
+		$edited = $this->make_source_comment( [
+			'comment_ID'      => 94,
+			'comment_content' => 'Edited <script>alert(2)</script> payload.',
+		] );
+		CommentImporter::process( $this->jid, [ $edited ] );
+
+		$this->assertSame( $dest_id, IdMap::get( $this->jid, 'comment', 94 ), 'Must update in place, not duplicate.' );
+
+		$content = get_comment( $dest_id )->comment_content;
+		$this->assertStringNotContainsString( '<script', $content );
+		$this->assertStringNotContainsString( 'alert(2)', $content );
+	}
+
+	public function test_javascript_uri_in_comment_author_url_is_sanitized_on_update(): void {
+		$comment = $this->make_source_comment( [ 'comment_ID' => 95, 'comment_author_url' => 'https://example.com/original' ] );
+		CommentImporter::process( $this->jid, [ $comment ] );
+		$dest_id = IdMap::get( $this->jid, 'comment', 95 );
+		$this->assertNotNull( $dest_id );
+
+		$edited = $this->make_source_comment( [
+			'comment_ID'         => 95,
+			'comment_author_url' => 'javascript:alert(document.cookie)',
+		] );
+		CommentImporter::process( $this->jid, [ $edited ] );
+
+		$this->assertSame( $dest_id, IdMap::get( $this->jid, 'comment', 95 ), 'Must update in place, not duplicate.' );
+
+		$url = get_comment( $dest_id )->comment_author_url;
+		$this->assertStringNotContainsString( 'javascript:', $url );
+	}
 }
