@@ -246,6 +246,69 @@ class Test_CommentImporter extends WP_UnitTestCase {
 		$this->assertSame( 1, $count, 'Retry must not create a duplicate comment.' );
 	}
 
+	public function test_wp_update_comment_failure_on_already_mapped_comment_leaves_existing_row_untouched(): void {
+		// Testing-review gap: no test forced the update branch's own wp_update_comment()
+		// failure path (CommentImporter::process(), the `if ( is_wp_error( $update_result )
+		// || ! $update_result )` branch guarding the already-IdMap-mapped/retry case). Forced
+		// here via the 'wp_update_comment_data' filter — the actual core hook
+		// wp_update_comment() itself checks with is_wp_error() to short-circuit (see
+		// wp-includes/comment.php: `$data = apply_filters( 'wp_update_comment_data', $data,
+		// $comment, $commentarr ); if ( is_wp_error( $data ) ) { ... return $data; }` when
+		// $wp_error is true, which CommentImporter always passes). This is the same
+		// "hook a core WP function so it legitimately fails" pattern
+		// test-post-importer.php/test-post-sync-stage.php use for wp_insert_post() via the
+		// 'wp_insert_post_empty_content' filter — there is no existing wp_update_post()
+		// UPDATE-branch-failure test anywhere in this codebase to mirror 1:1 (PostImporter's
+		// own existing-row branch is only exercised for success, per
+		// test_existing_row_branch_updates_core_fields_on_edit()), so 'wp_update_comment_data'
+		// is the closest and most correct core-level equivalent for the comment update path.
+		$comment = $this->make_source_comment( [ 'comment_ID' => 200, 'comment_content' => 'Original content.' ] );
+		CommentImporter::process( $this->jid, [ $comment ] );
+
+		$dest_id = IdMap::get( $this->jid, 'comment', 200 );
+		$this->assertNotNull( $dest_id );
+
+		add_filter( 'wp_update_comment_data', function ( $data ) use ( $dest_id ) {
+			if ( (int) ( $data['comment_ID'] ?? 0 ) === $dest_id ) {
+				return new WP_Error( 'forced_failure_for_test', 'Forced failure for test.' );
+			}
+			return $data;
+		} );
+
+		// Retry the SAME comment (already IdMap-mapped) with different content — exercises
+		// the update branch, whose wp_update_comment() call is forced to fail above.
+		$edited = $this->make_source_comment( [
+			'comment_ID'      => 200,
+			'comment_content' => 'Attempted edit that must NOT apply.',
+		] );
+		CommentImporter::process( $this->jid, [ $edited ] );
+
+		remove_all_filters( 'wp_update_comment_data' );
+
+		// Actual current behavior of CommentImporter::process()'s update branch: on
+		// wp_update_comment() failure it `continue`s, which skips the rest of that loop
+		// iteration entirely — including the subsequent unconditional $wpdb->update() call
+		// that otherwise fixes up comment_date_gmt/comment_approved after either branch. So
+		// the IdMap mapping AND the destination row (content, and every other column) are
+		// left completely untouched, per the code's own comment ("Leave the existing
+		// destination row untouched rather than partially apply — mirrors PostImporter's
+		// existing-row branch on wp_update_post() failure"). This test asserts that actual
+		// behavior; see this task's report for a flagged concern about its consequences at
+		// the CommentSyncStage cursor level.
+		$this->assertSame(
+			$dest_id,
+			IdMap::get( $this->jid, 'comment', 200 ),
+			'The IdMap mapping must still point at the original destination comment after an update failure.'
+		);
+
+		$dest_comment = get_comment( $dest_id );
+		$this->assertSame(
+			'Original content.',
+			$dest_comment->comment_content,
+			'A wp_update_comment() failure must leave the existing destination comment content untouched, not partially apply the edit.'
+		);
+	}
+
 	public function test_comment_date_gmt_preserved_exactly_on_update_not_recomputed(): void {
 		// wp_update_comment() unconditionally recomputes comment_date_gmt from comment_date
 		// via get_gmt_from_date() — this test guards CommentImporter's defensive

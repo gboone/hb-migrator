@@ -10,6 +10,7 @@
 
 use HBMigrator\Destination\MediaSyncStage;
 use HBMigrator\Destination\PostSyncStage;
+use HBMigrator\Destination\SyncDispatcher;
 use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\QueueTable;
@@ -441,6 +442,83 @@ class Test_MediaSyncStage extends WP_UnitTestCase {
 		( new MediaSyncStage() )->process( $other_jid );
 
 		$this->assertEmpty( $captured_parent_ids, 'parent_ids must be empty when PostSyncStage has not run for this site job.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// End-to-end cross-stage handoff through the REAL SyncDispatcher::run_sync_pass()
+	// (testing-review gap): the tests above call PostSyncStage/MediaSyncStage directly, in
+	// manually-chosen order — they never prove the production `hbm_sync_stages` wiring
+	// (Plugin::register_action_hooks()) actually runs 'posts' before 'media' within one real
+	// dispatched pass, nor that MediaImporter's post_parent resolution sees IdMap state a
+	// same-pass PostSyncStage run just wrote. Mirrors test-comment-sync-stage.php's
+	// test_comment_on_a_post_synced_in_the_same_pass_is_imported_via_sync_dispatcher() 1:1,
+	// with the media-specific twist that the mocked '/media' response is itself gated on the
+	// `parent_ids` request param, so this also proves MediaSyncStage actually sent
+	// PostSyncStage::get_synced_post_ids() through to the request — not just that IdMap
+	// happened to already contain the mapping.
+	// -------------------------------------------------------------------------
+
+	public function test_attachment_whose_parent_post_synced_in_the_same_pass_is_picked_up_via_parent_ids_handoff_through_sync_dispatcher(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		// Deliberately no pre-existing IdMap 'post' mapping for source post 88 — it only
+		// becomes mapped because PostSyncStage (registered under the 'posts' slot) runs
+		// before MediaSyncStage (registered under the 'media' slot) within the same
+		// SyncDispatcher::run_sync_pass() call. See SyncDispatcher::default_stages() for the
+		// fixed slot order and Plugin::register_action_hooks() for both registrations.
+		$this->mock_posts_response( [ $this->make_source_post( [ 'ID' => 88, 'post_title' => 'Same-pass parent post' ] ) ] );
+
+		$attachment = $this->make_source_media( [
+			'source_attachment_id'  => 200,
+			'post_name'             => 'same-pass-attachment',
+			'post_parent_source_id' => 88,
+			'file_url'              => 'https://93.184.216.34/wp-content/uploads/same-pass.png',
+			'post_modified'         => '2026-01-01 00:00:00',
+		] );
+
+		// Unlike mock_media_response(), this only returns the attachment when the request's
+		// own `parent_ids` param includes source post 88 — so this test fails if
+		// MediaSyncStage doesn't actually forward PostSyncStage::get_synced_post_ids() into
+		// its SourceClient::get() call, not just if IdMap resolution is broken.
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) use ( $attachment ) {
+			if ( false === strpos( $url, '/media' ) ) {
+				return $preempt;
+			}
+			$query = wp_parse_url( $url, PHP_URL_QUERY );
+			parse_str( $query ?: '', $params );
+			$parent_ids = array_map( 'strval', (array) ( $params['parent_ids'] ?? [] ) );
+			$items      = in_array( '88', $parent_ids, true ) ? [ $attachment ] : [];
+			return [
+				'response' => [ 'code' => 200, 'message' => 'OK' ],
+				'body'     => wp_json_encode( $items ),
+				'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+				'cookies'  => [],
+				'filename' => null,
+			];
+		}, 10, 3 );
+
+		// Reuses this file's own successful-download mock (needle matches nothing in this
+		// attachment's file_url, so the download/sideload succeeds) — same technique
+		// test_cursor_advances_normally_when_every_item_in_the_batch_succeeds() already uses.
+		$this->mock_media_download_partial_failure( 'no-such-file-fails' );
+
+		SyncDispatcher::run_sync_pass( $this->jid );
+
+		$dest_post_id = IdMap::get( $this->jid, 'post', 88 );
+		$this->assertNotNull( $dest_post_id, 'Post must have synced this pass.' );
+
+		$dest_att_id = IdMap::get( $this->jid, 'attachment', 200 );
+		$this->assertNotNull(
+			$dest_att_id,
+			'The attachment must have been picked up via the parent_ids handoff — the mocked source only returns it when parent_ids includes the just-synced post, proving PostSyncStage ran before MediaSyncStage within the real dispatched pass.'
+		);
+		$this->assertSame(
+			$dest_post_id,
+			(int) get_post( $dest_att_id )->post_parent,
+			'The attachment must be parented to the correct destination post, resolved via the IdMap mapping PostSyncStage wrote earlier in the same pass.'
+		);
 	}
 
 	// -------------------------------------------------------------------------
