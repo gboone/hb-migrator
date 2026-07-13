@@ -323,6 +323,90 @@ class Test_MigrationRegistry_Sync extends WP_UnitTestCase {
 	}
 
 	// -----------------------------------------------------------------------
+	// cancel_migration() — as_unschedule_all_actions() must actually unschedule by group
+	// (code review fix): the original call passed the group name as the $hook parameter
+	// (as_unschedule_all_actions( 'hb-migrator' )), which matches as_unschedule_all_actions(
+	// $hook, $args = [], $group = '' )'s FIRST parameter, not the group. Since no scheduled
+	// action actually has a hook literally named "hb-migrator", that call always silently
+	// unscheduled nothing. The fix passes '' for $hook and 'hb-migrator' for $group, which
+	// routes into ActionScheduler_Store::cancel_actions_by_group() — see
+	// lib/action-scheduler/functions.php.
+	// -----------------------------------------------------------------------
+
+	public function test_cancel_migration_unschedules_pending_group_actions(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+
+		as_enqueue_async_action( 'hbm_import_posts', [ 'site_job_id' => 1, 'last_id' => 0, 'attempt' => 0 ], 'hb-migrator' );
+		as_enqueue_async_action( 'hbm_import_media', [ 'site_job_id' => 1, 'offset' => 0, 'attempt' => 0 ], 'hb-migrator' );
+
+		$before = as_get_scheduled_actions( [
+			'group'    => 'hb-migrator',
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 50,
+		] );
+		$this->assertNotEmpty( $before, 'Precondition: pending actions exist in the hb-migrator group.' );
+
+		$this->assertTrue( MigrationRegistry::cancel_migration( $mid ) );
+
+		$after = as_get_scheduled_actions( [
+			'group'    => 'hb-migrator',
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 50,
+		] );
+		$this->assertEmpty( $after, 'cancel_migration() must unschedule every pending action in the hb-migrator group — this is the bug: the old call site never actually did.' );
+	}
+
+	public function test_cancel_migration_no_op_does_not_touch_unrelated_pending_actions(): void {
+		// Migration already 'complete' — cancel_migration()'s UPDATE affects 0 rows (rows_affected
+		// = 0), so $cancelled is false and the as_unschedule_all_actions() call must never run at
+		// all. Regression guard: fixing the parameter order must not turn this into an
+		// unconditional group-wide unschedule regardless of whether cancellation actually happened.
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'complete' );
+
+		as_enqueue_async_action( 'hbm_import_posts', [ 'site_job_id' => 1, 'last_id' => 0, 'attempt' => 0 ], 'hb-migrator' );
+
+		$this->assertFalse( MigrationRegistry::cancel_migration( $mid ) );
+
+		$after = as_get_scheduled_actions( [
+			'group'    => 'hb-migrator',
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 50,
+		] );
+		$this->assertNotEmpty( $after, 'A no-op cancel (migration already complete) must not unschedule unrelated pending actions.' );
+	}
+
+	// -----------------------------------------------------------------------
+	// get_syncing_site_jobs_for_migration()
+	// -----------------------------------------------------------------------
+
+	public function test_get_syncing_site_jobs_for_migration_returns_only_syncing_jobs_for_that_migration(): void {
+		$mid1 = MigrationRegistry::create_migration( 'https://source-a.example.com', 'key', null );
+		$jid1 = MigrationRegistry::create_site_job( $mid1, 1, 'a.example.com', 'https://a.example.com', '', '/a/' );
+		$jid2 = MigrationRegistry::create_site_job( $mid1, 2, 'b.example.com', 'https://b.example.com', '', '/b/' );
+		MigrationRegistry::update_site_job( $jid1, [ 'status' => 'syncing' ] );
+		MigrationRegistry::update_site_job( $jid2, [ 'status' => 'complete' ] );
+
+		// A second migration's syncing job must never leak into the first migration's results.
+		$mid2 = MigrationRegistry::create_migration( 'https://source-b.example.com', 'key', null );
+		$jid3 = MigrationRegistry::create_site_job( $mid2, 3, 'c.example.com', 'https://c.example.com', '', '/c/' );
+		MigrationRegistry::update_site_job( $jid3, [ 'status' => 'syncing' ] );
+
+		$ids = array_map( fn( $job ) => (int) $job->id, MigrationRegistry::get_syncing_site_jobs_for_migration( $mid1 ) );
+
+		$this->assertSame( [ $jid1 ], $ids );
+	}
+
+	public function test_get_syncing_site_jobs_for_migration_returns_empty_array_when_none_syncing(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'a.example.com', 'https://a.example.com', '', '/a/' );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete' ] );
+
+		$this->assertSame( [], MigrationRegistry::get_syncing_site_jobs_for_migration( $mid ) );
+	}
+
+	// -----------------------------------------------------------------------
 	// get_syncable_site_jobs()
 	// -----------------------------------------------------------------------
 

@@ -79,7 +79,15 @@ class MigrationRegistry {
 			// Stop any pending AS actions so importers that haven't fired yet are also halted.
 			// In-flight actions that are already executing will exit via the status guard at the
 			// top of each importer's process() method.
-			as_unschedule_all_actions( 'hb-migrator' );
+			//
+			// as_unschedule_all_actions( $hook, $args = [], $group = '' ) — the group name must
+			// go in the THIRD parameter, not the first (that's $hook). Passing it as $hook alone
+			// (the original bug here) matches no scheduled action's hook, so this call silently
+			// unscheduled nothing. With $hook = '' and $args = [], the group-only branch inside
+			// as_unschedule_all_actions() calls ActionScheduler_Store::cancel_actions_by_group(),
+			// which is what actually bulk-cancels every pending action tagged with this group,
+			// regardless of hook — see lib/action-scheduler/functions.php.
+			as_unschedule_all_actions( '', [], 'hb-migrator' );
 		}
 		return $cancelled;
 	}
@@ -269,6 +277,24 @@ class MigrationRegistry {
 		$table = $wpdb->base_prefix . 'hbm_site_jobs';
 		return $wpdb->get_results( // phpcs:ignore WordPress.DB.PreparedSQL.NotPrepared -- no user input, table name is hardcoded
 			"SELECT * FROM `{$table}` WHERE status IN ('complete', 'syncing') ORDER BY id DESC"
+		) ?: [];
+	}
+
+	/**
+	 * Site jobs belonging to a single migration that are currently 'syncing'. Used by
+	 * Admin\AdminPage::handle_clear_migration() to stop every still-syncing site job for a
+	 * migration in one action (the Clear button) instead of requiring an operator to visit
+	 * the Post-Migration Sync table and click "Finalize & Stop Sync" on each row individually.
+	 * cancel_migration() alone cannot cover this case: it is a no-op once the migration is
+	 * already 'complete' — which is exactly the state every migration with a 'syncing' site
+	 * job is already in, since "Enable Sync" itself requires the job (and therefore the
+	 * migration) to have already reached 'complete'. See cancel_migration()'s SQL guard.
+	 */
+	public static function get_syncing_site_jobs_for_migration( int $migration_id ): array {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_site_jobs';
+		return $wpdb->get_results(
+			$wpdb->prepare( "SELECT * FROM `$table` WHERE migration_id = %d AND status = 'syncing' ORDER BY id", $migration_id )
 		) ?: [];
 	}
 

@@ -543,6 +543,10 @@ class AdminPage {
 		if ( $active ) {
 			self::save_history_entry( self::fetch_migration_status( $active ), $active );
 
+			if ( ! empty( $active['migration_id'] ) ) {
+				self::stop_syncing_jobs_for_migration( (int) $active['migration_id'] );
+			}
+
 			// Cancel on destination so the old migration record is not restarted if the
 			// user starts a fresh migration for the same source. Best-effort — don't block
 			// the clear if the destination is temporarily unreachable.
@@ -569,6 +573,27 @@ class AdminPage {
 		delete_site_option( 'hbm_active_migration' );
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator' ) );
 		exit;
+	}
+
+	/**
+	 * Stops all post-migration sync activity for a migration in a single action — invoked from
+	 * handle_clear_migration() so clicking Clear stops every still-syncing site job belonging to
+	 * that migration, without requiring the operator to click "Finalize & Stop Sync" on each
+	 * syncing row individually first (see MigrationRegistry::get_syncing_site_jobs_for_migration()
+	 * for why cancel_migration() alone cannot reach this case). Reuses the exact pair of calls
+	 * handle_finalize_sync() already makes for a single site job — MigrationRegistry::
+	 * finalize_site_job_sync() (status transition + deferred credential/IdMap cleanup) and
+	 * SyncScheduler::unschedule() (stops the recurring hbm_sync_pass action) — rather than
+	 * duplicating either. Best-effort per job: a finalize that's rejected (e.g. a fresh
+	 * sync_locked_at from an in-flight pass) is simply skipped rather than blocking the clear;
+	 * it can be retried later from the Post-Migration Sync table.
+	 */
+	private static function stop_syncing_jobs_for_migration( int $migration_id ): void {
+		foreach ( MigrationRegistry::get_syncing_site_jobs_for_migration( $migration_id ) as $job ) {
+			if ( MigrationRegistry::finalize_site_job_sync( (int) $job->id ) ) {
+				SyncScheduler::unschedule( (int) $job->id );
+			}
+		}
 	}
 
 	/**

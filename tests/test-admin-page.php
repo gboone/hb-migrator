@@ -5,6 +5,8 @@
 
 use HBMigrator\Admin\AdminPage;
 use HBMigrator\Destination\SearchReplace;
+use HBMigrator\Destination\SyncDispatcher;
+use HBMigrator\Destination\SyncScheduler;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\QueueTable;
 
@@ -43,6 +45,56 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		MigrationRegistry::update_migration_status( $mid, 'running' );
 		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete', 'dest_blog_id' => $dest_blog_id ] );
 		return [ $mid, $jid ];
+	}
+
+	/**
+	 * Finds the pending hbm_sync_pass action (recurring or one-shot) scheduled for a given
+	 * site_job_id, or null if none exists. Mirrors tests/test-sync-scheduler.php's helper.
+	 */
+	private function find_pending_sync_action( int $site_job_id ): ?\ActionScheduler_Action {
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => SyncDispatcher::ACTION_HOOK,
+			'group'    => 'hb-migrator',
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 50,
+		] );
+
+		foreach ( $scheduled as $action ) {
+			$args = $action->get_args();
+			if ( isset( $args['site_job_id'] ) && (int) $args['site_job_id'] === $site_job_id ) {
+				return $action;
+			}
+		}
+		return null;
+	}
+
+	/**
+	 * Mocks the two outbound HTTP calls handle_clear_migration() makes to the destination
+	 * (status fetch for the history entry, then cancel) so tests can exercise the local
+	 * stop-syncing-jobs logic without a real destination.
+	 */
+	private function mock_clear_migration_destination_calls(): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/destination/status/' ) ) {
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => wp_json_encode( [ 'status' => 'complete', 'sites' => [] ] ),
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			if ( false !== strpos( $url, '/cancel' ) ) {
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => wp_json_encode( [ 'status' => 'cancelled' ] ),
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
 	}
 
 	// -------------------------------------------------------------------------
@@ -277,6 +329,148 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		$this->assertNotEmpty( $history );
 		$this->assertSame( 66, (int) $history[0]['migration_id'] );
 		$this->assertSame( 'unknown', $history[0]['status'], 'Status must be "unknown" when destination is unreachable.' );
+
+		$this->assertFalse( get_site_option( 'hbm_active_migration' ) );
+	}
+
+	// -------------------------------------------------------------------------
+	// handle_clear_migration() — stops sync for every syncing site job (code review fix)
+	//
+	// cancel_migration() alone cannot reach this: a migration with any 'syncing' site job is
+	// always already 'complete' (Enable Sync requires it), and cancel_migration()'s UPDATE only
+	// affects migrations NOT IN ('complete', 'cancelled') — see MigrationRegistry::
+	// get_syncing_site_jobs_for_migration()'s docblock. So Clear must separately find and stop
+	// every syncing site job belonging to the migration being cleared.
+	// -------------------------------------------------------------------------
+
+	public function test_handle_clear_migration_finalizes_and_unschedules_syncing_site_jobs(): void {
+		[ $mid, $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+		SyncScheduler::schedule( $jid );
+
+		$this->assertSame( 'syncing', MigrationRegistry::get_site_job( $jid )->status, 'Precondition: site job is syncing.' );
+		$this->assertNotNull( $this->find_pending_sync_action( $jid ), 'Precondition: recurring sync action exists before clearing.' );
+
+		update_site_option( 'hbm_active_migration', [
+			'migration_id' => $mid,
+			'dest_url'     => 'https://93.184.216.34',
+			'dest_key'     => 'key',
+			'status_token' => 'tok',
+			'started_at'   => time(),
+		] );
+
+		$this->mock_clear_migration_destination_calls();
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+
+		try {
+			AdminPage::handle_clear_migration();
+		} catch ( \Throwable $e ) {
+			// wp_safe_redirect() ends in exit() — expected in test context.
+		}
+
+		$_POST = [];
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 'finalized', $job->status, 'Clearing the migration must finalize its syncing site job.' );
+		$this->assertNotNull( $job->sync_finalized_at );
+
+		$this->assertNull( $this->find_pending_sync_action( $jid ), 'Clearing the migration must unschedule the recurring hbm_sync_pass action.' );
+
+		$this->assertFalse( get_site_option( 'hbm_active_migration' ) );
+	}
+
+	public function test_handle_clear_migration_finalizes_every_syncing_job_but_not_other_migrations(): void {
+		[ $mid, $jid1 ] = $this->make_complete_site_job( get_current_blog_id() );
+		$jid2 = MigrationRegistry::create_site_job( $mid, 2, 'sync2.example.com', 'https://sync2.example.com', '', '/sync2/' );
+		MigrationRegistry::update_site_job( $jid2, [ 'status' => 'complete', 'dest_blog_id' => get_current_blog_id() ] );
+
+		MigrationRegistry::enable_site_job_sync( $jid1 );
+		MigrationRegistry::enable_site_job_sync( $jid2 );
+		SyncScheduler::schedule( $jid1 );
+		SyncScheduler::schedule( $jid2 );
+
+		// A syncing job on a DIFFERENT migration must be left completely untouched.
+		[ , $other_jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $other_jid );
+		SyncScheduler::schedule( $other_jid );
+
+		update_site_option( 'hbm_active_migration', [
+			'migration_id' => $mid,
+			'dest_url'     => 'https://93.184.216.34',
+			'dest_key'     => 'key',
+			'status_token' => 'tok',
+			'started_at'   => time(),
+		] );
+
+		$this->mock_clear_migration_destination_calls();
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+
+		try {
+			AdminPage::handle_clear_migration();
+		} catch ( \Throwable $e ) {}
+
+		$_POST = [];
+
+		$this->assertSame( 'finalized', MigrationRegistry::get_site_job( $jid1 )->status );
+		$this->assertSame( 'finalized', MigrationRegistry::get_site_job( $jid2 )->status );
+		$this->assertNull( $this->find_pending_sync_action( $jid1 ) );
+		$this->assertNull( $this->find_pending_sync_action( $jid2 ) );
+
+		$this->assertSame( 'syncing', MigrationRegistry::get_site_job( $other_jid )->status, "Another migration's syncing job must be untouched by clearing this one." );
+		$this->assertNotNull( $this->find_pending_sync_action( $other_jid ), "Another migration's recurring sync action must survive." );
+	}
+
+	public function test_handle_clear_migration_with_no_syncing_jobs_regresses_to_original_behavior(): void {
+		// Regression guard: a migration whose site job never enabled sync must clear exactly as
+		// it did before this fix — no status change on the job, history saved, active option
+		// deleted.
+		[ $mid, $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+
+		update_site_option( 'hbm_active_migration', [
+			'migration_id' => $mid,
+			'dest_url'     => 'https://93.184.216.34',
+			'dest_key'     => 'key',
+			'status_token' => 'tok',
+			'started_at'   => time(),
+		] );
+
+		$this->mock_clear_migration_destination_calls();
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+
+		try {
+			AdminPage::handle_clear_migration();
+		} catch ( \Throwable $e ) {}
+
+		$_POST = [];
+
+		$this->assertSame( 'complete', MigrationRegistry::get_site_job( $jid )->status, 'A site job that never enabled sync must be untouched by Clear.' );
+		$this->assertFalse( get_site_option( 'hbm_active_migration' ) );
+
+		$history = (array) get_site_option( 'hbm_migration_history', [] );
+		$this->assertNotEmpty( $history, 'History must still be saved when there are no syncing jobs.' );
+		$this->assertSame( $mid, (int) $history[0]['migration_id'] );
+	}
+
+	public function test_handle_clear_migration_with_no_active_migration_id_does_not_error(): void {
+		// No migration_id at all in hbm_active_migration — stop_syncing_jobs_for_migration()
+		// must not be reached/must not error when there is nothing to look up.
+		update_site_option( 'hbm_active_migration', [
+			'dest_url'     => '',
+			'dest_key'     => '',
+			'status_token' => '',
+			'started_at'   => time(),
+		] );
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+
+		try {
+			AdminPage::handle_clear_migration();
+		} catch ( \Throwable $e ) {}
+
+		$_POST = [];
 
 		$this->assertFalse( get_site_option( 'hbm_active_migration' ) );
 	}
