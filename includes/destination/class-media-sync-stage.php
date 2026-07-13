@@ -112,19 +112,40 @@ class MediaSyncStage implements SyncStageInterface {
 			return false;
 		}
 
-		// Import first; only advance the cursor if the batch is fully processed without
-		// throwing (an exception here propagates straight out to SyncDispatcher's catch
-		// block, so the cursor-advance line below is simply never reached — cursor only
-		// advances on success, mirroring PostSyncStage/R11's contract). A per-item download
-		// or sideload failure inside import_batch() is not itself an exception — such items
-		// are simply skipped for this pass (see MediaImporter::import_batch()'s $failed_items
-		// return value); they are naturally retried on a later pass if the attachment or its
-		// parent post changes again, matching the accepted-gap shape of other best-effort
-		// sync paths in this plan (e.g. comment edits, U8's webhook trigger).
-		MediaImporter::import_batch( $site_job_id, $media );
+		// Import first; only advance the cursor for the prefix of this batch that was
+		// actually imported successfully. An exception here propagates straight out to
+		// SyncDispatcher's catch block, so the cursor-advance loop below is never reached on
+		// a hard failure — cursor only advances on success, mirroring PostSyncStage/R11's
+		// contract. A per-item download/sideload/insert failure inside import_batch() is not
+		// itself an exception — such items are reported back via $failed_items (source
+		// attachment ID => reason) instead of throwing. Note this is distinct from a
+		// *permanent* skip (no file_url, SSRF-guarded host, cross-run dedup match,
+		// skip_duplicates match) — those are intentionally never retried and are correctly
+		// absent from $failed_items, so they don't block the cursor here.
+		$failed_items  = MediaImporter::import_batch( $site_job_id, $media );
+		$failed_id_set = array_flip( array_keys( $failed_items ) );
 
+		// The cursor cannot simply become "max post_modified fetched in this batch": an item
+		// that failed to download/sideload/insert was skipped by MediaImporter, not written —
+		// advancing the cursor past its position would exclude it from every future
+		// `modified_since` fetch and drop it permanently, contradicting R5/R11's "skipped
+		// this pass, retried on the next one, not dropped" — exactly the bug
+		// CommentSyncStage already avoids for its own kind of per-item skip (see that
+		// class's docblock). Media items are not guaranteed to arrive in modified-time
+		// order, so walking the batch in fetch order and stopping the cursor's forward
+		// extension at the first failed item (even if later items in the batch succeeded)
+		// gives a safe high-water mark: everything before the failure is durably synced,
+		// and it plus everything from that point in this batch is re-fetched and
+		// re-attempted next pass. Re-fetching an already-succeeded item ahead of a failed one
+		// is safe — MediaImporter's IdMap-keyed already-imported check makes that a no-op.
 		$max_modified = $prior_cursor;
+		$had_failure  = false;
 		foreach ( $media as $m ) {
+			$source_att_id = (int) ( $m['source_attachment_id'] ?? 0 );
+			if ( isset( $failed_id_set[ $source_att_id ] ) ) {
+				$had_failure = true;
+				break;
+			}
 			$modified = $m['post_modified'] ?? null;
 			if ( $modified && ( null === $max_modified || $modified > $max_modified ) ) {
 				$max_modified = $modified;
@@ -137,7 +158,16 @@ class MediaSyncStage implements SyncStageInterface {
 
 		// A full batch means more matching media likely remain beyond this row budget —
 		// mirrors MediaImporter::process()'s own `count( $media ) >= 50` continuation check.
-		return count( $media ) >= self::BATCH_SIZE;
+		// A failure also means more work remains this pass (the failed item and everything
+		// after it in fetch order still needs to be retried), the same "keep retrying via
+		// self-requeue rather than silently treating a failure-laden batch as caught up"
+		// reasoning as PostSyncStage. Known, accepted trade-off (matching this plan's
+		// existing CommentSyncStage blocked-parent gap): an attachment that fails every
+		// single download/sideload attempt (a permanent problem, not a transient one) will
+		// cause this stage to self-requeue indefinitely rather than skip past it — solving
+		// that poison-item case is out of scope here; this fix only targets the silent-skip
+		// data-loss bug for transient failures.
+		return $had_failure || count( $media ) >= self::BATCH_SIZE;
 	}
 
 	/**

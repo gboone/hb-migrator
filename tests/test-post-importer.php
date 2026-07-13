@@ -261,4 +261,50 @@ class Test_PostImporter extends WP_UnitTestCase {
 		$this->assertNotNull( $post, 'A post absent from a later batch must not be deleted on destination.' );
 		$this->assertSame( 'Post A', $post->post_title, 'A post absent from a later batch must be left completely untouched.' );
 	}
+
+	// -------------------------------------------------------------------------
+	// import_batch() return-shape contract (code review P0/P1 fix): callers such as
+	// PostSyncStage need per-item failure visibility, not just the highest source ID
+	// processed, so a failed item's position never gets silently skipped by a delta-sync
+	// cursor. import_batch() now returns ['max_id' => int, 'failed_ids' => int[]] instead
+	// of a bare int.
+	// -------------------------------------------------------------------------
+
+	public function test_import_batch_returns_max_id_and_empty_failed_ids_on_full_success(): void {
+		$posts = [
+			$this->make_source_post( [ 'ID' => 20 ] ),
+			$this->make_source_post( [ 'ID' => 21 ] ),
+		];
+
+		$result = PostImporter::import_batch( $this->jid, $posts );
+
+		$this->assertIsArray( $result );
+		$this->assertArrayHasKey( 'max_id', $result );
+		$this->assertArrayHasKey( 'failed_ids', $result );
+		$this->assertSame( 21, $result['max_id'] );
+		$this->assertSame( [], $result['failed_ids'] );
+	}
+
+	public function test_import_batch_reports_failed_ids_for_a_wp_insert_post_failure(): void {
+		// wp_insert_post() is called by PostImporter with $wp_error = false, so a rejected
+		// insert (e.g. WordPress's own "empty content" guard) surfaces as a falsy return (0),
+		// not a WP_Error — import_batch() must still record it as a failure.
+		add_filter( 'wp_insert_post_empty_content', function ( $maybe_empty, $postarr ) {
+			if ( 'FAIL_ME' === ( $postarr['post_title'] ?? '' ) ) {
+				return true;
+			}
+			return $maybe_empty;
+		}, 10, 2 );
+
+		$failing    = $this->make_source_post( [ 'ID' => 30, 'post_title' => 'FAIL_ME' ] );
+		$succeeding = $this->make_source_post( [ 'ID' => 31, 'post_title' => 'This One Is Fine' ] );
+
+		$result = PostImporter::import_batch( $this->jid, [ $failing, $succeeding ] );
+
+		$this->assertSame( [ 30 ], $result['failed_ids'], 'The failed insert must be reported by source ID.' );
+		$this->assertNull( \HBMigrator\IdMap::get( $this->jid, 'post', 30 ), 'A failed insert must not be mapped.' );
+		$this->assertNotNull( \HBMigrator\IdMap::get( $this->jid, 'post', 31 ), 'The other post in the same batch must still import.' );
+
+		remove_all_filters( 'wp_insert_post_empty_content' );
+	}
 }

@@ -105,14 +105,34 @@ class PostSyncStage implements SyncStageInterface {
 			return false;
 		}
 
-		// Import first; only advance the cursor if the batch is fully processed without
-		// throwing (an exception here propagates straight out to SyncDispatcher's catch
-		// block, so the cursor-advance line below is simply never reached — cursor only
-		// advances on success, per plan R11/U3 test scenarios).
-		PostImporter::import_batch( $site_job_id, $posts );
+		// Import first; only advance the cursor for the prefix of this batch that was
+		// actually imported successfully. An exception here propagates straight out to
+		// SyncDispatcher's catch block, so the cursor-advance loop below is never reached on
+		// a hard failure — cursor only advances on success, per plan R11/U3 test scenarios.
+		$result        = PostImporter::import_batch( $site_job_id, $posts );
+		$failed_id_set = array_flip( $result['failed_ids'] );
 
+		// The cursor cannot simply become "max post_modified fetched in this batch": a post
+		// that failed wp_insert_post()/wp_update_post() (e.g. a transient DB error) was
+		// skipped by PostImporter, not written — advancing the cursor past its position would
+		// exclude it from every future `modified_since` fetch and drop it permanently,
+		// contradicting R11's "skipped this pass, retried on the next one, not dropped" —
+		// exactly the bug CommentSyncStage already avoids for its own kind of per-item skip
+		// (see that class's docblock). Posts are not guaranteed to arrive in modified-time
+		// order, so walking the batch in fetch order and stopping the cursor's forward
+		// extension at the first failed item (even if later items in the batch succeeded)
+		// gives a safe high-water mark: everything before the failure is durably synced,
+		// and it plus everything from that point in this batch is re-fetched and
+		// re-attempted next pass. Re-fetching an already-succeeded post ahead of a failed one
+		// is safe — PostImporter's IdMap-keyed existing-row check makes that a no-op update.
 		$max_modified = $prior_cursor;
+		$had_failure  = false;
 		foreach ( $posts as $p ) {
+			$source_id = (int) ( $p['ID'] ?? 0 );
+			if ( isset( $failed_id_set[ $source_id ] ) ) {
+				$had_failure = true;
+				break;
+			}
 			$modified = $p['post_modified'] ?? null;
 			if ( $modified && ( null === $max_modified || $modified > $max_modified ) ) {
 				$max_modified = $modified;
@@ -125,7 +145,17 @@ class PostSyncStage implements SyncStageInterface {
 
 		// A full batch means more matching posts likely remain beyond this row budget —
 		// mirrors PostImporter::process()'s own `count( $posts ) >= 100` continuation check.
-		return count( $posts ) >= self::BATCH_SIZE;
+		// A failure also means more work remains this pass (the failed item and everything
+		// after it in fetch order still needs to be retried) — without this, a batch that
+		// hit a transient failure but didn't fill the row budget would be wrongly treated as
+		// "caught up" and only retried on the next scheduled cron/webhook pass instead of
+		// immediately. Known, accepted trade-off (matching this plan's existing
+		// CommentSyncStage blocked-parent gap): a source post that fails every single import
+		// attempt (a permanent data problem, not a transient one) will cause this stage to
+		// self-requeue indefinitely rather than skip past it — solving that poison-item case
+		// is out of scope here; this fix only targets the silent-skip data-loss bug for
+		// transient failures.
+		return $had_failure || count( $posts ) >= self::BATCH_SIZE;
 	}
 
 	/**

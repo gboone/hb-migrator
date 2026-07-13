@@ -185,6 +185,80 @@ class Test_PostSyncStage extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// Cursor-skip regression coverage (code review P0/P1): a per-item import failure must
+	// never let the cursor advance past it, even when a later item in the same fetch batch
+	// succeeds. Uses the `wp_insert_post_empty_content` filter to force wp_insert_post() to
+	// fail for one specific post (returns 0 since PostImporter calls it with $wp_error =
+	// false), the same mechanism PostImporter::import_batch() already treats as a per-item
+	// failure via its `is_wp_error( $dest_id ) || ! $dest_id` check.
+	// -------------------------------------------------------------------------
+
+	private function force_insert_failure_for_title( string $title ): void {
+		add_filter( 'wp_insert_post_empty_content', function ( $maybe_empty, $postarr ) use ( $title ) {
+			if ( $title === ( $postarr['post_title'] ?? '' ) ) {
+				return true;
+			}
+			return $maybe_empty;
+		}, 10, 2 );
+	}
+
+	public function test_cursor_does_not_advance_past_earlier_failed_item_when_later_item_succeeds(): void {
+		$failing = $this->make_source_post( [
+			'ID'            => 1,
+			'post_title'    => 'FAIL_ME',
+			'post_modified' => '2026-01-01 09:00:00',
+		] );
+		$succeeding = $this->make_source_post( [
+			'ID'            => 2,
+			'post_title'    => 'Succeeds Fine',
+			'post_modified' => '2026-01-02 10:00:00',
+		] );
+		$this->mock_posts_response( [ $failing, $succeeding ] );
+		$this->force_insert_failure_for_title( 'FAIL_ME' );
+
+		$stage  = new PostSyncStage();
+		$result = $stage->process( $this->jid );
+
+		$this->assertTrue(
+			$result,
+			'A pass with a transient per-item failure must signal more work remains (retry), not "caught up".'
+		);
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertNull(
+			$job->sync_cursor_posts,
+			'Cursor must not advance past the earlier failed item even though the later item in the same batch succeeded — advancing here would permanently skip retrying post ID 1.'
+		);
+
+		$this->assertNull( IdMap::get( $this->jid, 'post', 1 ), 'The failed post must not be mapped.' );
+		$this->assertNotNull( IdMap::get( $this->jid, 'post', 2 ), 'The later, non-failing post must still have been imported.' );
+
+		remove_all_filters( 'wp_insert_post_empty_content' );
+	}
+
+	public function test_cursor_advances_normally_when_every_item_in_the_batch_succeeds(): void {
+		// No-regression check: with no failures, cursor behavior is unchanged from before
+		// this fix — it advances to the max post_modified seen, and process() reports no
+		// more work for an under-budget batch.
+		$posts = [
+			$this->make_source_post( [ 'ID' => 3, 'post_modified' => '2026-02-01 08:00:00' ] ),
+			$this->make_source_post( [ 'ID' => 4, 'post_modified' => '2026-02-02 09:30:00' ] ),
+		];
+		$this->mock_posts_response( $posts );
+
+		$stage  = new PostSyncStage();
+		$result = $stage->process( $this->jid );
+
+		$this->assertFalse( $result, 'An under-budget batch with no failures means already caught up.' );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( '2026-02-02 09:30:00', $job->sync_cursor_posts );
+
+		$this->assertNotNull( IdMap::get( $this->jid, 'post', 3 ) );
+		$this->assertNotNull( IdMap::get( $this->jid, 'post', 4 ) );
+	}
+
+	// -------------------------------------------------------------------------
 	// Integration: the post is actually imported via the normal Reader/Importer/IdMap path.
 	// -------------------------------------------------------------------------
 

@@ -217,6 +217,113 @@ class Test_MediaSyncStage extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// Cursor-skip regression coverage (code review P0/P1): a per-item import failure
+	// (download/sideload) must never let the cursor advance past it, even when a later item
+	// in the same fetch batch succeeds. Mirrors test-media-importer.php's
+	// mock_download_failure()/mock_successful_png_download() conventions, combined into one
+	// filter keyed by filename so one item in the batch fails and the other succeeds.
+	// -------------------------------------------------------------------------
+
+	private function mock_media_download_partial_failure( string $fail_url_needle ): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) use ( $fail_url_needle ) {
+			if ( false === strpos( $url, '/wp-content/uploads/' ) ) {
+				return $preempt;
+			}
+			if ( false !== strpos( $url, $fail_url_needle ) ) {
+				// download_url() calls wp_remote_get() on the file URL — make it fail.
+				return new \WP_Error( 'http_request_failed', 'Connection timed out.' );
+			}
+			// Minimal 1x1 transparent PNG (67 bytes), written to the temp file WordPress
+			// pre-creates, so wp_handle_sideload()/wp_insert_attachment() succeed normally.
+			if ( ! empty( $args['filename'] ) ) {
+				file_put_contents( $args['filename'], base64_decode(
+					'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg=='
+				) );
+			}
+			return [
+				'response' => [ 'code' => 200, 'message' => 'OK' ],
+				'body'     => '',
+				'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+				'cookies'  => [],
+				'filename' => $args['filename'] ?? null,
+			];
+		}, 20, 3 ); // priority 20 so it runs after mock_media_response() (priority 10).
+	}
+
+	public function test_cursor_does_not_advance_past_earlier_failed_item_when_later_item_succeeds(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$failing = $this->make_source_media( [
+			'source_attachment_id' => 1,
+			'post_name'            => 'fail-item',
+			'file_url'             => 'https://93.184.216.34/wp-content/uploads/fail-download.jpg',
+			'post_modified'        => '2026-01-01 09:00:00',
+		] );
+		$succeeding = $this->make_source_media( [
+			'source_attachment_id' => 2,
+			'post_name'            => 'succeed-item',
+			'file_url'             => 'https://93.184.216.34/wp-content/uploads/succeeds.png',
+			'post_modified'        => '2026-01-02 10:00:00',
+		] );
+		$this->mock_media_response( [ $failing, $succeeding ] );
+		$this->mock_media_download_partial_failure( 'fail-download.jpg' );
+
+		$stage  = new MediaSyncStage();
+		$result = $stage->process( $this->jid );
+
+		$this->assertTrue(
+			$result,
+			'A pass with a transient download failure must signal more work remains (retry), not "caught up".'
+		);
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertNull(
+			$job->sync_cursor_media,
+			'Cursor must not advance past the earlier failed item even though the later item in the same batch succeeded — advancing here would permanently skip retrying attachment ID 1.'
+		);
+
+		$this->assertNull( IdMap::get( $this->jid, 'attachment', 1 ), 'The failed download must not be mapped.' );
+		$this->assertNotNull( IdMap::get( $this->jid, 'attachment', 2 ), 'The later, non-failing attachment must still have been imported.' );
+	}
+
+	public function test_cursor_advances_normally_when_every_item_in_the_batch_succeeds(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		// No-regression check: with no failures, cursor behavior is unchanged from before
+		// this fix — it advances to the max post_modified seen, and process() reports no
+		// more work for an under-budget batch.
+		$item_a = $this->make_source_media( [
+			'source_attachment_id' => 3,
+			'post_name'            => 'ok-item-a',
+			'file_url'             => 'https://93.184.216.34/wp-content/uploads/ok-a.png',
+			'post_modified'        => '2026-02-01 08:00:00',
+		] );
+		$item_b = $this->make_source_media( [
+			'source_attachment_id' => 4,
+			'post_name'            => 'ok-item-b',
+			'file_url'             => 'https://93.184.216.34/wp-content/uploads/ok-b.png',
+			'post_modified'        => '2026-02-02 09:30:00',
+		] );
+		$this->mock_media_response( [ $item_a, $item_b ] );
+		$this->mock_media_download_partial_failure( 'no-such-file-fails' ); // nothing matches — both succeed.
+
+		$stage  = new MediaSyncStage();
+		$result = $stage->process( $this->jid );
+
+		$this->assertFalse( $result, 'An under-budget batch with no failures means already caught up.' );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( '2026-02-02 09:30:00', $job->sync_cursor_media );
+
+		$this->assertNotNull( IdMap::get( $this->jid, 'attachment', 3 ) );
+		$this->assertNotNull( IdMap::get( $this->jid, 'attachment', 4 ) );
+	}
+
+	// -------------------------------------------------------------------------
 	// Integration: a new attachment is actually imported via the normal Reader/Importer/
 	// IdMap path (reusing MediaImporter::import_batch(), including conflict-policy logic).
 	// -------------------------------------------------------------------------

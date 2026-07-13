@@ -33,8 +33,8 @@ class PostImporter {
 				[ 'per_page' => 100, 'last_id' => $last_id ]
 			);
 
-			$max_source_id = self::import_batch( $site_job_id, $posts );
-			$max_id         = max( $last_id, $max_source_id );
+			$result = self::import_batch( $site_job_id, $posts );
+			$max_id = max( $last_id, $result['max_id'] );
 
 			MigrationRegistry::update_site_job( $site_job_id, [ 'stage_offset' => $max_id ] );
 
@@ -75,20 +75,26 @@ class PostImporter {
 	 * mid-batch exception can never leave the destination blog switched or kses filters
 	 * removed — callers no longer need to replicate that cleanup themselves.
 	 *
-	 * @return int The highest source post ID processed in this batch (0 if none), for
-	 *              callers (process()) that track an ID-keyset cursor. Sync callers
-	 *              (PostSyncStage) track their own modified-timestamp cursor separately
-	 *              and can ignore this return value.
+	 * @return array{max_id: int, failed_ids: int[]} 'max_id' is the highest source post ID
+	 *              processed in this batch regardless of success (0 if none), for callers
+	 *              (process()) that track an ID-keyset cursor. Sync callers (PostSyncStage)
+	 *              track their own modified-timestamp cursor separately and use 'failed_ids'
+	 *              instead — the source post IDs that hit a wp_insert_post()/wp_update_post()
+	 *              failure and were skipped this pass, so the caller can avoid advancing a
+	 *              cursor past them (a failed item must be retried next pass, not silently
+	 *              skipped forever — see class-comment-sync-stage.php's same-shaped
+	 *              stop-at-first-unresolved-item contract).
 	 */
-	public static function import_batch( int $site_job_id, array $posts ): int {
+	public static function import_batch( int $site_job_id, array $posts ): array {
 		global $wpdb;
 
 		$job = MigrationRegistry::get_site_job( $site_job_id );
 		if ( ! $job || ! $job->dest_blog_id ) {
-			return 0;
+			return [ 'max_id' => 0, 'failed_ids' => [] ];
 		}
 
-		$max_id = 0;
+		$max_id     = 0;
+		$failed_ids = [];
 
 		switch_to_blog( (int) $job->dest_blog_id );
 		wp_suspend_cache_invalidation( true );
@@ -156,7 +162,9 @@ class PostImporter {
 					if ( is_wp_error( $update_result ) || ! $update_result ) {
 						// Leave the existing destination row untouched rather than partially
 						// apply — mirrors the insert branch's "skip this post" behavior on
-						// wp_insert_post() failure.
+						// wp_insert_post() failure. Recorded in $failed_ids so callers (e.g.
+						// PostSyncStage) never advance a cursor past this source ID.
+						$failed_ids[] = $source_id;
 						continue;
 					}
 
@@ -178,6 +186,9 @@ class PostImporter {
 				} else {
 					$dest_id = wp_insert_post( wp_slash( array_merge( $post_data, [ 'import_id' => $source_id ] ) ), false, false );
 					if ( is_wp_error( $dest_id ) || ! $dest_id ) {
+						// Recorded in $failed_ids so callers (e.g. PostSyncStage) never
+						// advance a cursor past this source ID.
+						$failed_ids[] = $source_id;
 						continue;
 					}
 
@@ -219,6 +230,6 @@ class PostImporter {
 			restore_current_blog();
 		}
 
-		return $max_id;
+		return [ 'max_id' => $max_id, 'failed_ids' => $failed_ids ];
 	}
 }
