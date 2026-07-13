@@ -187,19 +187,44 @@ class SearchReplace {
 				return null; // Phase complete.
 			}
 
-			foreach ( $rows as $row ) {
-				$original = $row['val'];
-				$replaced = self::safe_replace( $original, $replacements );
-				if ( $replaced !== $original ) {
-					$wpdb->update( $table, [ $col => $replaced ], [ $pk_col => $row['pk'] ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-				}
-				$last_pk = (int) $row['pk'];
-			}
+			// $rows is non-empty here, so replace_rows() always returns a real pk.
+			$last_pk = self::replace_rows( $table, $col, $pk_col, $rows, $replacements );
 
 			if ( ( microtime( true ) - $started ) > self::TIME_LIMIT ) {
 				return $last_pk; // Budget exceeded — checkpoint here.
 			}
 		}
+	}
+
+	/**
+	 * Single source of truth for the "replace each fetched row's value via safe_replace(), then
+	 * UPDATE only if it actually changed" inner loop shared by replace_in_column() (whole-table
+	 * keyset scan) and replace_in_column_scoped() (specific ID list). Previously duplicated
+	 * verbatim in both methods — a deliberate choice to keep the scoped-mode addition strictly
+	 * additive, later flagged as a duplication-drift risk. This method is now the only place
+	 * that logic lives; both callers pass their own already-fetched $rows.
+	 *
+	 * @param string $table
+	 * @param string $col      Column to update.
+	 * @param string $pk_col   Primary-key column used for the UPDATE ... WHERE clause.
+	 * @param array  $rows     Already-fetched rows, each an ARRAY_A row with 'pk' and 'val' keys.
+	 * @param array  $replacements
+	 * @return int  The pk of the last row processed (0 if $rows is empty).
+	 */
+	private static function replace_rows( string $table, string $col, string $pk_col, array $rows, array $replacements ): int {
+		global $wpdb;
+
+		$last_pk = 0;
+		foreach ( $rows as $row ) {
+			$original = $row['val'];
+			$replaced = self::safe_replace( $original, $replacements );
+			if ( $replaced !== $original ) {
+				$wpdb->update( $table, [ $col => $replaced ], [ $pk_col => $row['pk'] ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			}
+			$last_pk = (int) $row['pk'];
+		}
+
+		return $last_pk;
 	}
 
 	/**
@@ -403,13 +428,7 @@ class SearchReplace {
 			return;
 		}
 
-		foreach ( $rows as $row ) {
-			$original = $row['val'];
-			$replaced = self::safe_replace( $original, $replacements );
-			if ( $replaced !== $original ) {
-				$wpdb->update( $table, [ $col => $replaced ], [ $pk_col => $row['pk'] ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-			}
-		}
+		self::replace_rows( $table, $col, $pk_col, $rows, $replacements );
 	}
 
 	/**
@@ -420,35 +439,19 @@ class SearchReplace {
 	 * replace_in_column_scoped(), unlike remap_postmeta_ids() which switches/restores itself
 	 * since it's called directly from finalize(), outside any existing switch_to_blog bracket).
 	 *
-	 * NOTE (sequencing with docs/plans/2026-07-13-001-fix-post-type-migration-audit-plan.md):
-	 * that plan, not yet implemented as of this unit, also modifies remap_postmeta_ids() (to
-	 * add nav_menu_item remap alongside _thumbnail_id). If/when it lands, its changes to the
-	 * whole-table remap_postmeta_ids() need to be reconciled with this scoped counterpart —
-	 * both should stay in sync on which postmeta keys get remapped.
+	 * The actual UPDATE...JOIN SQL now lives solely in run_thumbnail_remap() — see that
+	 * method's docblock re: the planned nav_menu_item remap addition.
 	 *
 	 * @param int   $site_job_id
 	 * @param int[] $post_ids Destination post IDs to scope the JOIN to.
 	 */
 	private static function remap_postmeta_ids_scoped( int $site_job_id, array $post_ids ): void {
-		global $wpdb;
-
 		if ( empty( $post_ids ) ) {
 			return;
 		}
 
-		$id_map_table = $wpdb->base_prefix . 'hbm_id_map';
 		$placeholders = implode( ',', array_fill( 0, count( $post_ids ), '%d' ) );
-		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-			"UPDATE `{$wpdb->postmeta}` pm
-			 INNER JOIN `{$id_map_table}` im
-			     ON CAST(pm.meta_value AS UNSIGNED) = im.source_id
-			    AND im.site_job_id = %d
-			    AND im.object_type = 'attachment'
-			 SET pm.meta_value = im.dest_id
-			 WHERE pm.meta_key = '_thumbnail_id'
-			   AND pm.post_id IN ({$placeholders})",
-			array_merge( [ $site_job_id ], $post_ids )
-		) );
+		self::run_thumbnail_remap( $site_job_id, " AND pm.post_id IN ({$placeholders})", $post_ids );
 	}
 
 	/**
@@ -456,20 +459,43 @@ class SearchReplace {
 	 * Runs as the last step before marking the site job complete, when the full IdMap is available.
 	 */
 	private static function remap_postmeta_ids( int $site_job_id, int $blog_id ): void {
-		global $wpdb;
 		switch_to_blog( $blog_id );
+		self::run_thumbnail_remap( $site_job_id );
+		restore_current_blog();
+	}
+
+	/**
+	 * Single source of truth for the _thumbnail_id postmeta UPDATE...JOIN shape against
+	 * `hbm_id_map`, shared by remap_postmeta_ids() (whole-table, no extra filter) and
+	 * remap_postmeta_ids_scoped() (adds a `pm.post_id IN (...)` filter). Previously this SQL
+	 * shape was duplicated verbatim in both methods — a deliberate choice to keep the
+	 * scoped-mode addition strictly additive, later flagged as a duplication-drift risk. This
+	 * method is now the only place the JOIN/remap logic lives; a future change (e.g. the
+	 * sibling post-type-migration-audit plan's planned nav_menu_item remap addition alongside
+	 * _thumbnail_id — see docs/plans/2026-07-13-001-fix-post-type-migration-audit-plan.md) only
+	 * needs to happen here to apply to both the whole-table and scoped callers.
+	 *
+	 * @param int    $site_job_id
+	 * @param string $extra_where  Additional WHERE-clause fragment, ANDed after the base
+	 *                             `pm.meta_key = '_thumbnail_id'` condition. Must not embed raw
+	 *                             values — any placeholders in it are bound via $extra_params.
+	 *                             Empty string (default) = no additional filter (whole-table).
+	 * @param array  $extra_params Additional wpdb::prepare() params consumed by $extra_where's
+	 *                             placeholders, appended after $site_job_id in order.
+	 */
+	private static function run_thumbnail_remap( int $site_job_id, string $extra_where = '', array $extra_params = [] ): void {
+		global $wpdb;
+
 		$id_map_table = $wpdb->base_prefix . 'hbm_id_map';
-		$wpdb->query( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-			"UPDATE `{$wpdb->postmeta}` pm
+		$sql          = "UPDATE `{$wpdb->postmeta}` pm
 			 INNER JOIN `{$id_map_table}` im
 			     ON CAST(pm.meta_value AS UNSIGNED) = im.source_id
 			    AND im.site_job_id = %d
 			    AND im.object_type = 'attachment'
 			 SET pm.meta_value = im.dest_id
-			 WHERE pm.meta_key = '_thumbnail_id'",
-			$site_job_id
-		) );
-		restore_current_blog();
+			 WHERE pm.meta_key = '_thumbnail_id'" . $extra_where;
+
+		$wpdb->query( $wpdb->prepare( $sql, array_merge( [ $site_job_id ], $extra_params ) ) ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
 	}
 
 	private static function maybe_send_notification( int $migration_id ): void {
