@@ -5,8 +5,15 @@
 
 use HBMigrator\Admin\AdminPage;
 use HBMigrator\Destination\SearchReplace;
+use HBMigrator\MigrationRegistry;
+use HBMigrator\QueueTable;
 
 class Test_Admin_Page extends WP_UnitTestCase {
+
+	public function set_up(): void {
+		parent::set_up();
+		QueueTable::maybe_create_or_upgrade();
+	}
 
 	public function tear_down(): void {
 		parent::tear_down();
@@ -15,6 +22,27 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		delete_site_option( 'hbm_active_migration' );
 		delete_site_option( 'hbm_migration_history' );
 		remove_all_filters( 'pre_http_request' );
+		$_POST = [];
+	}
+
+	/**
+	 * Logs in as a user with manage_network — granted directly via add_cap() so these tests
+	 * pass whether or not the test environment is multisite (grant_super_admin() requires
+	 * multisite; add_cap() works either way and current_user_can() checks the cap directly).
+	 */
+	private function login_as_network_admin(): int {
+		$user_id = self::factory()->user->create( [ 'role' => 'administrator' ] );
+		get_user_by( 'id', $user_id )->add_cap( 'manage_network' );
+		wp_set_current_user( $user_id );
+		return $user_id;
+	}
+
+	private function make_complete_site_job( int $dest_blog_id ): array {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'testkey', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'sync.example.com', 'https://sync.example.com', '', '/sync/' );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete', 'dest_blog_id' => $dest_blog_id ] );
+		return [ $mid, $jid ];
 	}
 
 	// -------------------------------------------------------------------------
@@ -326,5 +354,216 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		] );
 		// First replacement wins since str_replace is sequential.
 		$this->assertStringContainsString( 'dest.example.com', $result );
+	}
+
+	// -------------------------------------------------------------------------
+	// handle_enable_sync()
+	// -------------------------------------------------------------------------
+
+	public function test_handle_enable_sync_transitions_complete_job_with_live_subsite(): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_enable_sync' ),
+			'site_job_id' => $jid,
+		];
+
+		try {
+			AdminPage::handle_enable_sync();
+		} catch ( \Throwable $e ) {
+			// wp_safe_redirect() ends in exit() — expected in test context.
+		}
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 'syncing', $job->status );
+		$this->assertNotEmpty( $job->sync_webhook_token );
+	}
+
+	/**
+	 * @dataProvider provide_non_complete_statuses_for_admin
+	 */
+	public function test_handle_enable_sync_rejects_non_complete_job( string $status ): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::update_site_job( $jid, [ 'status' => $status ] );
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_enable_sync' ),
+			'site_job_id' => $jid,
+		];
+
+		try {
+			AdminPage::handle_enable_sync();
+		} catch ( \Throwable $e ) {}
+
+		$this->assertSame( $status, MigrationRegistry::get_site_job( $jid )->status, 'Status must be unchanged on rejection.' );
+	}
+
+	public function provide_non_complete_statuses_for_admin(): array {
+		return [
+			'pending'   => [ 'pending' ],
+			'running'   => [ 'running' ],
+			'failed'    => [ 'failed' ],
+			'cancelled' => [ 'cancelled' ],
+			'finalized' => [ 'finalized' ], // sync cannot be re-enabled once finalized
+		];
+	}
+
+	public function test_handle_enable_sync_rejects_missing_destination_subsite(): void {
+		$this->login_as_network_admin();
+		// dest_blog_id = 0 — no destination subsite was ever recorded / it no longer resolves.
+		[ , $jid ] = $this->make_complete_site_job( 0 );
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_enable_sync' ),
+			'site_job_id' => $jid,
+		];
+
+		try {
+			AdminPage::handle_enable_sync();
+		} catch ( \Throwable $e ) {}
+
+		$this->assertSame( 'complete', MigrationRegistry::get_site_job( $jid )->status, 'Status must be unchanged when destination subsite does not resolve.' );
+	}
+
+	public function test_handle_enable_sync_rejects_deleted_destination_subsite(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'Simulating a deleted subsite requires multisite.' );
+		}
+
+		$this->login_as_network_admin();
+		$sub_id = self::factory()->blog->create();
+		[ , $jid ] = $this->make_complete_site_job( $sub_id );
+
+		// Soft-delete, matching TermImporter::process()'s dest_site/deleted check —
+		// get_site() still returns a WP_Site row for a soft-deleted blog (deleted = 1).
+		wp_update_site( $sub_id, [ 'deleted' => 1 ] );
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_enable_sync' ),
+			'site_job_id' => $jid,
+		];
+
+		try {
+			AdminPage::handle_enable_sync();
+		} catch ( \Throwable $e ) {}
+
+		$this->assertSame( 'complete', MigrationRegistry::get_site_job( $jid )->status, 'Status must be unchanged when destination subsite was deleted.' );
+	}
+
+	public function test_handle_enable_sync_rejects_invalid_nonce(): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+
+		$_POST = [ '_wpnonce' => 'not-a-real-nonce', 'site_job_id' => $jid ];
+
+		$this->expectException( WPDieException::class );
+		AdminPage::handle_enable_sync();
+	}
+
+	public function test_handle_enable_sync_rejects_insufficient_capability(): void {
+		$subscriber = self::factory()->user->create( [ 'role' => 'subscriber' ] );
+		wp_set_current_user( $subscriber );
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_enable_sync' ), 'site_job_id' => $jid ];
+
+		$this->expectException( WPDieException::class );
+		AdminPage::handle_enable_sync();
+	}
+
+	// -------------------------------------------------------------------------
+	// handle_finalize_sync()
+	// -------------------------------------------------------------------------
+
+	public function test_handle_finalize_sync_transitions_syncing_job(): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_finalize_sync' ),
+			'site_job_id' => $jid,
+		];
+
+		try {
+			AdminPage::handle_finalize_sync();
+		} catch ( \Throwable $e ) {}
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 'finalized', $job->status );
+		$this->assertNotNull( $job->sync_finalized_at );
+	}
+
+	public function test_handle_finalize_sync_rejects_non_syncing_job(): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		// Never enabled — status is 'complete', not 'syncing'.
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_finalize_sync' ),
+			'site_job_id' => $jid,
+		];
+
+		try {
+			AdminPage::handle_finalize_sync();
+		} catch ( \Throwable $e ) {}
+
+		$this->assertSame( 'complete', MigrationRegistry::get_site_job( $jid )->status, 'Status must be unchanged on rejection.' );
+	}
+
+	public function test_handle_finalize_sync_rejects_invalid_nonce(): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+
+		$_POST = [ '_wpnonce' => 'not-a-real-nonce', 'site_job_id' => $jid ];
+
+		$this->expectException( WPDieException::class );
+		AdminPage::handle_finalize_sync();
+	}
+
+	public function test_handle_finalize_sync_rejects_insufficient_capability(): void {
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+
+		$subscriber = self::factory()->user->create( [ 'role' => 'subscriber' ] );
+		wp_set_current_user( $subscriber );
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_finalize_sync' ), 'site_job_id' => $jid ];
+
+		$this->expectException( WPDieException::class );
+		AdminPage::handle_finalize_sync();
+	}
+
+	// -------------------------------------------------------------------------
+	// render_page() — Post-Migration Sync section
+	// -------------------------------------------------------------------------
+
+	public function test_render_page_shows_sync_last_pass_and_error_for_syncing_job(): void {
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+		MigrationRegistry::update_site_job( $jid, [
+			'sync_last_pass_at' => gmdate( 'Y-m-d H:i:s', strtotime( '-5 minutes' ) ),
+			'sync_last_error'   => 'Source unreachable: connection timed out.',
+		] );
+
+		ob_start();
+		AdminPage::render_page();
+		$html = ob_get_clean();
+
+		$this->assertStringContainsString( 'Post-Migration Sync', $html );
+		$this->assertStringContainsString( 'sync.example.com', $html );
+		$this->assertStringContainsString( 'hbm-error-message', $html );
+		$this->assertStringContainsString( 'Source unreachable: connection timed out.', $html );
+	}
+
+	public function test_render_page_hides_sync_section_when_no_syncable_jobs(): void {
+		ob_start();
+		AdminPage::render_page();
+		$html = ob_get_clean();
+
+		$this->assertStringNotContainsString( 'Post-Migration Sync', $html );
 	}
 }

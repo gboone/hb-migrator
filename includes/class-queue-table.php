@@ -17,6 +17,7 @@ class QueueTable {
 
 		self::create_tables();
 		self::upgrade_indexes();
+		self::upgrade_site_jobs_sync_columns();
 		self::drop_old_tables();
 		update_site_option( 'hbm_db_version', HBM_DB_VERSION );
 	}
@@ -45,6 +46,10 @@ class QueueTable {
   PRIMARY KEY  (id)
 ) $charset;";
 
+		// status: pending, running, complete, failed, cancelled — the original initial-migration
+		// lifecycle — plus 'syncing' (reached only from 'complete' via "Enable Sync") and
+		// 'finalized' (reached only from 'syncing' via "Finalize & Stop Sync", terminal — sync
+		// cannot be re-enabled after finalize). Column stays varchar(16); no enum constraint.
 		$sql_site_jobs = "CREATE TABLE {$p}hbm_site_jobs (
   id bigint(20) UNSIGNED NOT NULL AUTO_INCREMENT,
   migration_id bigint(20) UNSIGNED NOT NULL,
@@ -59,6 +64,15 @@ class QueueTable {
   stage_offset bigint(20) UNSIGNED NOT NULL DEFAULT 0,
   stage_total bigint(20) UNSIGNED NOT NULL DEFAULT 0,
   error_message text DEFAULT NULL,
+  sync_cursor_posts datetime DEFAULT NULL,
+  sync_cursor_media datetime DEFAULT NULL,
+  sync_cursor_comments bigint(20) UNSIGNED NOT NULL DEFAULT 0,
+  sync_locked_at datetime DEFAULT NULL,
+  sync_webhook_token varchar(64) DEFAULT NULL,
+  sync_enabled_at datetime DEFAULT NULL,
+  sync_finalized_at datetime DEFAULT NULL,
+  sync_last_pass_at datetime DEFAULT NULL,
+  sync_last_error text DEFAULT NULL,
   PRIMARY KEY  (id),
   KEY migration_id (migration_id),
   KEY status (status)
@@ -121,6 +135,54 @@ class QueueTable {
 			// phpcs:disable WordPress.DB.DirectDatabaseQuery.SchemaChange
 			$wpdb->query( "ALTER TABLE `{$table}` DROP INDEX `lookup`" );
 			$wpdb->query( "ALTER TABLE `{$table}` ADD UNIQUE KEY `lookup` (site_job_id, object_type, source_id)" );
+			// phpcs:enable
+		}
+	}
+
+	/**
+	 * Upgrade v5 → v6: add the sync-lifecycle columns to hbm_site_jobs for installs that
+	 * created the table before sync existed. dbDelta's CREATE TABLE above already produces
+	 * these columns on a fresh install; this covers existing installs the same way
+	 * upgrade_indexes() covers the hbm_id_map unique-key change — checked individually via
+	 * information_schema so a partially-upgraded table (e.g. a previous run that failed
+	 * partway through) doesn't error on columns that already exist.
+	 */
+	private static function upgrade_site_jobs_sync_columns(): void {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_site_jobs';
+
+		// Only touch the table if it already exists (upgrade path, not fresh install).
+		$exists = $wpdb->get_var( $wpdb->prepare(
+			'SELECT COUNT(*) FROM information_schema.TABLES WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s',
+			$table
+		) );
+		if ( ! $exists ) {
+			return;
+		}
+
+		$columns = [
+			'sync_cursor_posts'    => 'datetime DEFAULT NULL',
+			'sync_cursor_media'    => 'datetime DEFAULT NULL',
+			'sync_cursor_comments' => 'bigint(20) UNSIGNED NOT NULL DEFAULT 0',
+			'sync_locked_at'       => 'datetime DEFAULT NULL',
+			'sync_webhook_token'   => 'varchar(64) DEFAULT NULL',
+			'sync_enabled_at'      => 'datetime DEFAULT NULL',
+			'sync_finalized_at'    => 'datetime DEFAULT NULL',
+			'sync_last_pass_at'    => 'datetime DEFAULT NULL',
+			'sync_last_error'      => 'text DEFAULT NULL',
+		];
+
+		foreach ( $columns as $column => $definition ) {
+			$column_exists = $wpdb->get_var( $wpdb->prepare(
+				'SELECT COUNT(*) FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = %s AND COLUMN_NAME = %s',
+				$table,
+				$column
+			) );
+			if ( $column_exists ) {
+				continue;
+			}
+			// phpcs:disable WordPress.DB.DirectDatabaseQuery.SchemaChange
+			$wpdb->query( "ALTER TABLE `{$table}` ADD COLUMN `{$column}` {$definition}" );
 			// phpcs:enable
 		}
 	}

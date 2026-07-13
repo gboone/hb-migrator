@@ -60,6 +60,16 @@
 	color: #856404;
 }
 
+.hbm-status-syncing {
+	background: #d7e8f7;
+	color: #0073aa;
+}
+
+.hbm-status-finalized {
+	background: #f0f0f0;
+	color: #555;
+}
+
 /* Progress bar */
 .hbm-progress-bar {
 	background: #e0e0e0;

@@ -14,6 +14,8 @@ class AdminPage {
 		add_action( 'admin_post_hbm_save_config', [ self::class, 'handle_save_config' ] );
 		add_action( 'admin_post_hbm_start_migration', [ self::class, 'handle_start_migration' ] );
 		add_action( 'admin_post_hbm_clear_migration', [ self::class, 'handle_clear_migration' ] );
+		add_action( 'admin_post_hbm_enable_sync', [ self::class, 'handle_enable_sync' ] );
+		add_action( 'admin_post_hbm_finalize_sync', [ self::class, 'handle_finalize_sync' ] );
 	}
 
 	public static function register_page(): void {
@@ -61,6 +63,15 @@ class AdminPage {
 			<?php endif; ?>
 			<?php if ( isset( $_GET['error'] ) ) : ?>
 				<div class="notice notice-error is-dismissible"><p><?php echo esc_html( urldecode( wp_unslash( $_GET['error'] ) ) ); ?></p></div>
+			<?php endif; ?>
+			<?php if ( isset( $_GET['sync_enabled'] ) ) : ?>
+				<div class="notice notice-success is-dismissible"><p><?php esc_html_e( 'Sync enabled for this site job.', 'hb-migrator' ); ?></p></div>
+			<?php endif; ?>
+			<?php if ( isset( $_GET['sync_finalized'] ) ) : ?>
+				<div class="notice notice-success is-dismissible"><p><?php esc_html_e( 'Sync finalized for this site job. A sync pass already in progress at the moment Finalize was clicked will still finish before syncing fully stops.', 'hb-migrator' ); ?></p></div>
+			<?php endif; ?>
+			<?php if ( isset( $_GET['sync_error'] ) ) : ?>
+				<div class="notice notice-error is-dismissible"><p><?php echo esc_html( urldecode( wp_unslash( $_GET['sync_error'] ) ) ); ?></p></div>
 			<?php endif; ?>
 
 			<!-- Section 1: This site's API key -->
@@ -255,6 +266,65 @@ class AdminPage {
 			</table>
 			<?php endif; ?>
 
+			<?php
+			$syncable_jobs = MigrationRegistry::get_syncable_site_jobs();
+			if ( ! empty( $syncable_jobs ) ) :
+			?>
+			<hr>
+			<h2><?php esc_html_e( 'Post-Migration Sync', 'hb-migrator' ); ?></h2>
+			<p class="description"><?php esc_html_e( 'Sites that have completed their initial migration can keep pulling new and edited content from source until Finalize & Stop Sync is clicked.', 'hb-migrator' ); ?></p>
+			<table class="widefat hbm-sync-table">
+				<thead>
+					<tr>
+						<th><?php esc_html_e( 'Site', 'hb-migrator' ); ?></th>
+						<th><?php esc_html_e( 'Status', 'hb-migrator' ); ?></th>
+						<th><?php esc_html_e( 'Last Sync Pass', 'hb-migrator' ); ?></th>
+						<th><?php esc_html_e( 'Actions', 'hb-migrator' ); ?></th>
+					</tr>
+				</thead>
+				<tbody>
+					<?php
+					$sync_status_labels = [
+						'complete' => __( 'Complete', 'hb-migrator' ),
+						'syncing'  => __( 'Syncing', 'hb-migrator' ),
+					];
+					foreach ( $syncable_jobs as $sync_job ) :
+						$last_pass = ! empty( $sync_job->sync_last_pass_at ) ? date_i18n( 'Y-m-d H:i', strtotime( $sync_job->sync_last_pass_at ) ) : esc_html__( 'Never', 'hb-migrator' );
+					?>
+					<tr>
+						<td>
+							<?php echo esc_html( $sync_job->source_domain ); ?> &rarr; <?php echo esc_html( $sync_job->dest_path ); ?>
+						</td>
+						<td>
+							<span class="hbm-status hbm-status-<?php echo esc_attr( $sync_job->status ); ?>"><?php echo esc_html( $sync_status_labels[ $sync_job->status ] ?? ucfirst( $sync_job->status ) ); ?></span>
+							<?php if ( ! empty( $sync_job->sync_last_error ) ) : ?>
+								<p class="hbm-error-message"><?php echo esc_html( $sync_job->sync_last_error ); ?></p>
+							<?php endif; ?>
+						</td>
+						<td><?php echo esc_html( $last_pass ); ?></td>
+						<td>
+							<?php if ( 'complete' === $sync_job->status ) : ?>
+								<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="display:inline">
+									<input type="hidden" name="action" value="hbm_enable_sync">
+									<input type="hidden" name="site_job_id" value="<?php echo (int) $sync_job->id; ?>">
+									<?php wp_nonce_field( 'hbm_enable_sync' ); ?>
+									<button type="submit" class="button button-small"><?php esc_html_e( 'Enable Sync', 'hb-migrator' ); ?></button>
+								</form>
+							<?php elseif ( 'syncing' === $sync_job->status ) : ?>
+								<form method="post" action="<?php echo esc_url( admin_url( 'admin-post.php' ) ); ?>" style="display:inline" onsubmit="return confirm('<?php echo esc_js( sprintf( /* translators: %s: site domain */ __( 'Finalize and stop sync for %s? Sync cannot be re-enabled once finalized.', 'hb-migrator' ), $sync_job->source_domain ) ); ?>');">
+									<input type="hidden" name="action" value="hbm_finalize_sync">
+									<input type="hidden" name="site_job_id" value="<?php echo (int) $sync_job->id; ?>">
+									<?php wp_nonce_field( 'hbm_finalize_sync' ); ?>
+									<button type="submit" class="button button-small"><?php esc_html_e( 'Finalize & Stop Sync', 'hb-migrator' ); ?></button>
+								</form>
+							<?php endif; ?>
+						</td>
+					</tr>
+					<?php endforeach; ?>
+				</tbody>
+			</table>
+			<?php endif; ?>
+
 		</div>
 		<?php
 	}
@@ -339,6 +409,71 @@ class AdminPage {
 		] );
 
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&started=1' ) );
+		exit;
+	}
+
+	/**
+	 * Enable Sync: complete → syncing. Rejected when the job isn't 'complete' (including
+	 * 'finalized' — sync can never be re-enabled) or when the destination subsite no longer
+	 * resolves to a live, non-deleted site. Mirrors TermImporter::process()'s dest_site/deleted
+	 * check (includes/destination/class-term-importer.php) so a subsite deleted after initial
+	 * migration can't be synced into.
+	 */
+	public static function handle_enable_sync(): void {
+		check_admin_referer( 'hbm_enable_sync' );
+		if ( ! current_user_can( 'manage_network' ) ) {
+			wp_die( esc_html__( 'Insufficient permissions.', 'hb-migrator' ), 403 );
+		}
+
+		$site_job_id = (int) ( $_POST['site_job_id'] ?? 0 );
+		$job         = $site_job_id ? MigrationRegistry::get_site_job( $site_job_id ) : null;
+
+		if ( ! $job || 'complete' !== $job->status ) {
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_error=' . rawurlencode( 'Sync can only be enabled for a site job whose initial migration is complete.' ) ) );
+			exit;
+		}
+
+		$dest_site = $job->dest_blog_id ? get_site( (int) $job->dest_blog_id ) : null;
+		if ( ! $dest_site || (int) $dest_site->deleted ) {
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_error=' . rawurlencode( sprintf( 'Cannot enable sync: the destination subsite for %s no longer exists.', $job->source_domain ) ) ) );
+			exit;
+		}
+
+		if ( ! MigrationRegistry::enable_site_job_sync( $site_job_id ) ) {
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_error=' . rawurlencode( 'Sync could not be enabled — the site job status changed before this request completed.' ) ) );
+			exit;
+		}
+
+		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_enabled=1' ) );
+		exit;
+	}
+
+	/**
+	 * Finalize & Stop Sync: syncing → finalized (terminal). Rejected when the job isn't
+	 * currently 'syncing'. Runs the credential-wipe/IdMap cleanup complete_migration()
+	 * deferred for this job (see MigrationRegistry::finalize_site_job_sync()). Does not
+	 * abort an in-flight sync pass — U7's scheduler stops future scheduling only.
+	 */
+	public static function handle_finalize_sync(): void {
+		check_admin_referer( 'hbm_finalize_sync' );
+		if ( ! current_user_can( 'manage_network' ) ) {
+			wp_die( esc_html__( 'Insufficient permissions.', 'hb-migrator' ), 403 );
+		}
+
+		$site_job_id = (int) ( $_POST['site_job_id'] ?? 0 );
+		$job         = $site_job_id ? MigrationRegistry::get_site_job( $site_job_id ) : null;
+
+		if ( ! $job || 'syncing' !== $job->status ) {
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_error=' . rawurlencode( 'Sync can only be finalized for a site job that is currently syncing.' ) ) );
+			exit;
+		}
+
+		if ( ! MigrationRegistry::finalize_site_job_sync( $site_job_id ) ) {
+			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_error=' . rawurlencode( 'Sync could not be finalized — the site job status changed before this request completed.' ) ) );
+			exit;
+		}
+
+		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_finalized=1' ) );
 		exit;
 	}
 
