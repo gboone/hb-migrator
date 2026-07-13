@@ -3,6 +3,7 @@
 namespace HBMigrator\Admin;
 
 use HBMigrator\ApiAuth;
+use HBMigrator\Destination\SyncScheduler;
 use HBMigrator\MigrationRegistry;
 
 class AdminPage {
@@ -444,6 +445,9 @@ class AdminPage {
 			exit;
 		}
 
+		// U7: register the cron safety-net pass now that the job is actually 'syncing'.
+		SyncScheduler::schedule( $site_job_id );
+
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_enabled=1' ) );
 		exit;
 	}
@@ -472,6 +476,9 @@ class AdminPage {
 			wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_error=' . rawurlencode( 'Sync could not be finalized — the site job status changed before this request completed.' ) ) );
 			exit;
 		}
+
+		// U7: stop the cron safety-net pass — does not abort an in-flight pass, only future scheduling.
+		SyncScheduler::unschedule( $site_job_id );
 
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_finalized=1' ) );
 		exit;
