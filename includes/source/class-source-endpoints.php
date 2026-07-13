@@ -53,6 +53,18 @@ class SourceEndpoints {
 			] ),
 		] );
 
+		// U5: comment migration. Same $auth/$blog_id_args shape as TermReader/PostReader/
+		// MediaReader above — no `ids` targeted-retry param (comments have no equivalent to
+		// media's post-failure retry-by-ID use case; the last_id cursor plus IdMap's
+		// idempotent-retry check on the importer side already covers retrying a partially-
+		// failed pass, see CommentImporter).
+		register_rest_route( $ns, '/source/sites/(?P<blog_id>\d+)/comments', [
+			'methods'             => \WP_REST_Server::READABLE,
+			'callback'            => [ CommentReader::class, 'get_comments' ],
+			'permission_callback' => $auth,
+			'args'                => $blog_id_args,
+		] );
+
 		register_rest_route( $ns, '/source/sites/(?P<blog_id>\d+)/options', [
 			'methods'             => \WP_REST_Server::READABLE,
 			'callback'            => [ OptionReader::class, 'get_options' ],

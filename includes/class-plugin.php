@@ -59,6 +59,17 @@ class Plugin {
 			$stages['posts'] = new Destination\PostSyncStage();
 			return $stages;
 		} );
+
+		// Register U5's real 'comments' sync stage. SyncDispatcher::default_stages() already
+		// orders 'comments' after 'posts' in its stage array, and both this filter callback
+		// and U3's above only ever set/overwrite their own slot key, so registration order
+		// between the two callbacks doesn't matter — only SyncDispatcher's fixed iteration
+		// order does, which already puts posts before comments (U5 depends on this so a
+		// comment's post has somewhere to attach within the same pass).
+		add_filter( 'hbm_sync_stages', static function ( array $stages ) {
+			$stages['comments'] = new Destination\CommentSyncStage();
+			return $stages;
+		} );
 	}
 
 	public static function activate(): void {
