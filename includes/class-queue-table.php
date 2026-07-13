@@ -73,6 +73,9 @@ class QueueTable {
   sync_finalized_at datetime DEFAULT NULL,
   sync_last_pass_at datetime DEFAULT NULL,
   sync_last_error text DEFAULT NULL,
+  sync_comment_stall_id bigint(20) UNSIGNED NOT NULL DEFAULT 0,
+  sync_comment_stall_count int(10) UNSIGNED NOT NULL DEFAULT 0,
+  sync_comment_stall_note text DEFAULT NULL,
   PRIMARY KEY  (id),
   KEY migration_id (migration_id),
   KEY status (status)
@@ -146,6 +149,11 @@ class QueueTable {
 	 * upgrade_indexes() covers the hbm_id_map unique-key change — checked individually via
 	 * information_schema so a partially-upgraded table (e.g. a previous run that failed
 	 * partway through) doesn't error on columns that already exist.
+	 *
+	 * Upgrade v6 → v7: add the three sync_comment_stall_* columns (P1 fix — see
+	 * CommentSyncStage's class docblock) using this same per-column existence check, so an
+	 * install already on v6 (sync enabled, mid-migration) picks up the bounded-stall columns
+	 * without a fresh install/dbDelta pass.
 	 */
 	private static function upgrade_site_jobs_sync_columns(): void {
 		global $wpdb;
@@ -161,15 +169,18 @@ class QueueTable {
 		}
 
 		$columns = [
-			'sync_cursor_posts'    => 'datetime DEFAULT NULL',
-			'sync_cursor_media'    => 'datetime DEFAULT NULL',
-			'sync_cursor_comments' => 'bigint(20) UNSIGNED NOT NULL DEFAULT 0',
-			'sync_locked_at'       => 'datetime DEFAULT NULL',
-			'sync_webhook_token'   => 'varchar(64) DEFAULT NULL',
-			'sync_enabled_at'      => 'datetime DEFAULT NULL',
-			'sync_finalized_at'    => 'datetime DEFAULT NULL',
-			'sync_last_pass_at'    => 'datetime DEFAULT NULL',
-			'sync_last_error'      => 'text DEFAULT NULL',
+			'sync_cursor_posts'        => 'datetime DEFAULT NULL',
+			'sync_cursor_media'        => 'datetime DEFAULT NULL',
+			'sync_cursor_comments'     => 'bigint(20) UNSIGNED NOT NULL DEFAULT 0',
+			'sync_locked_at'           => 'datetime DEFAULT NULL',
+			'sync_webhook_token'       => 'varchar(64) DEFAULT NULL',
+			'sync_enabled_at'          => 'datetime DEFAULT NULL',
+			'sync_finalized_at'        => 'datetime DEFAULT NULL',
+			'sync_last_pass_at'        => 'datetime DEFAULT NULL',
+			'sync_last_error'          => 'text DEFAULT NULL',
+			'sync_comment_stall_id'    => 'bigint(20) UNSIGNED NOT NULL DEFAULT 0',
+			'sync_comment_stall_count' => 'int(10) UNSIGNED NOT NULL DEFAULT 0',
+			'sync_comment_stall_note'  => 'text DEFAULT NULL',
 		];
 
 		foreach ( $columns as $column => $definition ) {

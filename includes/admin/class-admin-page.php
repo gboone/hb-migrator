@@ -302,6 +302,12 @@ class AdminPage {
 							<?php if ( ! empty( $sync_job->sync_last_error ) ) : ?>
 								<p class="hbm-error-message"><?php echo esc_html( $sync_job->sync_last_error ); ?></p>
 							<?php endif; ?>
+							<?php if ( ! empty( $sync_job->sync_comment_stall_note ) ) : ?>
+								<?php // Not an error — a visible record of CommentSyncStage giving up on an
+								// unresolvable comment_parent (P1 fix) after MAX_STALL_PASSES consecutive
+								// passes, so sync could keep advancing instead of freezing on it forever. ?>
+								<p class="hbm-notice-message"><?php echo esc_html( $sync_job->sync_comment_stall_note ); ?></p>
+							<?php endif; ?>
 						</td>
 						<td><?php echo esc_html( $last_pass ); ?></td>
 						<td>

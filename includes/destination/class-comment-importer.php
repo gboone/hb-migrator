@@ -32,8 +32,22 @@ class CommentImporter {
 	 * @param int   $site_job_id
 	 * @param array $comments Already-fetched from CommentReader::get_comments() (or a stub in
 	 *                        tests) — see class docblock for the resolve-then-upsert order.
+	 * @param int[] $force_top_level_ids Source comment_ID values (usually zero or one) for
+	 *                        which the comment_parent -> 'comment' IdMap lookup below is
+	 *                        skipped entirely and the comment is inserted/updated with
+	 *                        comment_parent = 0, regardless of the source row's own
+	 *                        comment_parent value. Set only by CommentSyncStage, and only
+	 *                        after a comment has been the cursor's blocking item for
+	 *                        CommentSyncStage::MAX_STALL_PASSES consecutive passes without its
+	 *                        parent ever resolving (e.g. the parent comment was deleted on
+	 *                        source — WordPress core never cascades that deletion to replies,
+	 *                        so the reply's comment_parent can never resolve via IdMap on its
+	 *                        own). Does not affect the comment_post_ID resolution above it: a
+	 *                        comment whose post is still unmapped is skipped exactly as before
+	 *                        even when its ID appears here — forcing only ever waives the
+	 *                        parent check, never fabricates a destination post.
 	 */
-	public static function process( int $site_job_id, array $comments ): void {
+	public static function process( int $site_job_id, array $comments, array $force_top_level_ids = [] ): void {
 		global $wpdb;
 
 		if ( empty( $comments ) ) {

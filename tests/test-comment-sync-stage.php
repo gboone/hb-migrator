@@ -341,4 +341,147 @@ class Test_CommentSyncStage extends WP_UnitTestCase {
 		$this->assertNotNull( $dest_comment_id, 'Comment on the same-pass post must also have synced — proves posts ran before comments.' );
 		$this->assertSame( $dest_post_id, (int) get_comment( $dest_comment_id )->comment_post_ID );
 	}
+
+	// -------------------------------------------------------------------------
+	// Bounded comment-parent stall (P1 fix -- code review): WordPress core never
+	// cascade-deletes or reparents child comments when a parent comment is deleted, so a
+	// reply whose parent was deleted on source has a comment_parent that can NEVER resolve
+	// via IdMap -- left unbounded, the original "stop at the first unresolved comment"
+	// cursor logic would freeze sync_cursor_comments at that position forever, silently
+	// halting sync of every comment created after it. CommentSyncStage::MAX_STALL_PASSES
+	// bounds this: the SAME blocking comment_ID gets that many consecutive passes' worth of
+	// a genuine chance to resolve before it's force-imported as a top-level comment
+	// (comment_parent = 0) so the cursor can advance past it.
+	// -------------------------------------------------------------------------
+
+	public function test_transiently_blocked_reply_resolves_once_its_parent_syncs_within_the_bound(): void {
+		$dest_post_id = self::factory()->post->create();
+		IdMap::set( $this->jid, 'post', 1, $dest_post_id );
+
+		// Reply (source comment_ID 2) references a parent (source comment_ID 1) that
+		// hasn't synced yet -- a transient block, not a permanent one.
+		$this->mock_comments_response( [
+			$this->make_source_comment( [ 'comment_ID' => 2, 'comment_post_ID' => 1, 'comment_parent' => 1 ] ),
+		] );
+
+		$stage = new CommentSyncStage();
+		$stage->process( $this->jid );
+
+		$this->assertNull( IdMap::get( $this->jid, 'comment', 2 ), 'Must not import while genuinely blocked.' );
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 0, (int) $job->sync_cursor_comments );
+		$this->assertSame( 2, (int) $job->sync_comment_stall_id );
+		$this->assertSame( 1, (int) $job->sync_comment_stall_count, 'First stalled pass.' );
+
+		// The parent (source comment_ID 1) now syncs, as it would on a later pass once
+		// its own turn to import comes up.
+		$dest_parent_id = self::factory()->comment->create( [ 'comment_post_ID' => $dest_post_id ] );
+		IdMap::set( $this->jid, 'comment', 1, $dest_parent_id );
+
+		// A second pass -- well within MAX_STALL_PASSES (5), not a sixth.
+		$stage->process( $this->jid );
+
+		$dest_reply_id = IdMap::get( $this->jid, 'comment', 2 );
+		$this->assertNotNull( $dest_reply_id, 'Must resolve normally once genuinely unblocked.' );
+		$this->assertSame(
+			$dest_parent_id,
+			(int) get_comment( $dest_reply_id )->comment_parent,
+			'Must keep the real parent -- a transient block within the bound must never be force-flattened to top-level.'
+		);
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 2, (int) $job->sync_cursor_comments );
+		$this->assertSame( 0, (int) $job->sync_comment_stall_id, 'Stall bookkeeping must clear once unblocked.' );
+		$this->assertSame( 0, (int) $job->sync_comment_stall_count );
+		$this->assertEmpty( $job->sync_comment_stall_note, 'No give-up occurred -- nothing to log.' );
+	}
+
+	public function test_permanently_blocked_reply_is_force_imported_as_top_level_after_the_bound(): void {
+		$dest_post_id = self::factory()->post->create();
+		IdMap::set( $this->jid, 'post', 1, $dest_post_id );
+
+		// Reply (source comment_ID 2) references a parent (source comment_ID 1) that was
+		// deleted on source -- WordPress core never cascades that deletion to children, so
+		// this comment_parent can NEVER resolve via IdMap on its own.
+		$this->mock_comments_response( [
+			$this->make_source_comment( [ 'comment_ID' => 2, 'comment_post_ID' => 1, 'comment_parent' => 1 ] ),
+		] );
+
+		$stage = new CommentSyncStage();
+
+		// Four consecutive stalled passes -- still under the bound (5), so nothing is
+		// force-imported yet; this must behave exactly like the pre-fix retry-forever
+		// design for as long as the bound allows.
+		for ( $i = 1; $i <= 4; $i++ ) {
+			$stage->process( $this->jid );
+			$this->assertNull( IdMap::get( $this->jid, 'comment', 2 ), "Must not force-import before the bound (pass $i)." );
+			$job = MigrationRegistry::get_site_job( $this->jid );
+			$this->assertSame( 0, (int) $job->sync_cursor_comments, "Cursor must stay put before the bound (pass $i)." );
+			$this->assertSame( $i, (int) $job->sync_comment_stall_count, "Stall count must track consecutive passes (pass $i)." );
+		}
+
+		// Fifth consecutive pass on the SAME blocking comment_ID -- the bound is reached,
+		// so this stage gives up resolving the parent and force-imports it as top-level
+		// instead of blocking forever.
+		$stage->process( $this->jid );
+
+		$dest_reply_id = IdMap::get( $this->jid, 'comment', 2 );
+		$this->assertNotNull( $dest_reply_id, 'A permanently-unresolvable parent must not block the comment forever.' );
+		$this->assertSame(
+			0,
+			(int) get_comment( $dest_reply_id )->comment_parent,
+			'Must be imported as top-level (comment_parent = 0), not with a fabricated parent.'
+		);
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 2, (int) $job->sync_cursor_comments, 'Cursor must advance past the given-up comment, not stay frozen forever.' );
+		$this->assertSame( 0, (int) $job->sync_comment_stall_id, 'Stall bookkeeping must clear once resolved.' );
+		$this->assertSame( 0, (int) $job->sync_comment_stall_count );
+		$this->assertNotEmpty( $job->sync_comment_stall_note, 'The give-up decision must be logged somewhere visible to an operator.' );
+		$this->assertStringContainsString( '#2', $job->sync_comment_stall_note );
+	}
+
+	public function test_a_different_blocking_comment_starts_its_own_fresh_stall_count(): void {
+		$dest_post_id = self::factory()->post->create();
+		IdMap::set( $this->jid, 'post', 1, $dest_post_id );
+
+		// First pass: comment_ID 2 (parent 1) blocks -- a transient block, not yet
+		// resolved.
+		$this->mock_comments_response( [
+			$this->make_source_comment( [ 'comment_ID' => 2, 'comment_post_ID' => 1, 'comment_parent' => 1 ] ),
+		] );
+
+		$stage = new CommentSyncStage();
+		$stage->process( $this->jid );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 2, (int) $job->sync_comment_stall_id );
+		$this->assertSame( 1, (int) $job->sync_comment_stall_count );
+
+		// Comment 2's real parent (source comment_ID 1) now syncs, unblocking it -- but a
+		// DIFFERENT comment (source comment_ID 4, referencing a still-unmapped parent,
+		// source comment_ID 3) shows up in the same next-pass batch and becomes the new
+		// blocker.
+		$dest_parent_id = self::factory()->comment->create( [ 'comment_post_ID' => $dest_post_id ] );
+		IdMap::set( $this->jid, 'comment', 1, $dest_parent_id );
+
+		$this->mock_comments_response( [
+			$this->make_source_comment( [ 'comment_ID' => 2, 'comment_post_ID' => 1, 'comment_parent' => 1 ] ),
+			$this->make_source_comment( [ 'comment_ID' => 4, 'comment_post_ID' => 1, 'comment_parent' => 3 ] ),
+		] );
+
+		$stage->process( $this->jid );
+
+		$this->assertNotNull( IdMap::get( $this->jid, 'comment', 2 ), 'The now-unblocked comment must resolve normally.' );
+		$this->assertNull( IdMap::get( $this->jid, 'comment', 4 ), 'The new blocking comment must not be imported yet.' );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 2, (int) $job->sync_cursor_comments, 'Cursor advances up to just before the new blocker.' );
+		$this->assertSame( 4, (int) $job->sync_comment_stall_id, 'A different comment is now tracked as the blocker.' );
+		$this->assertSame(
+			1,
+			(int) $job->sync_comment_stall_count,
+			"The new blocker must start its own fresh count (1), not inherit comment #2's prior count."
+		);
+	}
 }

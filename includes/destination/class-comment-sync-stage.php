@@ -33,6 +33,13 @@ use HBMigrator\SourceClient;
  * already-synced comments are webhook-only, not covered by this cron-driven stage (see plan
  * "Key Technical Decisions", "Comment edits and moderation-status changes are webhook-only").
  *
+ * A blocked comment (unmapped comment_post_ID or comment_parent) is retried, not dropped —
+ * except when the SAME comment remains the blocking item for MAX_STALL_PASSES consecutive
+ * passes, at which point it's force-imported with comment_parent dropped to 0 (top-level)
+ * rather than left blocking the cursor forever — see MAX_STALL_PASSES' docblock for why this
+ * bound exists (a parent comment deleted on source, which WordPress core never cascades to its
+ * children, otherwise stalls sync_cursor_comments permanently — P1 fix, code review).
+ *
  * @see docs/plans/2026-07-13-002-feat-post-migration-content-sync-plan.md, "### U5. Comment
  *      migration"
  */
@@ -42,6 +49,35 @@ class CommentSyncStage implements SyncStageInterface {
 	 * Row budget per invocation, matching PostImporter/PostSyncStage's own 100-row convention.
 	 */
 	private const BATCH_SIZE = 100;
+
+	/**
+	 * Bound on how many consecutive passes the SAME comment (by source comment_ID) is allowed
+	 * to be the cursor's blocking item before this stage gives up trying to resolve its
+	 * comment_parent and force-imports it as a top-level comment instead (P1 fix — code
+	 * review).
+	 *
+	 * Why bounded retry is required at all: the cursor-advance logic below intentionally stops
+	 * at the first comment CommentImporter couldn't resolve, so a *transient* block (parent not
+	 * synced yet, will arrive next pass) gets retried rather than dropped. But WordPress core
+	 * never cascade-deletes or reparents child comments when a parent comment is deleted (see
+	 * wp-includes/comment.php — no such logic exists), so a reply whose parent was deleted on
+	 * source has a comment_parent that can NEVER resolve via IdMap. Left unbounded, that one
+	 * comment would freeze sync_cursor_comments at its position forever, silently halting sync
+	 * of every comment created after it on this site job — the exact bug this constant exists
+	 * to bound.
+	 *
+	 * Why 5: SyncScheduler's cron safety net runs a pass every 15 minutes by default
+	 * (SyncScheduler::DEFAULT_INTERVAL_SECONDS), and the webhook trigger (U8) can run passes
+	 * more often than that. Five consecutive stalls on the exact same comment is already several
+	 * multiples of the slowest realistic "genuinely still transient" case — a parent one batch
+	 * behind its child, or a same-pass ordering quirk (comment_parent > comment_ID is legal and
+	 * explicitly handled, see CommentImporter's docblock) — while still bounding the worst-case
+	 * freeze to roughly an hour of cron cadence rather than indefinitely. Not tied to
+	 * PostImporter/MediaImporter's row-level $wpdb write-failure retries (a different failure
+	 * shape — a single write erroring, not a reference that can never resolve on this host) and
+	 * not configurable via a filter, matching this stage's existing BATCH_SIZE convention.
+	 */
+	private const MAX_STALL_PASSES = 5;
 
 	/**
 	 * Source comment IDs fetched (passed to CommentImporter::process()) by the most recent
@@ -115,19 +151,90 @@ class CommentSyncStage implements SyncStageInterface {
 		// it (in this batch) will be re-fetched and re-attempted next pass. Re-fetching an
 		// already-synced comment ahead of a blocked one is safe — CommentImporter's
 		// IdMap-keyed existing-row check makes that a no-op update, not a duplicate.
-		$max_id  = $last_id;
-		$blocked = false;
+		//
+		// Bounded-stall exception (P1 fix — see MAX_STALL_PASSES docblock): if the first
+		// unresolved comment_ID encountered here is the SAME one that was already the
+		// blocking item on the immediately preceding pass, this pass's attempt count is
+		// $old_stall_count + 1; once that reaches MAX_STALL_PASSES, CommentImporter is called
+		// a second time for just that one comment with its comment_ID in $force_top_level_ids,
+		// which drops its comment_parent to 0 (top-level) rather than continuing to require an
+		// IdMap match that, for a parent deleted on source, can never come. If that force
+		// succeeds (i.e. the comment's post WAS mapped — only its parent was the permanent
+		// blocker), the walk falls through and keeps scanning the rest of the batch exactly as
+		// if this comment had resolved normally, so a later, different blocking comment in the
+		// same batch still gets its own fresh count (never inherits this one's), per-pass.
+		$old_stall_id    = (int) ( $job->sync_comment_stall_id ?? 0 );
+		$old_stall_count = (int) ( $job->sync_comment_stall_count ?? 0 );
+
+		$max_id          = $last_id;
+		$blocked         = false;
+		$new_stall_id    = 0;
+		$new_stall_count = 0;
+		$gave_up_note    = null;
+
 		foreach ( $comments as $c ) {
 			$id = (int) ( $c['comment_ID'] ?? 0 );
+
 			if ( null === IdMap::get( $site_job_id, 'comment', $id ) ) {
-				$blocked = true;
-				break;
+				$attempt = ( $id === $old_stall_id ) ? $old_stall_count + 1 : 1;
+
+				if ( $attempt >= self::MAX_STALL_PASSES ) {
+					// This exact comment has now been the cursor's blocking item for
+					// MAX_STALL_PASSES consecutive passes without resolving. Force it through
+					// with comment_parent dropped — a no-op if comment_post_ID is what's
+					// actually still unresolved (CommentImporter still skips it in that case,
+					// untouched by $force_top_level_ids), so this can never fabricate a
+					// destination post, only waive the parent check.
+					CommentImporter::process( $site_job_id, [ $c ], [ $id ] );
+				}
+
+				if ( null === IdMap::get( $site_job_id, 'comment', $id ) ) {
+					// Still unresolved — either not yet eligible for forcing, or forcing
+					// didn't help because comment_post_ID (not comment_parent) is the actual
+					// unresolved reference. Stop the walk here exactly as before; pin the
+					// stall count at the bound rather than growing it unbounded pass after
+					// pass once forcing is already being (harmlessly, idempotently) retried
+					// every pass.
+					$blocked         = true;
+					$new_stall_id    = $id;
+					$new_stall_count = min( $attempt, self::MAX_STALL_PASSES );
+					break;
+				}
+
+				// Forcing just resolved it this pass.
+				$gave_up_note = sprintf(
+					'Comment #%d: parent comment #%d never resolved after %d consecutive sync passes (likely deleted on source) — imported as a top-level comment.',
+					$id,
+					(int) ( $c['comment_parent'] ?? 0 ),
+					self::MAX_STALL_PASSES
+				);
 			}
+
 			$max_id = $id;
 		}
 
+		$job_updates = [];
 		if ( $max_id !== $last_id ) {
-			MigrationRegistry::update_site_job( $site_job_id, [ 'sync_cursor_comments' => $max_id ] );
+			$job_updates['sync_cursor_comments'] = $max_id;
+		}
+		if ( null !== $gave_up_note ) {
+			$job_updates['sync_comment_stall_note'] = $gave_up_note;
+		}
+		if ( $blocked ) {
+			if ( $new_stall_id !== $old_stall_id || $new_stall_count !== $old_stall_count ) {
+				$job_updates['sync_comment_stall_id']    = $new_stall_id;
+				$job_updates['sync_comment_stall_count'] = $new_stall_count;
+			}
+		} elseif ( 0 !== $old_stall_id || 0 !== $old_stall_count ) {
+			// Nothing blocked this pass — clear any stall bookkeeping left over from a prior
+			// pass so a later, unrelated blocking comment starts its own fresh count rather
+			// than inheriting this one's.
+			$job_updates['sync_comment_stall_id']    = 0;
+			$job_updates['sync_comment_stall_count'] = 0;
+		}
+
+		if ( ! empty( $job_updates ) ) {
+			MigrationRegistry::update_site_job( $site_job_id, $job_updates );
 		}
 
 		// Only self-requeue an immediate continuation when there's genuine forward progress
