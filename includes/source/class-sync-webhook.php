@@ -171,6 +171,20 @@ class SyncWebhook {
 	 * uses — the caller (destination) authenticates with the migration's source_api_key,
 	 * the exact credential destination already holds and already uses for every other
 	 * source-fetching call in this plugin.
+	 *
+	 * Note on "confirmed successful delivery" (code review — hbm_site_jobs.
+	 * sync_webhook_token_delivered_at): this HTTP 200 response IS the delivery confirmation
+	 * SourceClient::post() relies on to consider the call successful, but the timestamp
+	 * itself must not be written from here. Source and destination are separate WordPress
+	 * installs (see admin-page.php's storage of the counterpart install's own URL/API key);
+	 * this method runs on the SOURCE install against its own local hbm_site_jobs table, which
+	 * has no row for the destination's $site_job_id (site jobs are only ever created via
+	 * MigrationRegistry::create_site_job() during /destination/begin, a destination-only code
+	 * path). Writing the timestamp here would therefore be a no-op at best, or, if this
+	 * source's own hbm_site_jobs table happens to contain an unrelated row with a coincidentally
+	 * matching id, an incorrect write to the wrong record. The timestamp is instead recorded
+	 * on the destination side, at the call site that made this request and observed the 200 —
+	 * see Destination\SyncReceiver::deliver_sync_webhook_token().
 	 */
 	public static function receive_token( \WP_REST_Request $request ): \WP_REST_Response {
 		$blog_id     = (int) $request->get_param( 'blog_id' );

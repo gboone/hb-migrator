@@ -76,6 +76,7 @@ class QueueTable {
   sync_comment_stall_id bigint(20) UNSIGNED NOT NULL DEFAULT 0,
   sync_comment_stall_count int(10) UNSIGNED NOT NULL DEFAULT 0,
   sync_comment_stall_note text DEFAULT NULL,
+  sync_webhook_token_delivered_at datetime DEFAULT NULL,
   PRIMARY KEY  (id),
   KEY migration_id (migration_id),
   KEY status (status)
@@ -154,6 +155,13 @@ class QueueTable {
 	 * CommentSyncStage's class docblock) using this same per-column existence check, so an
 	 * install already on v6 (sync enabled, mid-migration) picks up the bounded-stall columns
 	 * without a fresh install/dbDelta pass.
+	 *
+	 * Upgrade v7 → v8: add sync_webhook_token_delivered_at (code review fix — see
+	 * Destination\SyncReceiver::deliver_sync_webhook_token()'s docblock). A failed token
+	 * delivery to source previously degraded a site job to cron-only sync with no signal
+	 * beyond an error_log() call; this column lets a future admin-page display (or any REST
+	 * caller reading the site job) tell "delivered" apart from "never confirmed," using the
+	 * same per-column existence check as the columns above.
 	 */
 	private static function upgrade_site_jobs_sync_columns(): void {
 		global $wpdb;
@@ -181,6 +189,7 @@ class QueueTable {
 			'sync_comment_stall_id'    => 'bigint(20) UNSIGNED NOT NULL DEFAULT 0',
 			'sync_comment_stall_count' => 'int(10) UNSIGNED NOT NULL DEFAULT 0',
 			'sync_comment_stall_note'  => 'text DEFAULT NULL',
+			'sync_webhook_token_delivered_at' => 'datetime DEFAULT NULL',
 		];
 
 		foreach ( $columns as $column => $definition ) {
