@@ -55,4 +55,47 @@ class SourceClient {
 		}
 		return $body;
 	}
+
+	/**
+	 * POST variant of get(), used by U8's token-delivery call (AdminPage::handle_enable_sync())
+	 * to push a freshly-generated sync_webhook_token to source over the same source_api_key
+	 * trust every other destination-to-source call in this class already uses — no new
+	 * bearer token is introduced for this call.
+	 */
+	public static function post( string $source_url, string $api_key, string $path, array $body = [] ): array {
+		$url = trailingslashit( $source_url ) . 'wp-json/' . HBM_API_NAMESPACE . '/' . ltrim( $path, '/' );
+
+		// Same DNS-rebinding re-check as get() — see that method's docblock.
+		$host = wp_parse_url( $url, PHP_URL_HOST );
+		if ( $host ) {
+			$ip = gethostbyname( $host );
+			if ( ! filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) ) {
+				throw new SourceClientException(
+					"Source hostname {$host} resolved to a private/reserved IP address.",
+					0,
+					false // not retryable — re-resolving won't fix a rebinding attempt
+				);
+			}
+		}
+
+		$response = wp_remote_post( $url, [
+			'headers'   => [
+				'Authorization' => 'Bearer ' . $api_key,
+				'Content-Type'  => 'application/json',
+			],
+			'body'      => wp_json_encode( $body ),
+			'timeout'   => 15,
+			'sslverify' => true,
+		] );
+		if ( is_wp_error( $response ) ) {
+			throw new SourceClientException( 'Source request failed: ' . $response->get_error_message(), 0, true );
+		}
+		$code = (int) wp_remote_retrieve_response_code( $response );
+		if ( 200 !== $code ) {
+			$retryable = $code >= 500 || 429 === $code;
+			throw new SourceClientException( "Source returned HTTP {$code} for {$path}", $code, $retryable );
+		}
+		$decoded = json_decode( wp_remote_retrieve_body( $response ), true );
+		return is_array( $decoded ) ? $decoded : [];
+	}
 }

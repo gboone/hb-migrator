@@ -72,5 +72,16 @@ class SourceEndpoints {
 			'callback'            => [ PreflightService::class, 'handle_request' ],
 			'permission_callback' => fn() => current_user_can( 'manage_network' ),
 		] );
+
+		// U8 token-delivery gap: destination's Enable Sync action (AdminPage::handle_enable_sync())
+		// calls this so source learns the per-site-job sync_webhook_token it needs to fire
+		// webhook calls — see SyncWebhook's class docblock for the full rationale. Same $auth
+		// (ApiAuth::verify_request()) as every other source endpoint; the caller authenticates
+		// with the migration's source_api_key, not a new credential.
+		register_rest_route( $ns, '/source/sync-webhook-token', [
+			'methods'             => \WP_REST_Server::CREATABLE,
+			'callback'            => [ SyncWebhook::class, 'receive_token' ],
+			'permission_callback' => $auth,
+		] );
 	}
 }

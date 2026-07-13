@@ -24,6 +24,12 @@ class Plugin {
 		// so we can't re-add to plugins_loaded at an earlier priority.
 		$this->register_action_hooks();
 
+		// Source-side content-event hooks for U8's webhook trigger. Registered
+		// unconditionally on every install — each hook is a no-op unless this blog has a
+		// sync_webhook_token on file (see Source\SyncWebhook::get_sync_config()), since this
+		// plugin runs symmetrically as source and/or destination on any given install.
+		Source\SyncWebhook::init();
+
 		if ( is_admin() || is_network_admin() ) {
 			Admin\AdminPage::init();
 		}
@@ -32,6 +38,7 @@ class Plugin {
 	public function register_rest_routes(): void {
 		Source\SourceEndpoints::register_routes();
 		Destination\MigrationReceiver::register_routes();
+		Destination\SyncReceiver::register_routes();
 		Admin\ProgressEndpoint::register_routes();
 	}
 
