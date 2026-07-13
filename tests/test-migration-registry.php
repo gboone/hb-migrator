@@ -149,6 +149,180 @@ class Test_MigrationRegistry_Sync extends WP_UnitTestCase {
 	}
 
 	// -----------------------------------------------------------------------
+	// finalize_site_job_sync() — lock-race guard (P0)
+	//
+	// finalize_site_job_sync() must not proceed with its status transition/cleanup while
+	// sync_locked_at indicates an in-flight pass — otherwise Finalize could delete a job's
+	// IdMap out from under a running SyncDispatcher pass, causing PostImporter/CommentImporter
+	// (which use IdMap::get() to decide insert-vs-update) to re-insert already-migrated rows
+	// as duplicates. The chosen mechanism mirrors claim_sync_lock()'s own staleness
+	// comparison: a FRESH lock (age < FINALIZE_LOCK_STALENESS_MINUTES) blocks finalize; a
+	// STALE lock (age >= threshold, i.e. an abandoned lock from a process that died mid-pass)
+	// does NOT block finalize, since claim_sync_lock() would reclaim it as abandoned anyway.
+	// This is a deliberate choice, not "any lock blocks regardless of staleness" — see
+	// FINALIZE_LOCK_STALENESS_MINUTES's docblock in class-migration-registry.php.
+	// -----------------------------------------------------------------------
+
+	public function test_finalize_site_job_sync_rejects_when_fresh_lock_held(): void {
+		[ , $jid ] = $this->make_complete_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+
+		// Simulate a sync pass currently in flight: claim_sync_lock() just set this a moment ago.
+		// Matches the fresh-lock convention test-sync-dispatcher.php and test-sync-receiver.php use.
+		MigrationRegistry::update_site_job( $jid, [ 'sync_locked_at' => current_time( 'mysql', true ) ] );
+
+		$this->assertFalse( MigrationRegistry::finalize_site_job_sync( $jid ), 'Finalize must be rejected while a fresh lock is held.' );
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 'syncing', $job->status, 'Job must remain syncing, not be finalized, while the lock is held.' );
+		$this->assertNull( $job->sync_finalized_at );
+		$this->assertSame( 2, IdMap::get( $jid, 'post', 1 ), 'IdMap must not be wiped while the in-flight pass could still be using it.' );
+
+		// Once the lock clears (pass completes/releases), finalize can be retried and succeeds.
+		MigrationRegistry::update_site_job( $jid, [ 'sync_locked_at' => null ] );
+		$this->assertTrue( MigrationRegistry::finalize_site_job_sync( $jid ), 'Finalize must succeed once the lock clears.' );
+		$this->assertSame( 'finalized', MigrationRegistry::get_site_job( $jid )->status );
+	}
+
+	public function test_finalize_site_job_sync_stale_lock_does_not_block(): void {
+		[ $mid, $jid ] = $this->make_complete_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+
+		// Older than FINALIZE_LOCK_STALENESS_MINUTES (10) — an abandoned lock from a process
+		// that died mid-pass (PHP timeout, OOM) without reaching release_sync_lock(). Uses the
+		// same 15-minute margin test-sync-dispatcher.php's staleness test uses for its analogous
+		// claim_sync_lock() check.
+		$stale = gmdate( 'Y-m-d H:i:s', time() - ( 15 * MINUTE_IN_SECONDS ) );
+		MigrationRegistry::update_site_job( $jid, [ 'sync_locked_at' => $stale ] );
+
+		$this->assertTrue( MigrationRegistry::finalize_site_job_sync( $jid ), 'A stale lock must not block finalize.' );
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 'finalized', $job->status );
+		$this->assertNotNull( $job->sync_finalized_at );
+		$this->assertNull( IdMap::get( $jid, 'post', 1 ), 'Cleanup must still run once finalize is allowed to proceed.' );
+
+		$migration = MigrationRegistry::get_migration( $mid );
+		$this->assertSame( '', $migration->source_api_key );
+	}
+
+	// -----------------------------------------------------------------------
+	// complete_migration() — sibling-job completion gate (P1)
+	//
+	// Once any site job on a migration legitimately leaves 'complete' (enables sync), it can
+	// never become 'complete' again ('syncing' -> 'finalized' is one-way). complete_migration()
+	// must treat 'syncing'/'finalized' siblings as "done with their pipeline" for both (a) the
+	// gate that lets the migration reach 'complete', and (b) whether cleanup should proceed —
+	// while still not letting a job stuck at 'complete' that can NEVER sync (deleted
+	// destination) permanently block either.
+	// -----------------------------------------------------------------------
+
+	/**
+	 * Builds a two-site-job migration in 'running' status, both jobs 'complete', so tests can
+	 * drive one job into syncing/finalized and observe complete_migration()'s gate and
+	 * maybe_wipe_migration_credential()'s sibling check.
+	 */
+	private function make_two_job_migration( int $dest_blog_id_a, int $dest_blog_id_b ): array {
+		$mid  = MigrationRegistry::create_migration( 'https://source.example.com', 'sharedkey', null );
+		$jidA = MigrationRegistry::create_site_job( $mid, 1, 'a.example.com', 'https://a.example.com', '', '/a/' );
+		$jidB = MigrationRegistry::create_site_job( $mid, 2, 'b.example.com', 'https://b.example.com', '', '/b/' );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		MigrationRegistry::update_site_job( $jidA, [ 'status' => 'complete', 'dest_blog_id' => $dest_blog_id_a ] );
+		MigrationRegistry::update_site_job( $jidB, [ 'status' => 'complete', 'dest_blog_id' => $dest_blog_id_b ] );
+		IdMap::set( $jidA, 'post', 1, 2 );
+		IdMap::set( $jidB, 'post', 1, 2 );
+		return [ $mid, $jidA, $jidB ];
+	}
+
+	public function test_complete_migration_reaches_complete_when_sibling_already_syncing(): void {
+		[ $mid, $jidA, $jidB ] = $this->make_two_job_migration( get_current_blog_id(), get_current_blog_id() );
+
+		// jobA already had "Enable Sync" clicked before jobB's own pipeline finished — its
+		// status is 'syncing', never 'complete' again.
+		MigrationRegistry::enable_site_job_sync( $jidA );
+		$this->assertSame( 'syncing', MigrationRegistry::get_site_job( $jidA )->status );
+
+		// jobB now finishes its own pipeline (mirrors SearchReplace::finalize()'s call pattern:
+		// mark the job complete, then ask complete_migration() to check all siblings).
+		MigrationRegistry::update_site_job( $jidB, [ 'status' => 'complete' ] );
+
+		$this->assertTrue(
+			MigrationRegistry::complete_migration( $mid ),
+			'Migration must reach complete once every job is either complete, syncing, or finalized — not stuck forever because a sibling left "complete" for "syncing".'
+		);
+		$this->assertSame( 'complete', MigrationRegistry::get_migration( $mid )->status );
+	}
+
+	public function test_complete_migration_still_blocked_by_genuinely_incomplete_sibling(): void {
+		// Regression guard: the relaxed gate must still block on a job that is actually
+		// unfinished (not complete/syncing/finalized), e.g. still running or failed.
+		[ $mid, $jidA, $jidB ] = $this->make_two_job_migration( get_current_blog_id(), get_current_blog_id() );
+		MigrationRegistry::update_site_job( $jidA, [ 'status' => 'running' ] );
+		MigrationRegistry::update_site_job( $jidB, [ 'status' => 'complete' ] );
+
+		$this->assertFalse( MigrationRegistry::complete_migration( $mid ) );
+		$this->assertSame( 'running', MigrationRegistry::get_migration( $mid )->status );
+	}
+
+	public function test_complete_migration_permanently_stuck_complete_job_does_not_block_other_jobs_cleanup(): void {
+		// jobA's destination subsite was deleted — it is permanently stuck at 'complete' and
+		// can never become sync-capable. jobB has a live destination and will go on to sync.
+		[ $mid, $jidA, $jidB ] = $this->make_two_job_migration( 999999, get_current_blog_id() );
+
+		$this->assertTrue( MigrationRegistry::complete_migration( $mid ) );
+		$this->assertSame( 'complete', MigrationRegistry::get_migration( $mid )->status );
+
+		// jobA can never sync — its own cleanup must proceed immediately, exactly like
+		// pre-sync behavior, rather than waiting on a window that will never open.
+		$this->assertNull( IdMap::get( $jidA, 'post', 1 ), "jobA's IdMap must be cleaned up immediately — it can never become sync-capable." );
+
+		// jobB is still sync-capable at this point, so the shared credential and jobB's own
+		// IdMap must both survive completion.
+		$this->assertSame( 'sharedkey', MigrationRegistry::get_migration( $mid )->source_api_key );
+		$this->assertSame( 2, IdMap::get( $jidB, 'post', 1 ) );
+
+		// jobB now enables and finalizes sync.
+		MigrationRegistry::enable_site_job_sync( $jidB );
+		MigrationRegistry::finalize_site_job_sync( $jidB );
+
+		// jobA being permanently stuck at 'complete' must NOT block the credential wipe once
+		// jobB (the only job that could still need it) has finalized — this is the bug: the
+		// old sibling check treated bare 'complete' status as "might still need it" forever.
+		$this->assertSame(
+			'',
+			MigrationRegistry::get_migration( $mid )->source_api_key,
+			"A permanently non-sync-capable sibling stuck at 'complete' must not block the credential wipe indefinitely."
+		);
+		$this->assertNull( IdMap::get( $jidB, 'post', 1 ) );
+	}
+
+	public function test_complete_migration_multi_job_no_sync_matches_original_behavior(): void {
+		// Regression guard: a multi-job migration where no job ever enables sync, and none
+		// are sync-capable (destinations deleted), must still get the original immediate
+		// cleanup for every job — the pre-sync-era behavior this method had before U1/this fix.
+		[ $mid, $jidA, $jidB ] = $this->make_two_job_migration( 999999, 999999 );
+
+		$this->assertTrue( MigrationRegistry::complete_migration( $mid ) );
+		$this->assertSame( 'complete', MigrationRegistry::get_migration( $mid )->status );
+		$this->assertSame( '', MigrationRegistry::get_migration( $mid )->source_api_key );
+		$this->assertNull( IdMap::get( $jidA, 'post', 1 ) );
+		$this->assertNull( IdMap::get( $jidB, 'post', 1 ) );
+	}
+
+	public function test_complete_migration_multi_job_both_sync_capable_defers_cleanup(): void {
+		// Regression guard: a multi-job migration where every job is complete and sync-capable
+		// but none has enabled sync yet must still defer cleanup for all of them, matching the
+		// single-job behavior already covered by test_complete_migration_defers_cleanup_when_job_sync_capable().
+		[ $mid, $jidA, $jidB ] = $this->make_two_job_migration( get_current_blog_id(), get_current_blog_id() );
+
+		$this->assertTrue( MigrationRegistry::complete_migration( $mid ) );
+		$this->assertSame( 'complete', MigrationRegistry::get_migration( $mid )->status );
+		$this->assertSame( 'sharedkey', MigrationRegistry::get_migration( $mid )->source_api_key );
+		$this->assertSame( 2, IdMap::get( $jidA, 'post', 1 ) );
+		$this->assertSame( 2, IdMap::get( $jidB, 'post', 1 ) );
+	}
+
+	// -----------------------------------------------------------------------
 	// get_syncable_site_jobs()
 	// -----------------------------------------------------------------------
 

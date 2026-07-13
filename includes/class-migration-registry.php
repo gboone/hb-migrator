@@ -94,7 +94,8 @@ class MigrationRegistry {
 	}
 
 	/**
-	 * Atomically marks the migration complete only when ALL site jobs are 'complete'.
+	 * Atomically marks the migration complete once every site job has either finished the
+	 * one-shot pipeline ('complete') or moved beyond it into sync ('syncing', 'finalized').
 	 * Returns true only if this call won (rows_affected = 1).
 	 *
 	 * The NOT EXISTS subquery replaces the previous two-step all_sites_complete()
@@ -103,15 +104,27 @@ class MigrationRegistry {
 	 * job finished and leaving the migration permanently stuck in 'running'. A single
 	 * UPDATE statement eliminates that replica-lag window entirely.
 	 *
+	 * 'syncing' and 'finalized' were added to the allowed set alongside 'complete' after a
+	 * P1 bug: this method is only ever called right after ONE site job's own pipeline just
+	 * finished (see SearchReplace::finalize()), so it always re-checks every sibling job too.
+	 * If any sibling had already had "Enable Sync" clicked, its status was 'syncing' —
+	 * never 'complete' again, since sync cannot be re-enabled — so the original
+	 * `j.status != 'complete'` gate failed forever and the migration row stayed 'running'
+	 * permanently even though every job was either done or legitimately syncing.
+	 *
 	 * The source_api_key wipe and hbm_id_map cleanup this method used to always perform
-	 * on completion are now skipped whenever the migration has at least one site job
-	 * capable of entering sync (status 'complete' with a live, non-deleted destination
-	 * subsite — the same precondition "Enable Sync" itself checks). Wiping the credential
-	 * or deleting the IdMap out from under a job that could still sync would make every
-	 * later sync pass fail outright. That cleanup instead runs per-job in
-	 * finalize_site_job_sync() once a job's sync window actually ends. A migration none of
-	 * whose jobs are sync-capable (e.g. every destination subsite was already deleted)
-	 * still gets today's immediate cleanup — see docs/plans/2026-07-13-002-feat-post-migration-content-sync-plan.md,
+	 * on completion are now skipped per-job (IdMap) / migration-wide (credential) whenever
+	 * job_cleanup_is_deferred() says a job could still need them — either it's actively
+	 * 'syncing', or it's 'complete' with a live, non-deleted destination subsite (the same
+	 * precondition "Enable Sync" itself checks), meaning "Enable Sync" could still succeed
+	 * for it. Wiping the credential or deleting the IdMap out from under a job that could
+	 * still sync (or already is) would make every later sync pass fail outright. That
+	 * cleanup instead runs per-job in finalize_site_job_sync() once a job's sync window
+	 * actually ends. A job stuck at 'complete' that can NEVER become sync-capable (e.g. its
+	 * destination subsite was deleted) is not deferred — it still gets today's original
+	 * immediate cleanup, since waiting on a sync window that will never open would block
+	 * that job's own cleanup forever. See
+	 * docs/plans/2026-07-13-002-feat-post-migration-content-sync-plan.md,
 	 * "Key Technical Decisions".
 	 */
 	public static function complete_migration( int $id ): bool {
@@ -126,7 +139,7 @@ class MigrationRegistry {
 			    AND NOT EXISTS (
 			        SELECT 1 FROM `{$jobs_table}` j
 			         WHERE j.migration_id = %d
-			           AND j.status != 'complete'
+			           AND j.status NOT IN ( 'complete', 'syncing', 'finalized' )
 			    )",
 			$id,
 			$id
@@ -134,22 +147,12 @@ class MigrationRegistry {
 		if ( $result ) {
 			$jobs = self::get_site_jobs_for_migration( $id );
 
-			$sync_capable = false;
 			foreach ( $jobs as $job ) {
-				if ( self::is_job_sync_capable( $job ) ) {
-					$sync_capable = true;
-					break;
-				}
-			}
-
-			if ( $sync_capable ) {
-				// Deferred to finalize_site_job_sync() for whichever job(s) actually sync.
-			} else {
-				foreach ( $jobs as $job ) {
+				if ( ! self::job_cleanup_is_deferred( $job ) ) {
 					IdMap::delete_for_job( (int) $job->id );
 				}
-				$wpdb->update( $table, [ 'source_api_key' => '' ], [ 'id' => $id ] );
 			}
+			self::maybe_wipe_migration_credential( $id );
 
 			// Role-assignment data is not needed by sync (roles are only applied once, at
 			// subsite creation), so this cleanup is unconditional regardless of sync capability.
@@ -169,6 +172,22 @@ class MigrationRegistry {
 		}
 		$dest_site = get_site( (int) $job->dest_blog_id );
 		return $dest_site && ! (int) $dest_site->deleted;
+	}
+
+	/**
+	 * Whether a site job's credential/IdMap cleanup must wait rather than run now: true for
+	 * a job actively mid-sync ('syncing') or still capable of entering sync from 'complete'
+	 * (is_job_sync_capable()) — both represent a real, ongoing need for the migration's
+	 * shared source_api_key and this job's own IdMap rows. False for 'finalized' (cleanup
+	 * already ran when it finalized) and for a 'complete' job that can never become
+	 * sync-capable (e.g. its destination subsite was deleted) — that job should get today's
+	 * original immediate cleanup rather than being stuck waiting on a sync window that will
+	 * never open. Shared by complete_migration() (per-job IdMap decision) and
+	 * maybe_wipe_migration_credential() (migration-wide credential decision) so both answer
+	 * "does this job still need it?" identically instead of drifting apart.
+	 */
+	private static function job_cleanup_is_deferred( object $job ): bool {
+		return 'syncing' === $job->status || self::is_job_sync_capable( $job );
 	}
 
 	public static function list_migrations(): array {
@@ -280,12 +299,38 @@ class MigrationRegistry {
 	}
 
 	/**
+	 * Staleness threshold finalize_site_job_sync() uses to decide whether a currently-set
+	 * sync_locked_at represents a genuinely in-flight pass (must block finalize) or an
+	 * abandoned lock left by a process that died mid-pass (must not block finalize forever).
+	 * Deliberately kept equal to SyncDispatcher::STALENESS_MINUTES
+	 * (includes/destination/class-sync-dispatcher.php) so "the lock is held" means the same
+	 * thing to claim_sync_lock() and to finalize — if that constant ever changes, update
+	 * this one too.
+	 */
+	private const FINALIZE_LOCK_STALENESS_MINUTES = 10;
+
+	/**
 	 * Moves a site job from 'syncing' to the terminal 'finalized' state and runs, for just
 	 * that job, the credential-wipe/IdMap cleanup complete_migration() deferred when the job
 	 * became sync-capable (see complete_migration() docblock). The migration's shared
 	 * source_api_key is only wiped once none of its site jobs could still need it (i.e. none
-	 * remain 'complete' or 'syncing') — other jobs on the same migration may still be
-	 * mid-sync and need the credential to keep authenticating to source.
+	 * remain 'syncing' or 'complete'-and-still-sync-capable — see job_cleanup_is_deferred())
+	 * — other jobs on the same migration may still be mid-sync and need the credential to
+	 * keep authenticating to source.
+	 *
+	 * The UPDATE also requires sync_locked_at to be unset or stale (P0 fix): without this,
+	 * an operator clicking "Finalize & Stop Sync" while a sync pass is actively in-flight
+	 * (holding a fresh lock via claim_sync_lock()) could have this method delete the
+	 * job's IdMap out from under that pass's PostImporter/CommentImporter calls, which use
+	 * IdMap::get() to decide insert-vs-update — with the map wiped mid-pass, they'd
+	 * re-insert already-migrated posts/comments as duplicates. This is a single atomic
+	 * UPDATE (not a SELECT-then-act check) using the same staleness comparison
+	 * claim_sync_lock() uses, so "is the lock held" is answered consistently: a fresh lock
+	 * blocks finalize; a stale/abandoned one does not (it will self-clear the next time
+	 * claim_sync_lock() reclaims and a pass completes, at which point retrying finalize
+	 * succeeds). A rejection here is indistinguishable from "job isn't 'syncing'" to the
+	 * caller — both are the same "not eligible right now, try again" outcome
+	 * handle_finalize_sync() already surfaces to the operator as a request to retry.
 	 */
 	public static function finalize_site_job_sync( int $site_job_id ): bool {
 		global $wpdb;
@@ -294,8 +339,10 @@ class MigrationRegistry {
 			"UPDATE `{$table}`
 			    SET status = 'finalized', sync_finalized_at = NOW()
 			  WHERE id = %d
-			    AND status = 'syncing'",
-			$site_job_id
+			    AND status = 'syncing'
+			    AND ( sync_locked_at IS NULL OR sync_locked_at < NOW() - INTERVAL %d MINUTE )",
+			$site_job_id,
+			self::FINALIZE_LOCK_STALENESS_MINUTES
 		) );
 		if ( ! $result ) {
 			return false;
@@ -382,15 +429,20 @@ class MigrationRegistry {
 	}
 
 	/**
-	 * Wipes hbm_migrations.source_api_key only once no site job on the migration is still
-	 * 'complete' or 'syncing' — i.e. no job remains that could either enable sync or is
-	 * already mid-sync and needs the credential for its next pass.
+	 * Wipes hbm_migrations.source_api_key only once no site job on the migration still needs
+	 * it per job_cleanup_is_deferred() — i.e. none remain 'syncing' or 'complete'-and-still-
+	 * sync-capable. A job merely 'complete' but permanently unable to ever sync (destination
+	 * subsite deleted) does NOT count as still needing it — treating it as a blocker would
+	 * leave the credential (and, via complete_migration(), every other job's IdMap) stuck
+	 * un-wiped forever, even after every job that could actually use it has finished or
+	 * finalized. This was a real bug: the previous version blocked on bare 'complete'
+	 * status regardless of sync capability.
 	 */
 	private static function maybe_wipe_migration_credential( int $migration_id ): void {
 		global $wpdb;
 		$jobs = self::get_site_jobs_for_migration( $migration_id );
 		foreach ( $jobs as $job ) {
-			if ( in_array( $job->status, [ 'complete', 'syncing' ], true ) ) {
+			if ( self::job_cleanup_is_deferred( $job ) ) {
 				return;
 			}
 		}
