@@ -108,9 +108,11 @@ class Test_SiteIndex extends WP_UnitTestCase {
 	}
 
 	public function test_history_capped_at_ten_entries(): void {
-		// Pre-fill with 10 entries.
+		// Pre-fill with 10 entries, newest first (index 0) — matching save_history_entry()'s
+		// own array_unshift() ordering, so migration_id=10 is the newest of the pre-existing
+		// batch and migration_id=1 is genuinely the oldest (last index).
 		$existing = [];
-		for ( $i = 1; $i <= 10; $i++ ) {
+		for ( $i = 10; $i >= 1; $i-- ) {
 			$existing[] = [ 'migration_id' => $i, 'status' => 'complete', 'sites' => [], 'dest_url' => '', 'started_at' => 0, 'saved_at' => 0 ];
 		}
 		update_site_option( 'hbm_migration_history', $existing );

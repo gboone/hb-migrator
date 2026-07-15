@@ -99,7 +99,12 @@ class Test_MigrationRegistry extends WP_UnitTestCase {
 
 	public function test_schema_upgrade_updates_version(): void {
 		delete_site_option( 'hbm_db_version' );
+		// maybe_create_or_upgrade() only runs in an admin or WP_CLI context (race-avoidance
+		// guard) — set_current_screen() makes is_admin() report true so this test can exercise
+		// the real upgrade path instead of the guard.
+		set_current_screen( 'dashboard' );
 		QueueTable::maybe_create_or_upgrade();
+		set_current_screen( 'front' );
 		$this->assertSame( HBM_DB_VERSION, (int) get_site_option( 'hbm_db_version' ) );
 	}
 }

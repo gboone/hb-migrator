@@ -141,6 +141,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			$this->markTestSkipped( 'handle_start_migration() requires multisite network.' );
 		}
 
+		$this->login_as_network_admin();
 		update_site_option( 'hbm_dest_url', 'https://93.184.216.34' );
 		update_site_option( 'hbm_dest_key', 'test-key' );
 
@@ -161,6 +162,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			'site_ids'            => [ 1 ],
 			'user_conflict_policy' => 'create',
 		];
+		$_REQUEST = $_POST;
 
 		// Call handle_start_migration() without the exit — we test the request body directly.
 		try {
@@ -180,6 +182,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			$this->markTestSkipped( 'handle_start_migration() requires multisite network.' );
 		}
 
+		$this->login_as_network_admin();
 		update_site_option( 'hbm_dest_url', 'https://93.184.216.34' );
 		update_site_option( 'hbm_dest_key', 'test-key' );
 
@@ -200,6 +203,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			'site_ids' => [ 1 ],
 			// No policy fields.
 		];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_start_migration();
@@ -224,6 +228,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			$this->markTestSkipped( 'handle_start_migration() requires multisite network.' );
 		}
 
+		$this->login_as_network_admin();
 		update_site_option( 'hbm_dest_url', 'https://93.184.216.34' );
 		update_site_option( 'hbm_dest_key', 'test-key' );
 
@@ -238,6 +243,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		} );
 
 		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_start_migration' ), 'site_ids' => [ 1 ] ];
+		$_REQUEST = $_POST;
 
 		$before = time();
 		try {
@@ -256,6 +262,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 	// -------------------------------------------------------------------------
 
 	public function test_handle_clear_migration_saves_history_entry_before_deleting(): void {
+		$this->login_as_network_admin();
 		update_site_option( 'hbm_active_migration', [
 			'migration_id' => 55,
 			'dest_url'     => 'https://93.184.216.34',
@@ -287,6 +294,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		}, 10, 3 );
 
 		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_clear_migration();
@@ -304,6 +312,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 	}
 
 	public function test_handle_clear_migration_saves_unknown_status_when_destination_unreachable(): void {
+		$this->login_as_network_admin();
 		update_site_option( 'hbm_active_migration', [
 			'migration_id' => 66,
 			'dest_url'     => 'https://93.184.216.34',
@@ -318,6 +327,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		} );
 
 		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_clear_migration();
@@ -344,6 +354,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 	// -------------------------------------------------------------------------
 
 	public function test_handle_clear_migration_finalizes_and_unschedules_syncing_site_jobs(): void {
+		$this->login_as_network_admin();
 		[ $mid, $jid ] = $this->make_complete_site_job( get_current_blog_id() );
 		MigrationRegistry::enable_site_job_sync( $jid );
 		SyncScheduler::schedule( $jid );
@@ -362,6 +373,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		$this->mock_clear_migration_destination_calls();
 
 		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_clear_migration();
@@ -381,6 +393,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 	}
 
 	public function test_handle_clear_migration_finalizes_every_syncing_job_but_not_other_migrations(): void {
+		$this->login_as_network_admin();
 		[ $mid, $jid1 ] = $this->make_complete_site_job( get_current_blog_id() );
 		$jid2 = MigrationRegistry::create_site_job( $mid, 2, 'sync2.example.com', 'https://sync2.example.com', '', '/sync2/' );
 		MigrationRegistry::update_site_job( $jid2, [ 'status' => 'complete', 'dest_blog_id' => get_current_blog_id() ] );
@@ -406,6 +419,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		$this->mock_clear_migration_destination_calls();
 
 		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_clear_migration();
@@ -426,6 +440,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		// Regression guard: a migration whose site job never enabled sync must clear exactly as
 		// it did before this fix — no status change on the job, history saved, active option
 		// deleted.
+		$this->login_as_network_admin();
 		[ $mid, $jid ] = $this->make_complete_site_job( get_current_blog_id() );
 
 		update_site_option( 'hbm_active_migration', [
@@ -439,6 +454,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		$this->mock_clear_migration_destination_calls();
 
 		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_clear_migration();
@@ -457,6 +473,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 	public function test_handle_clear_migration_with_no_active_migration_id_does_not_error(): void {
 		// No migration_id at all in hbm_active_migration — stop_syncing_jobs_for_migration()
 		// must not be reached/must not error when there is nothing to look up.
+		$this->login_as_network_admin();
 		update_site_option( 'hbm_active_migration', [
 			'dest_url'     => '',
 			'dest_key'     => '',
@@ -465,6 +482,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		] );
 
 		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_clear_migration();
@@ -562,6 +580,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			'_wpnonce'    => wp_create_nonce( 'hbm_enable_sync' ),
 			'site_job_id' => $jid,
 		];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_enable_sync();
@@ -680,6 +699,7 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			'_wpnonce'    => wp_create_nonce( 'hbm_finalize_sync' ),
 			'site_job_id' => $jid,
 		];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_finalize_sync();

@@ -191,7 +191,7 @@ class TermImporter {
 		}
 
 		$code = $result->get_error_code();
-		if ( 'blog_slug_already_exists' !== $code ) {
+		if ( 'site_taken' !== $code ) {
 			throw new \RuntimeException( 'Could not create subsite: ' . $result->get_error_message() );
 		}
 

@@ -163,6 +163,11 @@ class Test_SyncDispatcher extends WP_UnitTestCase {
 	}
 
 	public function test_stale_lock_is_reclaimed(): void {
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'claim_sync_lock() uses MySQL-only NOW() - INTERVAL syntax — no SQLite equivalent.' );
+		}
+
 		$jid = $this->make_syncing_job();
 
 		// Simulate a lock left behind by a process killed mid-pass, well past the

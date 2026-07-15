@@ -70,7 +70,11 @@ class Test_SyncReceiver extends WP_UnitTestCase {
 	 * @return array{0:int,1:int} [ migration_id, site_job_id ]
 	 */
 	private function make_complete_site_job( int $dest_blog_id ): array {
-		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'testkey', null );
+		// SourceClient::post()/get() resolve the source_url's hostname via gethostbyname() and
+		// reject a private/reserved result (SSRF guard) — a non-resolving placeholder hostname
+		// like source.example.com fails that check before pre_http_request is ever consulted.
+		// Use a real public IP, matching the convention other test files use.
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'testkey', null );
 		$jid = MigrationRegistry::create_site_job( $mid, 1, 'sync.example.com', 'https://sync.example.com', '', '/sync/' );
 		MigrationRegistry::update_migration_status( $mid, 'running' );
 		MigrationRegistry::update_site_job( $jid, [ 'status' => 'complete', 'dest_blog_id' => $dest_blog_id ] );

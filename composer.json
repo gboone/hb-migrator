@@ -1,0 +1,17 @@
+{
+    "name": "hb-migrator/hb-migrator",
+    "description": "HB Migrator WordPress plugin",
+    "type": "wordpress-plugin",
+    "authors": [
+        {
+            "name": "Greg Boone",
+            "email": "greg.boone@automattic.com"
+        }
+    ],
+    "minimum-stability": "stable",
+    "require-dev": {
+        "phpunit/phpunit": "^9.6",
+        "wp-phpunit/wp-phpunit": "^7.0",
+        "yoast/phpunit-polyfills": "^4.0"
+    }
+}

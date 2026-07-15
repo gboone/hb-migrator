@@ -95,6 +95,7 @@ class PostImporter {
 
 		$max_id     = 0;
 		$failed_ids = [];
+		$touched_ids = [];
 
 		switch_to_blog( (int) $job->dest_blog_id );
 		wp_suspend_cache_invalidation( true );
@@ -210,6 +211,7 @@ class PostImporter {
 
 				// Preserve comment_count — wp_insert_post/wp_update_post ignore this field.
 				$wpdb->update( $wpdb->posts, [ 'comment_count' => (int) ( $p['comment_count'] ?? 0 ) ], [ 'ID' => $dest_id ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				$touched_ids[] = $dest_id;
 
 				// Set terms by slug.
 				$terms_by_tax = [];
@@ -227,6 +229,13 @@ class PostImporter {
 		} finally {
 			kses_init_filters();
 			wp_suspend_cache_invalidation( false );
+			// Suspending invalidation above skipped, rather than deferred, every
+			// clean_post_cache() call wp_insert_post()/wp_update_post() would normally
+			// have made — clean explicitly now so touched posts don't serve stale
+			// cached data (comment_count, title, etc.) from a persistent object cache.
+			foreach ( $touched_ids as $touched_id ) {
+				clean_post_cache( $touched_id );
+			}
 			restore_current_blog();
 		}
 

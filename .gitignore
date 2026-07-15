@@ -1,1 +1,8 @@
 .claude/worktrees/
+
+# Test-execution infrastructure (see docs/testing.md) — not part of the plugin itself.
+/vendor/
+/.wordpress-core/
+/.phpunit.cache/
+/.phpunit.result.cache
+/tests/.generated/

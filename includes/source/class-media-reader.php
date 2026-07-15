@@ -105,6 +105,9 @@ class MediaReader {
 			];
 
 			if ( $attached_only ) {
+				// get_posts() defaults suppress_filters to true, which would otherwise make
+				// this posts_where addition silently do nothing.
+				$query_args['suppress_filters'] = false;
 				$parent_filter = static function ( string $where ) use ( $wpdb ): string {
 					return $where . " AND {$wpdb->posts}.post_parent > 0";
 				};

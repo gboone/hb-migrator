@@ -171,14 +171,19 @@ class SearchReplace {
 	private static function replace_in_column( string $table, string $col, array $replacements, int $from_pk, float $started ): ?int {
 		global $wpdb;
 
-		$pk_col  = false !== strpos( $table, 'postmeta' ) ? 'meta_id' : 'ID';
-		$last_pk = $from_pk;
-		$batch   = 200;
+		$is_postmeta = false !== strpos( $table, 'postmeta' );
+		$pk_col      = $is_postmeta ? 'meta_id' : 'ID';
+		// cache_col identifies which post/comment cache entry a changed row belongs to —
+		// same as pk_col for posts/comments, but postmeta's own pk (meta_id) isn't a cache
+		// key on its own, so its owning post_id is selected instead (see replace_rows()).
+		$cache_col = $is_postmeta ? 'post_id' : $pk_col;
+		$last_pk   = $from_pk;
+		$batch     = 200;
 
 		while ( true ) {
 			// Keyset pagination — stable under concurrent writes, O(n) instead of O(n²).
 			$rows = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-				"SELECT {$pk_col} AS pk, `{$col}` AS val FROM `{$table}` WHERE {$pk_col} > %d ORDER BY {$pk_col} ASC LIMIT %d",
+				"SELECT {$pk_col} AS pk, `{$cache_col}` AS cache_id, `{$col}` AS val FROM `{$table}` WHERE {$pk_col} > %d ORDER BY {$pk_col} ASC LIMIT %d",
 				$last_pk,
 				$batch
 			), ARRAY_A );
@@ -207,7 +212,10 @@ class SearchReplace {
 	 * @param string $table
 	 * @param string $col      Column to update.
 	 * @param string $pk_col   Primary-key column used for the UPDATE ... WHERE clause.
-	 * @param array  $rows     Already-fetched rows, each an ARRAY_A row with 'pk' and 'val' keys.
+	 * @param array  $rows     Already-fetched rows, each an ARRAY_A row with 'pk', 'cache_id',
+	 *                         and 'val' keys — 'cache_id' identifies the post/comment cache
+	 *                         entry to invalidate (see replace_in_column()/
+	 *                         replace_in_column_scoped()).
 	 * @param array  $replacements
 	 * @return int  The pk of the last row processed (0 if $rows is empty).
 	 */
@@ -220,6 +228,16 @@ class SearchReplace {
 			$replaced = self::safe_replace( $original, $replacements );
 			if ( $replaced !== $original ) {
 				$wpdb->update( $table, [ $col => $replaced ], [ $pk_col => $row['pk'] ] ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+				// This direct write bypasses wp_update_post()/wp_update_comment()'s own cache
+				// cleanup, so a cached WP_Post/WP_Comment object (or, for postmeta, the
+				// post's cached meta array) would otherwise still hold the pre-replacement
+				// value — the same object-cache-staleness class of bug fixed for
+				// PostImporter/CommentImporter's own direct writes.
+				if ( $wpdb->comments === $table ) {
+					clean_comment_cache( (int) $row['cache_id'] );
+				} else {
+					clean_post_cache( (int) $row['cache_id'] );
+				}
 			}
 			$last_pk = (int) $row['pk'];
 		}
@@ -287,6 +305,28 @@ class SearchReplace {
 				$result[ $new_key ] = self::safe_replace( $v, $replacements );
 			}
 			return $result;
+		}
+
+		if ( $value instanceof \__PHP_Incomplete_Class ) {
+			// A serialized object for a class not loaded in this process (allowed_classes:false
+			// above turns it into this rather than instantiating the real class — the object
+			// injection guard). PHP forbids writing properties directly on an incomplete-class
+			// object, so properties can't be replaced in place. Instead, hand-build a fresh
+			// serialized representation with the replaced property values and unserialize it
+			// again — producing a new, correctly-typed __PHP_Incomplete_Class instance (same
+			// external class name) that composes correctly whether this call is the top-level
+			// replacement or nested inside an outer array/object being serialized by the
+			// caller.
+			$props      = (array) $value;
+			$class_name = (string) ( $props['__PHP_Incomplete_Class_Name'] ?? '' );
+			unset( $props['__PHP_Incomplete_Class_Name'] );
+
+			$body = '';
+			foreach ( $props as $k => $v ) {
+				$body .= serialize( (string) $k ) . serialize( self::safe_replace( $v, $replacements ) );
+			}
+			$rebuilt = 'O:' . strlen( $class_name ) . ':"' . $class_name . '":' . count( $props ) . ':{' . $body . '}';
+			return unserialize( $rebuilt, [ 'allowed_classes' => false ] ); // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
 		}
 
 		if ( ! is_string( $value ) ) {
@@ -419,8 +459,11 @@ class SearchReplace {
 		}
 
 		$placeholders = implode( ',', array_fill( 0, count( $ids ), '%d' ) );
-		$rows         = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
-			"SELECT `{$pk_col}` AS pk, `{$col}` AS val FROM `{$table}` WHERE `{$filter_col}` IN ({$placeholders})",
+		// filter_col also identifies the post/comment cache entry each row belongs to (see
+		// replace_rows()) — for posts/comments it's the same column as pk_col; for postmeta
+		// it's post_id, which pk_col (meta_id) alone can't provide.
+		$rows = $wpdb->get_results( $wpdb->prepare( // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+			"SELECT `{$pk_col}` AS pk, `{$filter_col}` AS cache_id, `{$col}` AS val FROM `{$table}` WHERE `{$filter_col}` IN ({$placeholders})",
 			$ids
 		), ARRAY_A );
 

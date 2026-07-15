@@ -100,7 +100,8 @@ class Test_SyncWebhook extends WP_UnitTestCase {
 		// autosave revision — more reliable than hand-constructing a post_name convention
 		// that could drift from core's exact format across WP versions.
 		$autosave_id = wp_create_post_autosave( [
-			'ID'           => $post_id,
+			'post_ID'      => $post_id,
+			'post_type'    => 'post',
 			'post_title'   => 'Autosaved title',
 			'post_content' => 'Autosaved content',
 		] );

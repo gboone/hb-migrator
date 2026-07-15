@@ -15,11 +15,19 @@ class QueueTable {
 			return;
 		}
 
+		self::install();
+		update_site_option( 'hbm_db_version', HBM_DB_VERSION );
+	}
+
+	/**
+	 * Unconditional install/upgrade, without the admin/WP_CLI context guard above.
+	 * Exposed so test bootstraps can install the schema outside a real request context.
+	 */
+	public static function install(): void {
 		self::create_tables();
 		self::upgrade_indexes();
 		self::upgrade_site_jobs_sync_columns();
 		self::drop_old_tables();
-		update_site_option( 'hbm_db_version', HBM_DB_VERSION );
 	}
 
 	private static function create_tables(): void {

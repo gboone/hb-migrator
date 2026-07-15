@@ -175,11 +175,16 @@ class Test_Post_Reader extends WP_UnitTestCase {
 			'post_status'    => 'inherit',
 			'post_mime_type' => 'image/jpeg',
 		] );
+		// A non-attachment post modified within the cursor window, so the response is
+		// non-empty and the exclusion loop below actually exercises an assertion.
+		$this->insert_post();
 
 		$cursor   = gmdate( 'Y-m-d H:i:s', time() - HOUR_IN_SECONDS );
 		$response = PostReader::get_posts( $this->make_request( [ 'modified_since' => $cursor ] ) );
 
-		foreach ( $response->get_data() as $p ) {
+		$data = $response->get_data();
+		$this->assertNotEmpty( $data, 'Precondition: response must include the non-attachment post for this test to be meaningful.' );
+		foreach ( $data as $p ) {
 			$this->assertNotSame( 'attachment', $p['post_type'] );
 		}
 	}

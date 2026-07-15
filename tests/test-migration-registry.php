@@ -185,6 +185,11 @@ class Test_MigrationRegistry_Sync extends WP_UnitTestCase {
 	}
 
 	public function test_finalize_site_job_sync_stale_lock_does_not_block(): void {
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'finalize_site_job_sync() uses MySQL-only NOW() - INTERVAL syntax — no SQLite equivalent.' );
+		}
+
 		[ $mid, $jid ] = $this->make_complete_job( get_current_blog_id() );
 		MigrationRegistry::enable_site_job_sync( $jid );
 

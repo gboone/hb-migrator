@@ -82,7 +82,8 @@ class Test_SyncScheduler extends WP_UnitTestCase {
 
 		$schedule = $action->get_schedule();
 		$this->assertInstanceOf( \ActionScheduler_IntervalSchedule::class, $schedule, 'schedule() must register a recurring action, not a one-shot.' );
-		$this->assertSame( 15 * MINUTE_IN_SECONDS, $schedule->interval_in_seconds(), 'Default interval must be 15 minutes (900 seconds).' );
+		// interval_in_seconds() is deprecated since Action Scheduler 3.0.0 in favor of get_recurrence().
+		$this->assertSame( 15 * MINUTE_IN_SECONDS, (int) $schedule->get_recurrence(), 'Default interval must be 15 minutes (900 seconds).' );
 	}
 
 	public function test_schedule_interval_is_filterable(): void {
@@ -94,7 +95,8 @@ class Test_SyncScheduler extends WP_UnitTestCase {
 
 		$action   = $this->find_pending_sync_action( $jid );
 		$schedule = $action->get_schedule();
-		$this->assertSame( 300, $schedule->interval_in_seconds(), 'hbm_sync_interval filter must override the default interval.' );
+		// interval_in_seconds() is deprecated since Action Scheduler 3.0.0 in favor of get_recurrence().
+		$this->assertSame( 300, (int) $schedule->get_recurrence(), 'hbm_sync_interval filter must override the default interval.' );
 	}
 
 	public function test_unschedule_removes_recurring_action_and_no_further_passes_are_scheduled(): void {
@@ -161,6 +163,7 @@ class Test_SyncScheduler extends WP_UnitTestCase {
 			'_wpnonce'    => wp_create_nonce( 'hbm_enable_sync' ),
 			'site_job_id' => $jid,
 		];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_enable_sync();
@@ -187,6 +190,7 @@ class Test_SyncScheduler extends WP_UnitTestCase {
 			'_wpnonce'    => wp_create_nonce( 'hbm_finalize_sync' ),
 			'site_job_id' => $jid,
 		];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_finalize_sync();
@@ -211,6 +215,7 @@ class Test_SyncScheduler extends WP_UnitTestCase {
 			'_wpnonce'    => wp_create_nonce( 'hbm_finalize_sync' ),
 			'site_job_id' => $jid1,
 		];
+		$_REQUEST = $_POST;
 
 		try {
 			AdminPage::handle_finalize_sync();

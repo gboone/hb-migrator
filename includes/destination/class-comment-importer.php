@@ -94,7 +94,7 @@ class CommentImporter {
 				}
 
 				$dest_parent_id = 0;
-				if ( (int) $c['comment_parent'] > 0 ) {
+				if ( (int) $c['comment_parent'] > 0 && ! in_array( $source_id, $force_top_level_ids, true ) ) {
 					$dest_parent_id = IdMap::get( $site_job_id, 'comment', (int) $c['comment_parent'] );
 					if ( null === $dest_parent_id ) {
 						// Parent comment not yet synced (or never will be, e.g. filtered on
@@ -193,6 +193,11 @@ class CommentImporter {
 					],
 					[ 'comment_ID' => $dest_id ]
 				);
+				// The direct write above bypasses wp_update_comment()'s own cache cleanup, so
+				// a cached WP_Comment object (from wp_update_comment()'s recomputed
+				// comment_date_gmt, or from the insert branch) would otherwise still hold the
+				// pre-update value.
+				clean_comment_cache( $dest_id );
 			}
 		} finally {
 			restore_current_blog();

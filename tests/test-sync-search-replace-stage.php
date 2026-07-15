@@ -185,6 +185,11 @@ class Test_SyncSearchReplaceStage extends WP_UnitTestCase {
 	// -------------------------------------------------------------------------
 
 	public function test_newly_synced_post_thumbnail_id_is_remapped_to_new_attachment(): void {
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'remap_postmeta_ids_scoped() uses MySQL-only UPDATE...JOIN syntax — no SQLite equivalent.' );
+		}
+
 		$this->mock_response( '/posts', [
 			$this->make_source_post( [ 'ID' => 6, 'post_content' => 'No URL here.' ] ),
 		] );
@@ -226,6 +231,11 @@ class Test_SyncSearchReplaceStage extends WP_UnitTestCase {
 	// -------------------------------------------------------------------------
 
 	public function test_untouched_posts_thumbnail_id_is_left_alone_by_scoped_pass(): void {
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'remap_postmeta_ids_scoped() uses MySQL-only UPDATE...JOIN syntax — no SQLite equivalent.' );
+		}
+
 		$touched_post = self::factory()->post->create();
 		IdMap::set( $this->jid, 'post', 100, $touched_post );
 		IdMap::set( $this->jid, 'attachment', 1, 111 );

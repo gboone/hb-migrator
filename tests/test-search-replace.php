@@ -180,6 +180,10 @@ class Test_SearchReplace_Remap extends WP_UnitTestCase {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'remap_postmeta_ids() requires multisite.' );
 		}
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'remap_postmeta_ids() uses MySQL-only UPDATE...JOIN syntax — no SQLite equivalent.' );
+		}
 
 		$post_id = $this->create_post_with_thumbnail( $this->blog_id, 99 );
 		IdMap::set( $this->jid, 'attachment', 99, 42 );
@@ -214,6 +218,10 @@ class Test_SearchReplace_Remap extends WP_UnitTestCase {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'remap_postmeta_ids() requires multisite.' );
 		}
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'remap_postmeta_ids() uses MySQL-only UPDATE...JOIN syntax — no SQLite equivalent.' );
+		}
 
 		$post_a = $this->create_post_with_thumbnail( $this->blog_id, 100 );
 		$post_b = $this->create_post_with_thumbnail( $this->blog_id, 200 );
@@ -233,6 +241,10 @@ class Test_SearchReplace_Remap extends WP_UnitTestCase {
 	public function test_remap_remaps_only_posts_with_id_map_entries(): void {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'remap_postmeta_ids() requires multisite.' );
+		}
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'remap_postmeta_ids() uses MySQL-only UPDATE...JOIN syntax — no SQLite equivalent.' );
 		}
 
 		$post_mapped   = $this->create_post_with_thumbnail( $this->blog_id, 300 );
@@ -342,6 +354,10 @@ class Test_SearchReplace_Scoped extends WP_UnitTestCase {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'replace_scoped() requires multisite.' );
 		}
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'remap_postmeta_ids_scoped() uses MySQL-only UPDATE...JOIN syntax — no SQLite equivalent.' );
+		}
 
 		$post_id = $this->create_post( 'No URL here.' );
 		switch_to_blog( $this->blog_id );
@@ -368,6 +384,10 @@ class Test_SearchReplace_Scoped extends WP_UnitTestCase {
 	public function test_scoped_replace_leaves_untouched_posts_thumbnail_id_alone(): void {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'replace_scoped() requires multisite.' );
+		}
+		global $wpdb;
+		if ( $wpdb instanceof \WP_SQLite_DB ) {
+			$this->markTestSkipped( 'remap_postmeta_ids_scoped() uses MySQL-only UPDATE...JOIN syntax — no SQLite equivalent.' );
 		}
 
 		$touched_post   = $this->create_post( 'No URL here.' );
