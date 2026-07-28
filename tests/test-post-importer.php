@@ -364,4 +364,108 @@ class Test_PostImporter extends WP_UnitTestCase {
 		$this->assertFalse( $rows[0]['success'] );
 		$this->assertArrayHasKey( 'error', $rows[0] );
 	}
+
+	// -------------------------------------------------------------------------
+	// U5: write-action trail for posts (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U5. Write-action trail:
+	// posts and media (sync-gated)"). import_batch() is the only method PostSyncStage also
+	// calls, so the status gate below is the single most important test in this file — a leak
+	// here would mean audit data silently appearing for out-of-scope sync passes.
+	// -------------------------------------------------------------------------
+
+	private function get_write_trail_rows(): array {
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+		return $rows;
+	}
+
+	/**
+	 * Critical, non-obvious behavior (plan's explicit Execution note): a call to import_batch()
+	 * for a site job whose status is NOT pending/running (simulating PostSyncStage's own call,
+	 * which only ever runs while status is 'syncing') must produce ZERO write-trail entries.
+	 */
+	public function test_import_batch_records_no_write_trail_entries_when_site_job_is_syncing(): void {
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'syncing' ] );
+
+		$post = $this->make_source_post( [ 'ID' => 700 ] );
+		PostImporter::import_batch( $this->jid, [ $post ] );
+
+		$this->assertCount(
+			0,
+			$this->get_write_trail_rows(),
+			'A sync-context (status: syncing) call to import_batch() must not produce any write-trail entries.'
+		);
+	}
+
+	/** Same gate, for the 'complete' status (also used by the sync pipeline's own callers). */
+	public function test_import_batch_records_no_write_trail_entries_when_site_job_is_complete(): void {
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'complete' ] );
+
+		$post = $this->make_source_post( [ 'ID' => 701 ] );
+		PostImporter::import_batch( $this->jid, [ $post ] );
+
+		$this->assertCount(
+			0,
+			$this->get_write_trail_rows(),
+			'A sync-context (status: complete) call to import_batch() must not produce any write-trail entries.'
+		);
+	}
+
+	public function test_import_batch_records_created_entry_with_raw_source_fields_for_new_post(): void {
+		// Site job status is 'pending' by default from set_up() — the initial-migration context.
+		$post = $this->make_source_post( [
+			'ID'            => 710,
+			'post_content'  => 'Raw source content.',
+			'post_excerpt'  => 'Raw source excerpt.',
+			'post_author_email' => 'author@example.com',
+			'meta'          => [ [ 'key' => '_custom_field', 'value' => 'custom-value' ] ],
+		] );
+
+		PostImporter::import_batch( $this->jid, [ $post ] );
+
+		$rows = $this->get_write_trail_rows();
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'write', $rows[0]['type'] );
+		$this->assertSame( 'post', $rows[0]['object_type'] );
+		$this->assertSame( 710, $rows[0]['source_id'] );
+		$this->assertSame( 'created', $rows[0]['outcome'] );
+		$this->assertSame( 'Raw source content.', $rows[0]['post_content'] );
+		$this->assertSame( 'Raw source excerpt.', $rows[0]['post_excerpt'] );
+		$this->assertSame( 'author@example.com', $rows[0]['source_author'] );
+		$this->assertSame( [ [ 'key' => '_custom_field', 'value' => 'custom-value' ] ], $rows[0]['meta'] );
+	}
+
+	public function test_import_batch_records_updated_entry_for_already_mapped_retried_item(): void {
+		$post = $this->make_source_post( [ 'ID' => 720 ] );
+		PostImporter::import_batch( $this->jid, [ $post ] );
+
+		// Same batch re-processed (resumed/retried pass) — the item is already IdMap-mapped.
+		PostImporter::import_batch( $this->jid, [ $post ] );
+
+		$rows = $this->get_write_trail_rows();
+		$this->assertCount( 2, $rows, 'Each attempt gets its own trail entry (request-trail-style duplication).' );
+		$this->assertSame( 'created', $rows[0]['outcome'] );
+		$this->assertSame( 'updated', $rows[1]['outcome'], 'A retried already-mapped item must be recorded as updated, not created (no double-counting).' );
+	}
+
+	public function test_import_batch_records_failed_entry_tagged_to_correct_source_id(): void {
+		add_filter( 'wp_insert_post_empty_content', function ( $maybe_empty, $postarr ) {
+			if ( 'FAIL_ME' === ( $postarr['post_title'] ?? '' ) ) {
+				return true;
+			}
+			return $maybe_empty;
+		}, 10, 2 );
+
+		$post = $this->make_source_post( [ 'ID' => 730, 'post_title' => 'FAIL_ME' ] );
+		PostImporter::import_batch( $this->jid, [ $post ] );
+
+		$rows = $this->get_write_trail_rows();
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'failed', $rows[0]['outcome'] );
+		$this->assertSame( 730, $rows[0]['source_id'] );
+
+		remove_all_filters( 'wp_insert_post_empty_content' );
+	}
 }
