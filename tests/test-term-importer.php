@@ -7,6 +7,7 @@
  * unit tests here isolate the path-collision logic directly.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\TermImporter;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\QueueTable;
@@ -334,5 +335,102 @@ class Test_Term_Importer extends WP_UnitTestCase {
 		$this->assertSame( $live_id, (int) $job->dest_blog_id, 'dest_blog_id must NOT be changed when blog is live.' );
 
 		wp_delete_site( $live_id );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: request-trail capture for TermImporter's source/sites/{id}/terms listing (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U3. Request-trail
+	// capture at every outbound source call"). TermImporter is site-job-scoped, so entries
+	// are recorded via AuditReport::record() (scope: site_job).
+	// -------------------------------------------------------------------------
+
+	public function test_process_records_site_job_scoped_request_trail_entry_on_success(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'process() requires multisite.' );
+		}
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/audit-term-success/' );
+
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/source/sites/' ) && false !== strpos( $url, '/terms' ) ) {
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => wp_json_encode( [
+						[ 'term_id' => 1, 'name' => 'Cat', 'slug' => 'cat', 'taxonomy' => 'category', 'parent' => 0, 'description' => '' ],
+					] ),
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		TermImporter::process( $jid, 0, 0 );
+
+		remove_all_filters( 'pre_http_request' );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertTrue( $rows[0]['success'] );
+		$this->assertSame( 1, $rows[0]['count'] );
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		if ( $job->dest_blog_id ) {
+			wp_delete_site( (int) $job->dest_blog_id );
+		}
+	}
+
+	public function test_process_records_failed_request_trail_entry_when_source_unreachable(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'process() requires multisite.' );
+		}
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/audit-term-fail/' );
+
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/source/sites/' ) && false !== strpos( $url, '/terms' ) ) {
+				return [
+					'response' => [ 'code' => 500, 'message' => 'Internal Server Error' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		TermImporter::process( $jid, 0, 0 );
+
+		remove_all_filters( 'pre_http_request' );
+
+		// Existing error-handling behavior is unchanged by U3: a retryable failure at
+		// attempt 0 is rescheduled by PipelineController, not marked failed outright.
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertNotSame( 'failed', $job->status );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertFalse( $rows[0]['success'] );
+		$this->assertArrayHasKey( 'error', $rows[0] );
+
+		if ( $job->dest_blog_id ) {
+			wp_delete_site( (int) $job->dest_blog_id );
+		}
 	}
 }

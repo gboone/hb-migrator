@@ -7,6 +7,7 @@
  * validation without a real DNS lookup.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\OptionImporter;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\QueueTable;
@@ -203,5 +204,62 @@ class Test_OptionImporter extends WP_UnitTestCase {
 		$active = (array) get_option( 'active_plugins', [] );
 		$this->assertNotContains( '../../wp-config.php', $active );
 		$this->assertNotContains( '../../../secrets.php', $active );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: request-trail capture for OptionImporter's source/sites/{id}/options listing (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U3. Request-trail
+	// capture at every outbound source call"). OptionImporter is site-job-scoped, so entries
+	// are recorded via AuditReport::record() (scope: site_job).
+	// -------------------------------------------------------------------------
+
+	public function test_process_records_site_job_scoped_request_trail_entry_on_success(): void {
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'audit-trail-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertTrue( $rows[0]['success'] );
+		$this->assertSame( 1, $rows[0]['count'] );
+	}
+
+	public function test_process_records_failed_request_trail_entry_when_source_unreachable(): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/options' ) ) {
+				return [
+					'response' => [ 'code' => 500, 'message' => 'Internal Server Error' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		// Existing error-handling behavior is unchanged by U3: a retryable failure at
+		// attempt 0 is rescheduled by PipelineController, not marked failed outright.
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertNotSame( 'failed', $job->status );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertFalse( $rows[0]['success'] );
+		$this->assertArrayHasKey( 'error', $rows[0] );
 	}
 }

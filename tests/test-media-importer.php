@@ -3,6 +3,7 @@
  * Tests for MediaImporter media conflict policy behaviour.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\MediaImporter;
 use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
@@ -799,5 +800,77 @@ class Test_Media_Importer extends WP_UnitTestCase {
 			'per_page' => 20,
 		] );
 		$this->assertNotEmpty( $scheduled, 'process() must still enqueue hbm_import_options after import_batch() extraction.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: request-trail capture for MediaImporter's source/sites/{id}/media listing (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U3. Request-trail
+	// capture at every outbound source call"). MediaImporter is site-job-scoped, so entries
+	// are recorded via AuditReport::record() (scope: site_job).
+	// -------------------------------------------------------------------------
+
+	public function test_process_records_site_job_scoped_request_trail_entry_on_success(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 950, 'audit-success.jpg' ) ] );
+		$this->mock_download_failure(); // download outcome is irrelevant to the request-trail entry itself
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertTrue( $rows[0]['success'] );
+		$this->assertSame( 1, $rows[0]['count'] );
+	}
+
+	public function test_process_records_failed_request_trail_entry_when_source_unreachable(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/source/sites/' ) && false !== strpos( $url, '/media' ) ) {
+				return [
+					'response' => [ 'code' => 500, 'message' => 'Internal Server Error' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		// Existing error-handling behavior is unchanged by U3: a retryable failure at
+		// attempt 0 is rescheduled by PipelineController, not marked failed outright.
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertNotSame( 'failed', $job->status );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertFalse( $rows[0]['success'] );
+		$this->assertArrayHasKey( 'error', $rows[0] );
 	}
 }

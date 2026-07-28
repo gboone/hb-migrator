@@ -206,6 +206,19 @@ class MigrationReceiver {
 		$migration_id   = MigrationRegistry::create_migration( $source_url, $source_api_key, $email ?: null, $policies );
 		$network_domain = get_network()->domain ?? '';
 
+		// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+		// This is the one trail-capture site that runs before any migration_id exists yet at the
+		// actual SourceClient::get() call above — the migration row is only created here, after a
+		// successful fetch. record_for_migration() therefore only ever sees the success case for
+		// this specific call; a failed fetch above returns a 502 immediately with no migration_id
+		// to attach a failure entry to, so no request-trail entry is possible for that path.
+		AuditReport::record_for_migration( $migration_id, 'migration', [
+			'type'    => 'request',
+			'path'    => 'source/sites',
+			'success' => true,
+			'count'   => count( $source_sites ),
+		] );
+
 		foreach ( $valid_ids as $blog_id ) {
 			$s         = $sites_by_id[ $blog_id ];
 			$dest_path = MultisiteHandler::dest_path_for_siteurl( $s['siteurl'], $network_domain );

@@ -6,6 +6,7 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\SourceClientException;
 
 class PostImporter {
 
@@ -26,12 +27,32 @@ class PostImporter {
 
 			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'posts', 'error_message' => null ] );
 
-			$posts = SourceClient::get(
-				$migration->source_url,
-				$migration->source_api_key,
-				'source/sites/' . (int) $job->source_blog_id . '/posts',
-				[ 'per_page' => 100, 'last_id' => $last_id ]
-			);
+			// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+			// PostImporter is site-job-scoped, so this is recorded via record() (scope: site_job).
+			$posts_path = 'source/sites/' . (int) $job->source_blog_id . '/posts';
+			try {
+				$posts = SourceClient::get(
+					$migration->source_url,
+					$migration->source_api_key,
+					$posts_path,
+					[ 'per_page' => 100, 'last_id' => $last_id ]
+				);
+			} catch ( SourceClientException $e ) {
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'    => 'request',
+					'path'    => $posts_path,
+					'success' => false,
+					'error'   => $e->getMessage(),
+				] );
+				throw $e;
+			}
+
+			AuditReport::record( $site_job_id, 'site_job', [
+				'type'    => 'request',
+				'path'    => $posts_path,
+				'success' => true,
+				'count'   => count( $posts ),
+			] );
 
 			$result = self::import_batch( $site_job_id, $posts );
 			$max_id = max( $last_id, $result['max_id'] );

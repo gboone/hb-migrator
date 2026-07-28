@@ -6,6 +6,7 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\SourceClientException;
 
 class OptionImporter {
 
@@ -50,15 +51,35 @@ class OptionImporter {
 
 			MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'options', 'error_message' => null ] );
 
-			$response = SourceClient::get(
-				$migration->source_url,
-				$migration->source_api_key,
-				'source/sites/' . (int) $job->source_blog_id . '/options',
-				[ 'offset' => $offset ]
-			);
+			// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+			// OptionImporter is site-job-scoped, so this is recorded via record() (scope: site_job).
+			$options_path = 'source/sites/' . (int) $job->source_blog_id . '/options';
+			try {
+				$response = SourceClient::get(
+					$migration->source_url,
+					$migration->source_api_key,
+					$options_path,
+					[ 'offset' => $offset ]
+				);
+			} catch ( SourceClientException $e ) {
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'    => 'request',
+					'path'    => $options_path,
+					'success' => false,
+					'error'   => $e->getMessage(),
+				] );
+				throw $e;
+			}
 
 			$options  = $response['options'] ?? $response; // back-compat if response is flat
 			$has_more = $response['has_more'] ?? false;
+
+			AuditReport::record( $site_job_id, 'site_job', [
+				'type'    => 'request',
+				'path'    => $options_path,
+				'success' => true,
+				'count'   => count( $options ),
+			] );
 
 			switch_to_blog( (int) $job->dest_blog_id );
 

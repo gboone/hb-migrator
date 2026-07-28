@@ -3,6 +3,7 @@
  * Tests for UserImporter user conflict policy behaviour.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\UserImporter;
 use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
@@ -271,5 +272,116 @@ class Test_User_Importer extends WP_UnitTestCase {
 		wp_delete_user( $blocking_id );
 		wp_delete_user( $modified_block );
 		wp_delete_user( $mapped_id );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: request-trail capture for UserImporter's source/users listing (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U3. Request-trail
+	// capture at every outbound source call"). UserImporter runs once per migration, before
+	// any site-job-specific stage, so the entry is recorded via record_for_migration()
+	// (scope: migration) and copied into every sibling site job's report on first creation.
+	// -------------------------------------------------------------------------
+
+	private function mock_empty_second_page(): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, 'offset=100' ) ) {
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => wp_json_encode( [] ),
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+	}
+
+	public function test_process_records_migration_scoped_request_trail_entry_on_success(): void {
+		$mid = $this->make_migration();
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/example.com/' );
+
+		$this->mock_users( [
+			$this->make_source_user( [ 'source_user_id' => 500, 'user_email' => 'audit-trail-500@example.test', 'user_login' => 'audittrail500' ] ),
+		] );
+		$this->mock_empty_second_page();
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'migration', $rows[0]['scope'] );
+		$this->assertSame( 'source/users', $rows[0]['path'] );
+		$this->assertTrue( $rows[0]['success'] );
+		$this->assertSame( 1, $rows[0]['count'] );
+
+		wp_delete_user( IdMap::get( IdMap::NETWORK, 'user', 500 ) );
+	}
+
+	public function test_process_records_failed_request_trail_entry_when_source_unreachable(): void {
+		$mid = $this->make_migration();
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/example.com/' );
+
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/source/users' ) ) {
+				return [
+					'response' => [ 'code' => 500, 'message' => 'Internal Server Error' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		UserImporter::process( $mid, 0, 0 );
+
+		// Existing error-handling behavior is unchanged by U3: a retryable failure at
+		// attempt 0 schedules a retry rather than failing the migration outright.
+		$migration = MigrationRegistry::get_migration( $mid );
+		$this->assertSame( 'running', $migration->status );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'migration', $rows[0]['scope'] );
+		$this->assertFalse( $rows[0]['success'] );
+		$this->assertArrayHasKey( 'error', $rows[0] );
+	}
+
+	public function test_staged_request_trail_entry_copies_into_every_sibling_site_job(): void {
+		$mid  = $this->make_migration();
+		$jid1 = MigrationRegistry::create_site_job( $mid, 1, 'a.example.com', 'https://93.184.216.34', '', '/a/' );
+		$jid2 = MigrationRegistry::create_site_job( $mid, 2, 'b.example.com', 'https://93.184.216.34', '', '/b/' );
+
+		$this->mock_users( [
+			$this->make_source_user( [ 'source_user_id' => 777, 'user_email' => 'audit-sibling-777@example.test', 'user_login' => 'auditsibling777' ] ),
+		] );
+		$this->mock_empty_second_page();
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$post_id_1 = AuditReport::get_or_create_for_site_job( $jid1 );
+		$post_id_2 = AuditReport::get_or_create_for_site_job( $jid2 );
+
+		switch_to_blog( get_main_site_id() );
+		$rows_1 = get_post_meta( $post_id_1, '_hbm_audit_request', false );
+		$rows_2 = get_post_meta( $post_id_2, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows_1 );
+		$this->assertSame( 'source/users', $rows_1[0]['path'] );
+		$this->assertCount( 1, $rows_2, 'UserImporter\'s migration-level request-trail entry must be copied into every sibling site job report, not just the first.' );
+		$this->assertSame( 'source/users', $rows_2[0]['path'] );
+
+		wp_delete_user( IdMap::get( IdMap::NETWORK, 'user', 777 ) );
 	}
 }

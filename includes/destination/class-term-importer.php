@@ -6,6 +6,7 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\SourceClientException;
 use HBMigrator\UserSiteRoles;
 
 class TermImporter {
@@ -54,12 +55,32 @@ class TermImporter {
 				] );
 			}
 
-			$terms = SourceClient::get(
-				$migration->source_url,
-				$migration->source_api_key,
-				'source/sites/' . (int) $job->source_blog_id . '/terms',
-				[ 'per_page' => 100, 'offset' => $offset ]
-			);
+			// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+			// TermImporter is site-job-scoped, so this is recorded via record() (scope: site_job).
+			$terms_path = 'source/sites/' . (int) $job->source_blog_id . '/terms';
+			try {
+				$terms = SourceClient::get(
+					$migration->source_url,
+					$migration->source_api_key,
+					$terms_path,
+					[ 'per_page' => 100, 'offset' => $offset ]
+				);
+			} catch ( SourceClientException $e ) {
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'    => 'request',
+					'path'    => $terms_path,
+					'success' => false,
+					'error'   => $e->getMessage(),
+				] );
+				throw $e;
+			}
+
+			AuditReport::record( $site_job_id, 'site_job', [
+				'type'    => 'request',
+				'path'    => $terms_path,
+				'success' => true,
+				'count'   => count( $terms ),
+			] );
 
 			switch_to_blog( (int) $job->dest_blog_id );
 

@@ -6,6 +6,7 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\SourceClientException;
 
 class MediaImporter {
 
@@ -37,14 +38,34 @@ class MediaImporter {
 				MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'media', 'error_message' => null ] );
 			}
 
-			$media = SourceClient::get(
-				$migration->source_url,
-				$migration->source_api_key,
-				'source/sites/' . (int) $job->source_blog_id . '/media',
-				$is_retry_pass
-					? [ 'ids' => $source_attachment_ids ]
-					: [ 'per_page' => 50, 'offset' => $offset, 'attached_only' => ( 'attached_only' === $media_scope ) ? 1 : 0 ]
-			);
+			// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+			// MediaImporter is site-job-scoped, so this is recorded via record() (scope: site_job).
+			$media_path = 'source/sites/' . (int) $job->source_blog_id . '/media';
+			try {
+				$media = SourceClient::get(
+					$migration->source_url,
+					$migration->source_api_key,
+					$media_path,
+					$is_retry_pass
+						? [ 'ids' => $source_attachment_ids ]
+						: [ 'per_page' => 50, 'offset' => $offset, 'attached_only' => ( 'attached_only' === $media_scope ) ? 1 : 0 ]
+				);
+			} catch ( SourceClientException $e ) {
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'    => 'request',
+					'path'    => $media_path,
+					'success' => false,
+					'error'   => $e->getMessage(),
+				] );
+				throw $e;
+			}
+
+			AuditReport::record( $site_job_id, 'site_job', [
+				'type'    => 'request',
+				'path'    => $media_path,
+				'success' => true,
+				'count'   => count( $media ),
+			] );
 
 			$failed_items = self::import_batch( $site_job_id, $media );
 

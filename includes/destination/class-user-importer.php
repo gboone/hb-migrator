@@ -6,6 +6,7 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\SourceClientException;
 use HBMigrator\UserSiteRoles;
 
 class UserImporter {
@@ -27,12 +28,33 @@ class UserImporter {
 				UserSiteRoles::delete_for_migration( $migration_id );
 			}
 
-			$users = SourceClient::get(
-				$migration->source_url,
-				$migration->source_api_key,
-				'source/users',
-				[ 'per_page' => 100, 'offset' => $offset ]
-			);
+			// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+			// UserImporter runs once per migration, before any site-job-specific stage, so this is
+			// recorded via record_for_migration() (scope: migration) rather than record() — copied
+			// into every sibling site job's report the first time each one is created.
+			try {
+				$users = SourceClient::get(
+					$migration->source_url,
+					$migration->source_api_key,
+					'source/users',
+					[ 'per_page' => 100, 'offset' => $offset ]
+				);
+			} catch ( SourceClientException $e ) {
+				AuditReport::record_for_migration( $migration_id, 'migration', [
+					'type'    => 'request',
+					'path'    => 'source/users',
+					'success' => false,
+					'error'   => $e->getMessage(),
+				] );
+				throw $e;
+			}
+
+			AuditReport::record_for_migration( $migration_id, 'migration', [
+				'type'    => 'request',
+				'path'    => 'source/users',
+				'success' => true,
+				'count'   => count( $users ),
+			] );
 
 			wp_suspend_cache_invalidation( true );
 
