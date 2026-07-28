@@ -395,6 +395,64 @@ class AuditComparator {
 	}
 
 	/**
+	 * U7: the self-chaining entry point the `hbm_audit_compare` Action Scheduler action calls
+	 * directly (registered in Plugin::register_action_hooks() — see class-plugin.php).
+	 * SearchReplace::finalize() enqueues this action once, immediately after a site job flips to
+	 * `complete` — it never calls this (or compare_batch()) synchronously, so an arbitrarily long,
+	 * self-chained comparison run can never delay or destabilize finalize() itself.
+	 *
+	 * Calls compare_batch() once. If it returns a non-null checkpoint (more work remains), this
+	 * method self-enqueues the same action with that checkpoint and returns — the next invocation
+	 * picks up where this one left off. Once compare_batch() returns null (every cached post
+	 * compared, or nothing to compare, or an internal failure inside compare_batch() already
+	 * logged and swallowed there — this method's perspective can't distinguish those cases, which
+	 * is fine, that's compare_batch()'s own documented contract), this method computes the
+	 * media/taxonomy/taxonomy-term counts and the per-post comparison results, then renders the
+	 * final summary into the report post via AuditReport::render_summary() — exactly once, after
+	 * the LAST batch, never after an intermediate one (a self-enqueue above always `return`s
+	 * before reaching this step).
+	 *
+	 * Wraps its ENTIRE body in try/catch (\Throwable), matching every other method in this class
+	 * (see class docblock): this is now the thing an Action Scheduler action calls directly, so an
+	 * uncaught exception here is exactly the failure-cascade risk this whole plan is designed to
+	 * prevent — a bug in the count/render step must never propagate into
+	 * PipelineController::handle_batch_failure()'s retry/failure machinery, nor regress an
+	 * already-`complete` site job back to `failed`.
+	 *
+	 * @param int $site_job_id
+	 * @param int $last_pk  Resume cursor, forwarded to compare_batch() as-is. Defaults to 0 —
+	 *                      matches the shape of every other stage's process() entry point
+	 *                      (SearchReplace::process(), PostImporter::process(), etc.), which all
+	 *                      accept a checkpoint/cursor parameter with a zero default for the first
+	 *                      call.
+	 */
+	public static function process( int $site_job_id, int $last_pk = 0 ): void {
+		try {
+			$checkpoint = self::compare_batch( $site_job_id, $last_pk );
+
+			if ( null !== $checkpoint ) {
+				// Time budget exhausted mid-batch — dispatch a continuation from the checkpoint.
+				as_enqueue_async_action(
+					'hbm_audit_compare',
+					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
+					'hb-migrator'
+				);
+				return;
+			}
+
+			// Every cached post has now been compared (or compare_batch() already swallowed an
+			// internal failure) — render the final summary exactly once, now that no further
+			// batches will run for this site job.
+			$counts       = self::compute_counts( $site_job_id );
+			$post_results = self::get_post_comparison_results( $site_job_id );
+			AuditReport::render_summary( $site_job_id, $counts, $post_results );
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditComparator::process() failed for site job ' . $site_job_id . ' at last_pk ' . $last_pk . ': ' . $e->getMessage() );
+		}
+	}
+
+	/**
 	 * Aggregate, non-batched count comparison for media (attachments) and taxonomy terms (R3).
 	 * Deliberately not part of compare_batch()'s checkpointed loop — this is cheap aggregate
 	 * counting, not per-item hashing, so it always completes in one call (see plan U6 approach).

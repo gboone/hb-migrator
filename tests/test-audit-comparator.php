@@ -13,6 +13,7 @@
 
 use HBMigrator\Destination\AuditComparator;
 use HBMigrator\Destination\AuditReport;
+use HBMigrator\Destination\SearchReplace;
 use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\QueueTable;
@@ -35,6 +36,8 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		parent::tear_down();
 		remove_all_filters( 'hbm_audit_compare_batch_size' );
 		remove_all_filters( 'hbm_audit_compare_time_limit' );
+		remove_all_filters( 'hbm_audit_report_detail_cap' );
+		remove_all_filters( 'wp_insert_post_empty_content' );
 	}
 
 	// -------------------------------------------------------------------------
@@ -135,6 +138,21 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		$results = AuditComparator::get_post_comparison_results( $jid ?? $this->jid );
 		$this->assertArrayHasKey( $source_id, $results, "No comparison result recorded for source_id {$source_id}." );
 		return $results[ $source_id ];
+	}
+
+	/**
+	 * U7: reads back the report post's rendered post_content, on the primary site, matching
+	 * AuditReport::render_summary()'s own switch_to_blog( get_main_site_id() ) convention.
+	 */
+	private function get_report_content( ?int $jid = null ): string {
+		$post_id = AuditReport::get_or_create_for_site_job( $jid ?? $this->jid );
+		switch_to_blog( get_main_site_id() );
+		try {
+			$post = get_post( $post_id );
+			return $post ? (string) $post->post_content : '';
+		} finally {
+			restore_current_blog();
+		}
 	}
 
 	// -------------------------------------------------------------------------
@@ -563,5 +581,270 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		$this->assertSame( 1, $counts['attachment']['landed'] );
 		$this->assertSame( 1, $counts['attachment']['id_map_count'] );
 		$this->assertSame( 2, $counts['attachment']['destination_actual'], 'destination_actual is a raw count, independent of what was attempted.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// U7: AuditComparator::process() — self-chaining orchestration — and
+	// AuditReport::render_summary() — R6 report rendering. See docs/plans/
+	// 2026-07-28-001-feat-migration-audit-report-plan.md, "U7. Report rendering and comparator
+	// wiring".
+	// -------------------------------------------------------------------------
+
+	// -------------------------------------------------------------------------
+	// Happy path: a single-batch process() run (compare_batch() returns null on the first call)
+	// renders counts, then flagged posts, then full detail, in that order. Zero flagged posts
+	// renders a clear "No divergence found." state rather than an empty/missing section.
+	// -------------------------------------------------------------------------
+
+	public function test_process_single_batch_renders_ordered_summary_with_no_divergence(): void {
+		$source_id = 2001;
+		$dest_id   = $this->create_dest_post( [
+			'post_title'   => 'Clean Post',
+			'post_name'    => 'clean-post',
+			'post_content' => 'All good.',
+		] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [
+			'post_title'   => 'Clean Post',
+			'post_name'    => 'clean-post',
+			'post_content' => 'All good.',
+		] );
+
+		AuditComparator::process( $this->jid, 0 );
+
+		$content = $this->get_report_content();
+
+		$counts_pos  = strpos( $content, '=== Counts ===' );
+		$flagged_pos = strpos( $content, '=== Flagged Posts ===' );
+		$detail_pos  = strpos( $content, '=== Full Detail ===' );
+
+		$this->assertNotFalse( $counts_pos, 'Rendered summary must contain a counts section.' );
+		$this->assertNotFalse( $flagged_pos, 'Rendered summary must contain a flagged-posts section.' );
+		$this->assertNotFalse( $detail_pos, 'Rendered summary must contain a full-detail section.' );
+		$this->assertLessThan( $flagged_pos, $counts_pos, 'Counts must render before flagged posts (R6).' );
+		$this->assertLessThan( $detail_pos, $flagged_pos, 'Flagged posts must render before full detail (R6).' );
+		$this->assertStringContainsString( 'No divergence found.', $content, 'Zero flagged posts must render a clear "no divergence" state, not an empty section.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Every flagged post — comparable-and-diverged (with diverged_fields) and
+	// not-comparable-but-diverged (e.g. destination_post_missing, with its reason) — is listed
+	// in the flagged section with the right detail.
+	// -------------------------------------------------------------------------
+
+	public function test_flagged_section_lists_diverged_fields_or_reason_for_each_flagged_post(): void {
+		$sid_title = 2101;
+		$dest_id   = $this->create_dest_post( [ 'post_title' => 'Dest Title', 'post_name' => 'flag-title' ] );
+		IdMap::set( $this->jid, 'post', $sid_title, $dest_id );
+		$this->record_post_entry( $sid_title, 'created', [ 'post_title' => 'Source Title', 'post_name' => 'flag-title' ] );
+
+		$sid_missing = 2102;
+		IdMap::set( $this->jid, 'post', $sid_missing, 9999999 ); // No such destination post.
+		$this->record_post_entry( $sid_missing, 'created', [ 'post_title' => 'Ghost', 'post_name' => 'ghost' ] );
+
+		AuditComparator::process( $this->jid, 0 );
+
+		$content        = $this->get_report_content();
+		$flagged_start  = strpos( $content, '=== Flagged Posts ===' );
+		$detail_start   = strpos( $content, '=== Full Detail ===' );
+		$flagged_section = substr( $content, $flagged_start, $detail_start - $flagged_start );
+
+		$this->assertStringContainsString( "source_id={$sid_title}", $flagged_section );
+		$this->assertStringContainsString( 'diverged_fields=[title]', $flagged_section );
+		$this->assertStringContainsString( "source_id={$sid_missing}", $flagged_section );
+		$this->assertStringContainsString( 'destination_post_missing', $flagged_section );
+		$this->assertStringNotContainsString( 'No divergence found.', $flagged_section );
+	}
+
+	// -------------------------------------------------------------------------
+	// Edge case: a site job whose post count exceeds the inline-render cap still shows a
+	// complete counts/flagged section, with the full-detail section truncated and annotated.
+	// -------------------------------------------------------------------------
+
+	public function test_full_detail_section_is_capped_and_annotated_when_post_count_exceeds_cap(): void {
+		add_filter( 'hbm_audit_report_detail_cap', static fn() => 2 );
+
+		$ids = [ 2201, 2202, 2203, 2204 ];
+		foreach ( $ids as $sid ) {
+			$dest_id = $this->create_dest_post( [ 'post_title' => "Post {$sid}", 'post_name' => "cap-post-{$sid}" ] );
+			IdMap::set( $this->jid, 'post', $sid, $dest_id );
+			$this->record_post_entry( $sid, 'created', [ 'post_title' => "Post {$sid}", 'post_name' => "cap-post-{$sid}" ] );
+		}
+
+		AuditComparator::process( $this->jid, 0 );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		$content = $this->get_report_content();
+
+		// Counts and flagged sections are never subject to the cap — only full detail is.
+		$this->assertStringContainsString( '=== Counts ===', $content );
+		$this->assertStringContainsString( 'No divergence found.', $content );
+		$this->assertStringContainsString( "showing 2 of 4 posts", $content, 'Full-detail section must be truncated to the forced cap.' );
+		$this->assertStringContainsString( "wp post meta list {$post_id}", $content, 'Truncation note must point at the uncapped wp post meta list fallback.' );
+
+		// The complete per-post detail is never capped in storage — only the inline render is.
+		$results = AuditComparator::get_post_comparison_results( $this->jid );
+		$this->assertCount( 4, $results, 'Storage (postmeta) must never be capped — only the inline render.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Sanitization: any rendered text originating from source content (expected/actual
+	// title/slug) is esc_html()-escaped before being embedded in post_content.
+	// -------------------------------------------------------------------------
+
+	public function test_source_derived_title_is_escaped_in_rendered_report(): void {
+		$source_id = 2301;
+		$dest_id   = $this->create_dest_post( [
+			'post_title' => '<b>Dest</b> Title',
+			'post_name'  => 'escape-slug',
+		] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [
+			'post_title' => '<script>alert(1)</script>',
+			'post_name'  => 'escape-slug',
+		] );
+
+		AuditComparator::process( $this->jid, 0 );
+
+		$content = $this->get_report_content();
+
+		$this->assertStringNotContainsString( '<script>alert(1)</script>', $content, 'Source-derived title must be esc_html()-escaped, never embedded as raw HTML.' );
+		$this->assertStringContainsString( '&lt;script&gt;', $content, 'Escaped form of the diverging source title must still be present.' );
+		$this->assertStringNotContainsString( '<b>Dest</b>', $content, 'Destination-side title must also be escaped before embedding.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Integration: a comparison spanning multiple self-chained process() invocations only
+	// renders the final summary once, after the last batch completes — not after every
+	// intermediate batch. Also verifies process() actually self-enqueues a continuation when
+	// compare_batch() returns a non-null checkpoint.
+	// -------------------------------------------------------------------------
+
+	public function test_multibatch_process_renders_final_summary_only_once(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+
+		$ids = [ 2401, 2402, 2403 ];
+		foreach ( $ids as $sid ) {
+			$dest_id = $this->create_dest_post( [ 'post_title' => "Multi {$sid}", 'post_name' => "proc-multi-{$sid}" ] );
+			IdMap::set( $this->jid, 'post', $sid, $dest_id );
+			$this->record_post_entry( $sid, 'created', [ 'post_title' => "Multi {$sid}", 'post_name' => "proc-multi-{$sid}" ] );
+		}
+
+		// First call: batch_size=1 + an always-exceeded time budget means compare_batch()
+		// processes exactly one item and returns a checkpoint — process() must self-enqueue a
+		// continuation, not render.
+		AuditComparator::process( $this->jid, 0 );
+		$this->assertSame( '', $this->get_report_content(), 'post_content must remain unset after the first (non-final) batch.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $ids[0] ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'process() must self-enqueue exactly one continuation when compare_batch() returns a checkpoint.' );
+
+		// Second call: still one item left after this one — must still self-enqueue, not render.
+		AuditComparator::process( $this->jid, $ids[0] );
+		$this->assertSame( '', $this->get_report_content(), 'post_content must remain unset after an intermediate batch.' );
+
+		// Third call drains the LAST item still remaining (2403) — but compare_batch()'s own
+		// time-budget check runs unconditionally after every processed batch (see that method),
+		// so it still returns a (non-null) checkpoint here even though every item has now been
+		// processed once — matching this same file's own
+		// test_budget_exceeded_returns_checkpoint_and_resumes_without_double_processing, which
+		// requires MORE calls than there are items for exactly this reason. Must still
+		// self-enqueue, not render.
+		AuditComparator::process( $this->jid, $ids[1] );
+		$this->assertSame( '', $this->get_report_content(), 'post_content must remain unset after the batch that processed the last item, since compare_batch() still returned a non-null checkpoint.' );
+
+		// Fourth call: remaining_ids is now genuinely empty — compare_batch() returns null. This
+		// is the ONLY call that must render the final summary.
+		AuditComparator::process( $this->jid, $ids[2] );
+		$content = $this->get_report_content();
+		$this->assertStringContainsString( '=== Counts ===', $content, 'Final summary must be rendered exactly once, after the last batch.' );
+
+		remove_all_filters( 'hbm_audit_compare_batch_size' );
+		remove_all_filters( 'hbm_audit_compare_time_limit' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Integration: SearchReplace::finalize() enqueues hbm_audit_compare exactly once per site
+	// job reaching complete, and never calls the comparator synchronously — finalize() itself
+	// must complete regardless of how long the (enqueued, not inline) comparison run takes.
+	// -------------------------------------------------------------------------
+
+	public function test_search_replace_finalize_enqueues_audit_compare_exactly_once(): void {
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'running' ] );
+
+		$ref    = new ReflectionClass( SearchReplace::class );
+		$method = $ref->getMethod( 'finalize' );
+		$method->setAccessible( true );
+
+		global $wpdb;
+		// finalize() also runs remap_postmeta_ids()'s MySQL-only UPDATE...JOIN (see
+		// test-search-replace.php's own precedent of skipping assertions on that query's effect
+		// under the SQLite test driver) — harmless here since this test only asserts on the
+		// hbm_audit_compare enqueue, not the thumbnail remap itself. Suppressed purely to keep
+		// this test's output free of an unrelated, expected-under-SQLite query error dump.
+		$suppress = $wpdb->suppress_errors( true );
+		try {
+			$method->invoke( null, $this->jid, $this->mid, get_current_blog_id() );
+		} finally {
+			$wpdb->suppress_errors( $suppress );
+		}
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => 0 ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 10,
+		] );
+		$this->assertCount( 1, $scheduled, 'finalize() must enqueue hbm_audit_compare exactly once per site job reaching complete.' );
+
+		// finalize() must never call the comparator synchronously — only the action is
+		// enqueued, no comparison work has actually run yet.
+		$this->assertSame( [], AuditComparator::get_post_comparison_results( $this->jid ), 'finalize() must not synchronously invoke compare_batch()/process() — comparison only runs once the enqueued action executes.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Critical, non-obvious behavior: a forced internal failure during the count/render step
+	// (wp_update_post() forced to fail) does not throw out of process() and does not alter the
+	// site job's own status.
+	// -------------------------------------------------------------------------
+
+	public function test_forced_render_failure_does_not_throw_and_does_not_alter_site_job_status(): void {
+		$source_id = 2501;
+		$dest_id   = $this->create_dest_post( [ 'post_title' => 'Fine', 'post_name' => 'render-fail-fine' ] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [ 'post_title' => 'Fine', 'post_name' => 'render-fail-fine' ] );
+
+		// Report post already exists by this point (record_post_entry() above triggered lazy
+		// creation) — this filter only needs to break the later wp_update_post() call inside
+		// render_summary(), not the earlier wp_insert_post() that already succeeded.
+		add_filter( 'wp_insert_post_empty_content', '__return_true' );
+
+		$log_file = tempnam( sys_get_temp_dir(), 'hbm_audit_render_summary_test_log' );
+		$prev_log = ini_set( 'error_log', $log_file );
+
+		try {
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			ini_set( 'error_log', $prev_log );
+			remove_filter( 'wp_insert_post_empty_content', '__return_true' );
+		}
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 'complete', $job->status, "A forced render failure must never alter the site job's own status column." );
+
+		// The comparison result itself must still have been stored — only the final render
+		// step failed, not the comparison work compare_batch() already completed.
+		$results = AuditComparator::get_post_comparison_results( $this->jid );
+		$this->assertArrayHasKey( $source_id, $results );
+
+		$log_contents = file_get_contents( $log_file );
+		unlink( $log_file );
+		$this->assertStringContainsString( 'render_summary()', $log_contents, 'The render failure must be observable via the logged message even though it never propagated.' );
 	}
 }

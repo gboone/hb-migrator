@@ -114,6 +114,11 @@ class SearchReplace {
 			'current_stage' => null,
 		] );
 
+		// U7: enqueue the audit comparator's self-chaining entry point rather than calling it
+		// synchronously — comparison can take arbitrarily long across many self-chained batches
+		// (see AuditComparator::process()) and must never delay finalize() itself completing.
+		as_enqueue_async_action( 'hbm_audit_compare', [ 'site_job_id' => $site_job_id, 'last_pk' => 0 ], 'hb-migrator' );
+
 		// complete_migration() uses a NOT EXISTS subquery to atomically check that all
 		// site jobs are complete before updating the migration row — no separate read needed.
 		if ( MigrationRegistry::complete_migration( $migration_id ) ) {
