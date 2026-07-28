@@ -24,6 +24,12 @@ class Plugin {
 		// so we can't re-add to plugins_loaded at an earlier priority.
 		$this->register_action_hooks();
 
+		// U1: register the hbm_audit_report post type (docs/plans/2026-07-28-001-feat-
+		// migration-audit-report-plan.md). Registered unconditionally on every request, like
+		// everything else in this method — the plugin is network-activated and already
+		// registers everything on every page load.
+		add_action( 'init', [ Destination\AuditReport::class, 'register_post_type' ] );
+
 		// Source-side content-event hooks for U8's webhook trigger. Registered
 		// unconditionally on every install — each hook is a no-op unless this blog has a
 		// sync_webhook_token on file (see Source\SyncWebhook::get_sync_config()), since this
