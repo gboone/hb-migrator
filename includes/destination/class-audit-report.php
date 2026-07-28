@@ -278,6 +278,41 @@ class AuditReport {
 	}
 
 	/**
+	 * U6 read-access addition (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md,
+	 * "U6. Comparator: hashing, normalization, and count comparison"). AuditReport previously had
+	 * no way to read write-action trail entries back out — AuditComparator needs the full set
+	 * for a site job to build its own per-source_id "latest entry wins" lookup (a resumed/
+	 * retried batch can produce more than one _hbm_audit_write entry for the same source_id).
+	 * Returns entries in ascending meta_id (insertion) order — get_post_meta( ..., false )
+	 * already returns rows in that order, so no additional ordering step is needed here.
+	 *
+	 * Deliberately does NOT create a report via get_or_create_for_site_job() if none exists: a
+	 * comparison pass only ever runs after write-trail entries have already been recorded (see
+	 * SearchReplace::finalize()), so a missing report here means there is genuinely nothing to
+	 * compare, not something worth lazily creating an empty report for.
+	 *
+	 * Never throws (see class docblock) — returns an empty array on internal failure.
+	 */
+	public static function get_write_entries_for_site_job( int $site_job_id ): array {
+		try {
+			switch_to_blog( get_main_site_id() );
+			try {
+				$post_id = self::find_report_post_id( $site_job_id );
+				if ( ! $post_id ) {
+					return [];
+				}
+				return get_post_meta( $post_id, self::META_WRITE, false ) ?: [];
+			} finally {
+				restore_current_blog();
+			}
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditReport::get_write_entries_for_site_job() failed for site job ' . $site_job_id . ': ' . $e->getMessage() );
+			return [];
+		}
+	}
+
+	/**
 	 * Looks up an existing report post ID for a given site_job_id via a direct postmeta query
 	 * (mirrors IdMap's own single-prepare-per-call convention, includes/class-id-map.php) rather
 	 * than get_posts()/WP_Query, since we only need a single scalar post ID keyed by an exact
