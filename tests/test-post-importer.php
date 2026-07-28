@@ -435,6 +435,8 @@ class Test_PostImporter extends WP_UnitTestCase {
 		$this->assertSame( 'Raw source excerpt.', $rows[0]['post_excerpt'] );
 		$this->assertSame( 'author@example.com', $rows[0]['source_author'] );
 		$this->assertSame( [ [ 'key' => '_custom_field', 'value' => 'custom-value' ] ], $rows[0]['meta'] );
+		$this->assertSame( 'test-post', $rows[0]['post_name'], 'Slug must be cached for later comparator use (R4).' );
+		$this->assertSame( 'post', $rows[0]['post_type'] );
 	}
 
 	public function test_import_batch_records_updated_entry_for_already_mapped_retried_item(): void {
