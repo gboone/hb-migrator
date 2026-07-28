@@ -70,11 +70,16 @@ class UserImporter {
 
 			foreach ( $users as $u ) {
 				$dest_user_id = null;
+				// U4 write-action trail (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md):
+				// reuses this loop's own existing merge-vs-create control-flow signal — no new
+				// bookkeeping needed beyond tracking which branch was taken.
+				$outcome      = null;
 
 				if ( 'merge' === $policy ) {
 					$existing = get_user_by( 'email', $u['user_email'] );
 					if ( $existing ) {
 						$dest_user_id = $existing->ID;
+						$outcome      = 'merged';
 					}
 				}
 
@@ -100,10 +105,18 @@ class UserImporter {
 					}
 
 					if ( is_wp_error( $new_id ) ) {
+						AuditReport::record_for_migration( $migration_id, 'migration', [
+							'type'        => 'write',
+							'object_type' => 'user',
+							'source_id'   => (int) $u['source_user_id'],
+							'outcome'     => 'failed',
+							'error'       => $new_id->get_error_message(),
+						] );
 						continue;
 					}
 
 					$dest_user_id = (int) $new_id;
+					$outcome      = 'created';
 
 					if ( 'create' === $policy ) {
 						update_user_meta( $dest_user_id, 'hbm_original_email', $u['user_email'] );
@@ -111,6 +124,14 @@ class UserImporter {
 				}
 
 				IdMap::set( IdMap::NETWORK, 'user', (int) $u['source_user_id'], $dest_user_id );
+
+				AuditReport::record_for_migration( $migration_id, 'migration', [
+					'type'        => 'write',
+					'object_type' => 'user',
+					'source_id'   => (int) $u['source_user_id'],
+					'dest_id'     => $dest_user_id,
+					'outcome'     => $outcome,
+				] );
 
 				// Store per-site roles so TermImporter can assign them after subsite creation
 				// without making additional HTTP requests.

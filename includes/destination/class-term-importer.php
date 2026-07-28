@@ -93,6 +93,17 @@ class TermImporter {
 					if ( $t['parent'] > 0 ) {
 						$pending_parents[ $existing->term_id ] = (int) $t['parent'];
 					}
+
+					// U4 write-action trail (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+					// An existing term matched by slug is "matched", not "created" — reusing the
+					// control-flow signal this loop already distinguishes.
+					AuditReport::record( $site_job_id, 'site_job', [
+						'type'        => 'write',
+						'object_type' => 'term',
+						'source_id'   => (int) $t['term_id'],
+						'dest_id'     => (int) $existing->term_id,
+						'outcome'     => 'matched',
+					] );
 					continue;
 				}
 
@@ -103,11 +114,26 @@ class TermImporter {
 				] );
 
 				if ( is_wp_error( $result ) ) {
+					AuditReport::record( $site_job_id, 'site_job', [
+						'type'        => 'write',
+						'object_type' => 'term',
+						'source_id'   => (int) $t['term_id'],
+						'outcome'     => 'failed',
+						'error'       => $result->get_error_message(),
+					] );
 					continue;
 				}
 
 				$dest_term_id = (int) $result['term_id'];
 				IdMap::set( $site_job_id, 'term', (int) $t['term_id'], $dest_term_id );
+
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'        => 'write',
+					'object_type' => 'term',
+					'source_id'   => (int) $t['term_id'],
+					'dest_id'     => $dest_term_id,
+					'outcome'     => 'created',
+				] );
 
 				if ( $t['parent'] > 0 ) {
 					$pending_parents[ $dest_term_id ] = (int) $t['parent'];
@@ -199,6 +225,14 @@ class TermImporter {
 	}
 
 	private static function create_subsite_inner( object $job, string $policy, \WP_Network $network ): int {
+		// U4 write-action trail (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md):
+		// a site job typically already exists by the time subsite creation is attempted, so
+		// $job->id (the same site_job_id process() was called with) is used directly with
+		// AuditReport::record() rather than record_for_migration(). This is the one write action
+		// a site job that fails before ever creating its destination subsite would otherwise have
+		// zero record of.
+		$site_job_id = (int) $job->id;
+
 		$result = wp_insert_site( [
 			'domain'     => $network->domain,
 			'path'       => $job->dest_path,
@@ -208,11 +242,24 @@ class TermImporter {
 		] );
 
 		if ( ! is_wp_error( $result ) ) {
+			AuditReport::record( $site_job_id, 'site_job', [
+				'type'        => 'write',
+				'object_type' => 'subsite',
+				'dest_id'     => (int) $result,
+				'dest_path'   => $job->dest_path,
+				'outcome'     => 'created',
+			] );
 			return (int) $result;
 		}
 
 		$code = $result->get_error_code();
 		if ( 'site_taken' !== $code ) {
+			AuditReport::record( $site_job_id, 'site_job', [
+				'type'        => 'write',
+				'object_type' => 'subsite',
+				'outcome'     => 'failed',
+				'error'       => $result->get_error_message(),
+			] );
 			throw new \RuntimeException( 'Could not create subsite: ' . $result->get_error_message() );
 		}
 
@@ -244,14 +291,27 @@ class TermImporter {
 			] );
 			if ( ! is_wp_error( $retry ) ) {
 				$job->dest_path = $candidate; // bubble updated path back to caller
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'        => 'write',
+					'object_type' => 'subsite',
+					'dest_id'     => (int) $retry,
+					'dest_path'   => $candidate,
+					'outcome'     => 'created',
+				] );
 				return (int) $retry;
 			}
 		}
 
 		MigrationRegistry::update_site_job(
-			(int) $job->id,
+			$site_job_id,
 			[ 'status' => 'failed', 'error_message' => 'Could not create unique subsite path after 10 attempts for: ' . $job->dest_path ]
 		);
+		AuditReport::record( $site_job_id, 'site_job', [
+			'type'        => 'write',
+			'object_type' => 'subsite',
+			'outcome'     => 'failed',
+			'error'       => 'Could not create unique subsite path after 10 attempts for: ' . $job->dest_path,
+		] );
 		throw new \RuntimeException( 'Subsite path exhausted — marked failed, not retrying.' );
 	}
 }

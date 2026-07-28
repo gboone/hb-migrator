@@ -433,4 +433,211 @@ class Test_Term_Importer extends WP_UnitTestCase {
 			wp_delete_site( (int) $job->dest_blog_id );
 		}
 	}
+
+	// -------------------------------------------------------------------------
+	// U4: write-action trail for terms and subsite creation (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U4. Write-action trail:
+	// terms, users, options"). TermImporter is site-job-scoped, so entries are recorded via
+	// AuditReport::record() (scope: site_job).
+	// -------------------------------------------------------------------------
+
+	private function mock_terms_response( array $terms ): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) use ( $terms ) {
+			if ( false !== strpos( $url, '/source/sites/' ) && false !== strpos( $url, '/terms' ) ) {
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => wp_json_encode( $terms ),
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+	}
+
+	private function get_write_rows( int $jid ): array {
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+		return $rows;
+	}
+
+	public function test_process_records_created_outcome_for_new_term(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'process() requires multisite.' );
+		}
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/audit-term-created/' );
+
+		$this->mock_terms_response( [
+			[ 'term_id' => 111, 'name' => 'Dog', 'slug' => 'audit-new-term-dog', 'taxonomy' => 'category', 'parent' => 0, 'description' => '' ],
+		] );
+
+		TermImporter::process( $jid, 0, 0 );
+		remove_all_filters( 'pre_http_request' );
+
+		$rows = $this->get_write_rows( $jid );
+		$term_rows = array_values( array_filter( $rows, fn( $r ) => 'term' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $term_rows );
+		$this->assertSame( 'created', $term_rows[0]['outcome'] );
+		$this->assertSame( 111, $term_rows[0]['source_id'] );
+		$this->assertArrayHasKey( 'dest_id', $term_rows[0] );
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		if ( $job->dest_blog_id ) {
+			wp_delete_site( (int) $job->dest_blog_id );
+		}
+	}
+
+	public function test_process_records_matched_outcome_for_existing_term_by_slug(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'process() requires multisite.' );
+		}
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/audit-term-matched/' );
+
+		// Pre-create the destination subsite and a term on it with the matching slug, so
+		// the per-item loop's get_term_by( 'slug', ... ) finds it and takes the "matched" branch.
+		$job = MigrationRegistry::get_site_job( $jid );
+		$network = get_network();
+		$dest_blog_id = wp_insert_site( [
+			'domain'     => $network->domain,
+			'path'       => '/audit-term-matched-dest/',
+			'network_id' => $network->id,
+			'title'      => 'Dest',
+			'user_id'    => 1,
+		] );
+		$this->assertNotInstanceOf( \WP_Error::class, $dest_blog_id );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => $dest_blog_id ] );
+
+		switch_to_blog( $dest_blog_id );
+		wp_insert_term( 'Existing Cat', 'category', [ 'slug' => 'audit-existing-term-cat' ] );
+		restore_current_blog();
+
+		$this->mock_terms_response( [
+			[ 'term_id' => 222, 'name' => 'Existing Cat', 'slug' => 'audit-existing-term-cat', 'taxonomy' => 'category', 'parent' => 0, 'description' => '' ],
+		] );
+
+		TermImporter::process( $jid, 0, 0 );
+		remove_all_filters( 'pre_http_request' );
+
+		$rows = $this->get_write_rows( $jid );
+		$term_rows = array_values( array_filter( $rows, fn( $r ) => 'term' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $term_rows );
+		$this->assertSame( 'matched', $term_rows[0]['outcome'] );
+		$this->assertSame( 222, $term_rows[0]['source_id'] );
+
+		wp_delete_site( $dest_blog_id );
+	}
+
+	public function test_process_records_failed_outcome_for_term_wp_insert_term_error(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'process() requires multisite.' );
+		}
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		MigrationRegistry::update_migration_status( $mid, 'running' );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/audit-term-failed/' );
+
+		// An empty slug/name combination that wp_insert_term() rejects (WP requires a non-empty
+		// term name) forces the existing is_wp_error() branch this loop already handles.
+		$this->mock_terms_response( [
+			[ 'term_id' => 333, 'name' => '', 'slug' => 'audit-fail-term', 'taxonomy' => 'category', 'parent' => 0, 'description' => '' ],
+		] );
+
+		TermImporter::process( $jid, 0, 0 );
+		remove_all_filters( 'pre_http_request' );
+
+		$rows = $this->get_write_rows( $jid );
+		$term_rows = array_values( array_filter( $rows, fn( $r ) => 'term' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $term_rows );
+		$this->assertSame( 'failed', $term_rows[0]['outcome'] );
+		$this->assertSame( 333, $term_rows[0]['source_id'] );
+		$this->assertArrayHasKey( 'error', $term_rows[0] );
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		if ( $job->dest_blog_id ) {
+			wp_delete_site( (int) $job->dest_blog_id );
+		}
+	}
+
+	public function test_create_subsite_records_write_trail_entry_on_success(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'create_subsite() requires multisite.' );
+		}
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/audit-subsite-success/' );
+
+		$job    = $this->make_job( [ 'id' => $jid, 'dest_path' => '/audit-subsite-success/' ] );
+		$new_id = $this->call_create_subsite( $job, 'generate_new' );
+
+		$rows        = $this->get_write_rows( $jid );
+		$subsite_rows = array_values( array_filter( $rows, fn( $r ) => 'subsite' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $subsite_rows );
+		$this->assertSame( 'created', $subsite_rows[0]['outcome'] );
+		$this->assertSame( $new_id, $subsite_rows[0]['dest_id'] );
+
+		wp_delete_site( $new_id );
+	}
+
+	public function test_create_subsite_records_write_trail_entry_on_path_collision_exhaustion(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'create_subsite() requires multisite.' );
+		}
+
+		$network = get_network();
+		$base    = '/audit-exhaust-test';
+		$created_ids = [];
+		// Original path plus every generate_new suffix (-2 .. -11) so all 11 wp_insert_site()
+		// attempts collide and create_subsite_inner() exhausts its retries.
+		for ( $i = 1; $i <= 11; $i++ ) {
+			$path = ( 1 === $i ) ? $base . '/' : $base . '-' . $i . '/';
+			$id   = wp_insert_site( [
+				'domain'     => $network->domain,
+				'path'       => $path,
+				'network_id' => $network->id,
+				'title'      => 'Blocker ' . $i,
+				'user_id'    => 1,
+			] );
+			$this->assertNotInstanceOf( \WP_Error::class, $id );
+			$created_ids[] = (int) $id;
+		}
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', $base . '/' );
+
+		$job = $this->make_job( [ 'id' => $jid, 'dest_path' => $base . '/' ] );
+
+		$threw = false;
+		try {
+			$this->call_create_subsite( $job, 'generate_new' );
+		} catch ( \RuntimeException $e ) {
+			$threw = true;
+		}
+		$this->assertTrue( $threw, 'Subsite creation must throw once all path-collision retries are exhausted.' );
+
+		$rows = $this->get_write_rows( $jid );
+		$this->assertNotEmpty( $rows, 'A site job that fails during subsite creation must not have an empty report.' );
+
+		$failed_rows = array_values( array_filter(
+			$rows,
+			fn( $r ) => 'subsite' === ( $r['object_type'] ?? null ) && 'failed' === ( $r['outcome'] ?? null )
+		) );
+		$this->assertCount( 1, $failed_rows );
+		$this->assertArrayHasKey( 'error', $failed_rows[0] );
+
+		$job_row = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 'failed', $job_row->status );
+
+		foreach ( $created_ids as $id ) {
+			wp_delete_site( $id );
+		}
+	}
 }

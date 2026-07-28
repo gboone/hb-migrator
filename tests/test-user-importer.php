@@ -384,4 +384,96 @@ class Test_User_Importer extends WP_UnitTestCase {
 
 		wp_delete_user( IdMap::get( IdMap::NETWORK, 'user', 777 ) );
 	}
+
+	// -------------------------------------------------------------------------
+	// U4: write-action trail for users (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U4. Write-action trail:
+	// terms, users, options"). UserImporter runs once per migration, before any site-job-specific
+	// stage, so entries are recorded via AuditReport::record_for_migration() (scope: migration).
+	// -------------------------------------------------------------------------
+
+	private function get_write_rows( int $jid ): array {
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+		return $rows;
+	}
+
+	public function test_process_records_created_outcome_for_newly_created_user(): void {
+		$mid = $this->make_migration();
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/example.com/' );
+
+		$this->mock_users( [
+			$this->make_source_user( [ 'source_user_id' => 601, 'user_email' => 'audit-write-created@example.test', 'user_login' => 'auditwritecreated' ] ),
+		] );
+		$this->mock_empty_second_page();
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$rows      = $this->get_write_rows( $jid );
+		$user_rows = array_values( array_filter( $rows, fn( $r ) => 'user' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $user_rows );
+		$this->assertSame( 'created', $user_rows[0]['outcome'] );
+		$this->assertSame( 601, $user_rows[0]['source_id'] );
+		$this->assertArrayHasKey( 'dest_id', $user_rows[0] );
+
+		wp_delete_user( IdMap::get( IdMap::NETWORK, 'user', 601 ) );
+	}
+
+	public function test_process_records_merged_outcome_for_existing_user_matched_by_email(): void {
+		$existing_id = wp_insert_user( [
+			'user_login' => 'audit-write-merge-existing',
+			'user_email' => 'audit-write-merge@example.test',
+			'user_pass'  => 'password',
+		] );
+		$this->assertNotInstanceOf( \WP_Error::class, $existing_id );
+
+		$mid = $this->make_migration( [ 'user_conflict_policy' => 'merge' ] );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/example.com/' );
+
+		$this->mock_users( [
+			$this->make_source_user( [ 'source_user_id' => 602, 'user_email' => 'audit-write-merge@example.test' ] ),
+		] );
+		$this->mock_empty_second_page();
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$rows      = $this->get_write_rows( $jid );
+		$user_rows = array_values( array_filter( $rows, fn( $r ) => 'user' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $user_rows );
+		$this->assertSame( 'merged', $user_rows[0]['outcome'], 'A user matched to an existing destination user must be recorded as "merged", not "created".' );
+		$this->assertSame( 602, $user_rows[0]['source_id'] );
+		$this->assertSame( $existing_id, $user_rows[0]['dest_id'] );
+
+		wp_delete_user( $existing_id );
+	}
+
+	public function test_process_records_failed_outcome_when_wp_insert_user_fails(): void {
+		$mid = $this->make_migration( [ 'user_conflict_policy' => 'merge' ] );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/example.com/' );
+
+		// sanitize_user( ..., true ) strips every character from a login made entirely of
+		// disallowed characters, leaving an empty string — wp_insert_user() then fails with
+		// 'empty_user_login', the existing is_wp_error() branch this loop already handles.
+		$this->mock_users( [
+			$this->make_source_user( [
+				'source_user_id' => 603,
+				'user_email'     => 'audit-write-fail@example.test',
+				'user_login'     => '###',
+			] ),
+		] );
+		$this->mock_empty_second_page();
+
+		UserImporter::process( $mid, 0, 0 );
+
+		$rows      = $this->get_write_rows( $jid );
+		$user_rows = array_values( array_filter( $rows, fn( $r ) => 'user' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $user_rows );
+		$this->assertSame( 'failed', $user_rows[0]['outcome'] );
+		$this->assertSame( 603, $user_rows[0]['source_id'] );
+		$this->assertArrayHasKey( 'error', $user_rows[0] );
+
+		$this->assertNull( IdMap::get( IdMap::NETWORK, 'user', 603 ), 'A failed user creation must not be mapped in IdMap.' );
+	}
 }

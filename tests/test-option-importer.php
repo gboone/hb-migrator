@@ -262,4 +262,68 @@ class Test_OptionImporter extends WP_UnitTestCase {
 		$this->assertFalse( $rows[0]['success'] );
 		$this->assertArrayHasKey( 'error', $rows[0] );
 	}
+
+	// -------------------------------------------------------------------------
+	// U4: write-action trail for options (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U4. Write-action trail:
+	// terms, users, options"). OptionImporter is site-job-scoped, so entries are recorded via
+	// AuditReport::record() (scope: site_job). This is the one importer in U4 that needed new
+	// bookkeeping: a get_option() read before update_option() so the trail entry can record a
+	// real created/updated/unchanged outcome.
+	// -------------------------------------------------------------------------
+
+	private function get_write_rows(): array {
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+		return $rows;
+	}
+
+	public function test_process_records_created_outcome_for_option_that_did_not_exist(): void {
+		delete_option( 'hbm_test_imported_option' );
+
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'brand-new-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$rows        = $this->get_write_rows();
+		$option_rows = array_values( array_filter( $rows, fn( $r ) => 'hbm_test_imported_option' === ( $r['name'] ?? null ) ) );
+		$this->assertCount( 1, $option_rows );
+		$this->assertSame( 'created', $option_rows[0]['outcome'] );
+	}
+
+	public function test_process_records_updated_outcome_for_option_that_changed(): void {
+		update_option( 'hbm_test_imported_option', 'old-value' );
+
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'new-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$this->assertSame( 'new-value', get_option( 'hbm_test_imported_option' ) );
+
+		$rows        = $this->get_write_rows();
+		$option_rows = array_values( array_filter( $rows, fn( $r ) => 'hbm_test_imported_option' === ( $r['name'] ?? null ) ) );
+		$this->assertCount( 1, $option_rows );
+		$this->assertSame( 'updated', $option_rows[0]['outcome'] );
+	}
+
+	public function test_process_records_unchanged_outcome_for_option_with_same_value(): void {
+		update_option( 'hbm_test_imported_option', 'same-value' );
+
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'same-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$rows        = $this->get_write_rows();
+		$option_rows = array_values( array_filter( $rows, fn( $r ) => 'hbm_test_imported_option' === ( $r['name'] ?? null ) ) );
+		$this->assertCount( 1, $option_rows );
+		$this->assertSame( 'unchanged', $option_rows[0]['outcome'], 'An option whose value did not actually change must be "unchanged", not "updated".' );
+	}
 }

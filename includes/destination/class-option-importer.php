@@ -121,7 +121,31 @@ class OptionImporter {
 				$stored = is_serialized( $value )
 					? unserialize( $value, [ 'allowed_classes' => false ] ) // phpcs:ignore WordPress.PHP.DiscouragedPHPFunctions.serialize_unserialize
 					: $value;
+
+				// U4 write-action trail (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md):
+				// the one new bookkeeping addition in this unit. update_option() itself never told
+				// us whether the option pre-existed or actually changed, so we read the prior value
+				// first — a dedicated sentinel (not false/null/'') distinguishes "did not exist" from
+				// "existed with a falsy value" — purely to give the trail entry a real
+				// created/updated/unchanged outcome.
+				$missing_sentinel = "\0hbm_option_missing\0";
+				$prior_value      = get_option( $name, $missing_sentinel );
+				if ( $missing_sentinel === $prior_value ) {
+					$outcome = 'created';
+				} elseif ( $prior_value === $stored ) {
+					$outcome = 'unchanged';
+				} else {
+					$outcome = 'updated';
+				}
+
 				update_option( $name, $stored );
+
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'        => 'write',
+					'object_type' => 'option',
+					'name'        => $name,
+					'outcome'     => $outcome,
+				] );
 			}
 
 			// Apply source theme only if it is installed at the destination.
