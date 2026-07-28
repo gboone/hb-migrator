@@ -298,9 +298,10 @@ class PostImporter {
 	 * unit's concern) hashes against, so it carries the raw source fields needed to re-derive a
 	 * normalized content/postmeta hash later: post content, excerpt, serialized postmeta, and
 	 * the source author identifier (post_author_email — the same field import_batch() itself
-	 * uses to resolve the destination author above). Also carries post_name (slug) and post_type
-	 * — R4 explicitly requires comparing slugs across every post type, and neither is derivable
-	 * from the other cached fields.
+	 * uses to resolve the destination author above). Also carries post_name (slug), post_type,
+	 * and post_title — R4 explicitly requires comparing slugs across every post type, and U6's
+	 * own drift-detection scenario requires a title change to register as a mismatch; none of
+	 * the three is derivable from the other cached fields.
 	 */
 	private static function record_write_trail( int $site_job_id, int $source_id, string $outcome, array $p ): void {
 		AuditReport::record( $site_job_id, 'site_job', [
@@ -314,6 +315,7 @@ class PostImporter {
 			'source_author' => $p['post_author_email'] ?? '',
 			'post_name'     => $p['post_name'] ?? '',
 			'post_type'     => $p['post_type'] ?? '',
+			'post_title'    => $p['post_title'] ?? '',
 		] );
 	}
 }
