@@ -258,4 +258,31 @@ class Test_IdMap extends WP_UnitTestCase {
 		IdMap::delete_for_job( 42 );
 		$this->assertNull( IdMap::get( 42, 'post', 1 ) );
 	}
+
+	public function test_get_all_for_job_returns_all_mappings_for_job_and_type(): void {
+		IdMap::set( 50, 'post', 1, 101 );
+		IdMap::set( 50, 'post', 2, 102 );
+		IdMap::set( 50, 'post', 3, 103 );
+
+		$this->assertSame(
+			[
+				1 => 101,
+				2 => 102,
+				3 => 103,
+			],
+			IdMap::get_all_for_job( 50, 'post' )
+		);
+	}
+
+	public function test_get_all_for_job_with_no_entries_returns_empty_array(): void {
+		$this->assertSame( [], IdMap::get_all_for_job( 999, 'post' ) );
+	}
+
+	public function test_get_all_for_job_excludes_other_jobs_and_types(): void {
+		IdMap::set( 60, 'post', 1, 201 );
+		IdMap::set( 61, 'post', 1, 999 ); // different site job, same object_type/source_id.
+		IdMap::set( 60, 'media', 1, 888 ); // same site job, different object_type.
+
+		$this->assertSame( [ 1 => 201 ], IdMap::get_all_for_job( 60, 'post' ) );
+	}
 }
