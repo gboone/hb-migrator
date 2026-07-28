@@ -4,6 +4,7 @@
  */
 
 use HBMigrator\Admin\AdminPage;
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\SearchReplace;
 use HBMigrator\Destination\SyncDispatcher;
 use HBMigrator\Destination\SyncScheduler;
@@ -66,6 +67,25 @@ class Test_Admin_Page extends WP_UnitTestCase {
 			}
 		}
 		return null;
+	}
+
+	/**
+	 * U8: counts hbm_audit_report posts for a given site job — mirrors
+	 * tests/test-audit-report.php's identical helper, duplicated here rather than shared since
+	 * it's a small test-only lookup, not production code.
+	 */
+	private function count_report_posts_for_site_job( int $site_job_id ): int {
+		switch_to_blog( get_main_site_id() );
+		$count = count( get_posts( [
+			'post_type'   => AuditReport::POST_TYPE,
+			'post_status' => 'private',
+			'numberposts' => -1,
+			'fields'      => 'ids',
+			'meta_key'    => '_hbm_audit_site_job_id',
+			'meta_value'  => $site_job_id,
+		] ) );
+		restore_current_blog();
+		return $count;
 	}
 
 	/**
@@ -436,6 +456,80 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		$this->assertNotNull( $this->find_pending_sync_action( $other_jid ), "Another migration's recurring sync action must survive." );
 	}
 
+	public function test_handle_clear_migration_deletes_reports_for_every_syncing_site_job(): void {
+		// U8 integration: stop_syncing_jobs_for_migration() (the bulk "Clear" path) must delete
+		// the report for every syncing site job it finalizes in the loop, not just the first one.
+		$this->login_as_network_admin();
+		[ $mid, $jid1 ] = $this->make_complete_site_job( get_current_blog_id() );
+		$jid2 = MigrationRegistry::create_site_job( $mid, 2, 'sync2.example.com', 'https://sync2.example.com', '', '/sync2/' );
+		MigrationRegistry::update_site_job( $jid2, [ 'status' => 'complete', 'dest_blog_id' => get_current_blog_id() ] );
+
+		MigrationRegistry::enable_site_job_sync( $jid1 );
+		MigrationRegistry::enable_site_job_sync( $jid2 );
+		SyncScheduler::schedule( $jid1 );
+		SyncScheduler::schedule( $jid2 );
+		AuditReport::get_or_create_for_site_job( $jid1 );
+		AuditReport::get_or_create_for_site_job( $jid2 );
+
+		$this->assertSame( 1, $this->count_report_posts_for_site_job( $jid1 ), 'Precondition: jid1 has a report before clearing.' );
+		$this->assertSame( 1, $this->count_report_posts_for_site_job( $jid2 ), 'Precondition: jid2 has a report before clearing.' );
+
+		update_site_option( 'hbm_active_migration', [
+			'migration_id' => $mid,
+			'dest_url'     => 'https://93.184.216.34',
+			'dest_key'     => 'key',
+			'status_token' => 'tok',
+			'started_at'   => time(),
+		] );
+
+		$this->mock_clear_migration_destination_calls();
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
+
+		try {
+			AdminPage::handle_clear_migration();
+		} catch ( \Throwable $e ) {}
+
+		$_POST = [];
+
+		$this->assertSame( 0, $this->count_report_posts_for_site_job( $jid1 ), 'Clearing must delete jid1\'s report.' );
+		$this->assertSame( 0, $this->count_report_posts_for_site_job( $jid2 ), 'Clearing must delete jid2\'s report too, not just the first one touched.' );
+	}
+
+	public function test_handle_clear_migration_does_not_delete_report_for_a_site_job_that_never_synced(): void {
+		// Non-goal, explicitly verified: a site job that completes but never enables sync keeps
+		// its report indefinitely — none of the three sync-finalize cleanup call sites fire for
+		// it, so Clear (which only finalizes *syncing* jobs) must leave its report untouched.
+		$this->login_as_network_admin();
+		[ $mid, $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		// Sync never enabled — status stays 'complete'.
+		AuditReport::get_or_create_for_site_job( $jid );
+		$this->assertSame( 1, $this->count_report_posts_for_site_job( $jid ), 'Precondition: report exists before clearing.' );
+
+		update_site_option( 'hbm_active_migration', [
+			'migration_id' => $mid,
+			'dest_url'     => 'https://93.184.216.34',
+			'dest_key'     => 'key',
+			'status_token' => 'tok',
+			'started_at'   => time(),
+		] );
+
+		$this->mock_clear_migration_destination_calls();
+
+		$_POST = [ '_wpnonce' => wp_create_nonce( 'hbm_clear_migration' ) ];
+		$_REQUEST = $_POST;
+
+		try {
+			AdminPage::handle_clear_migration();
+		} catch ( \Throwable $e ) {}
+
+		$_POST = [];
+
+		$this->assertSame( 'complete', MigrationRegistry::get_site_job( $jid )->status, 'A site job that never enabled sync must be untouched by Clear.' );
+		$this->assertSame( 1, $this->count_report_posts_for_site_job( $jid ), 'A report for a site job that never enabled sync must not be deleted.' );
+	}
+
 	public function test_handle_clear_migration_with_no_syncing_jobs_regresses_to_original_behavior(): void {
 		// Regression guard: a migration whose site job never enabled sync must clear exactly as
 		// it did before this fix — no status change on the job, history saved, active option
@@ -725,6 +819,51 @@ class Test_Admin_Page extends WP_UnitTestCase {
 		} catch ( \Throwable $e ) {}
 
 		$this->assertSame( 'complete', MigrationRegistry::get_site_job( $jid )->status, 'Status must be unchanged on rejection.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// handle_finalize_sync() — U8: audit report cleanup.
+	// -------------------------------------------------------------------------
+
+	public function test_handle_finalize_sync_deletes_the_site_jobs_report(): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+		AuditReport::get_or_create_for_site_job( $jid );
+		$this->assertSame( 1, $this->count_report_posts_for_site_job( $jid ), 'Precondition: report exists before finalizing.' );
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_finalize_sync' ),
+			'site_job_id' => $jid,
+		];
+		$_REQUEST = $_POST;
+
+		try {
+			AdminPage::handle_finalize_sync();
+		} catch ( \Throwable $e ) {}
+
+		$this->assertSame( 0, $this->count_report_posts_for_site_job( $jid ), 'Finalizing sync must delete the site job\'s audit report.' );
+	}
+
+	public function test_handle_finalize_sync_with_no_report_is_a_safe_noop(): void {
+		$this->login_as_network_admin();
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+		// Deliberately no AuditReport::get_or_create_for_site_job() call — no report exists.
+
+		$_POST = [
+			'_wpnonce'    => wp_create_nonce( 'hbm_finalize_sync' ),
+			'site_job_id' => $jid,
+		];
+		$_REQUEST = $_POST;
+
+		try {
+			AdminPage::handle_finalize_sync();
+		} catch ( \Throwable $e ) {}
+
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertSame( 'finalized', $job->status, 'Finalizing must still succeed when there is no report to delete.' );
+		$this->assertSame( 0, $this->count_report_posts_for_site_job( $jid ) );
 	}
 
 	public function test_handle_finalize_sync_rejects_invalid_nonce(): void {
