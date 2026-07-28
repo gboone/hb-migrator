@@ -249,6 +249,45 @@ class MigrationRegistry {
 		) ?: [];
 	}
 
+	/**
+	 * Finds the site job whose source_domain, or whose resolved destination domain,
+	 * matches the given domain — used by Cli\MigrationKeyCommand's --domain flag so an
+	 * operator can identify a migration without already knowing its numeric ID. A
+	 * migration's source_api_key is shared across every site job under it, but a domain
+	 * only ever identifies one specific site job (or none), so this resolves to the site
+	 * job and callers read ->migration_id from it.
+	 *
+	 * Checks source_domain first (a single indexed-shape SQL match, and the common case —
+	 * an operator troubleshooting a specific site already knows its source domain).
+	 * Destination domain isn't a stored column (a site job's destination is a WP_Site,
+	 * addressed by dest_blog_id; get_site() resolves its domain), so that check falls back
+	 * to scanning site jobs with a resolved dest_blog_id.
+	 */
+	public static function find_site_job_by_domain( string $domain ): ?object {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_site_jobs';
+
+		$job = $wpdb->get_row( $wpdb->prepare(
+			"SELECT * FROM `$table` WHERE source_domain = %s ORDER BY id DESC LIMIT 1",
+			$domain
+		) );
+		if ( $job ) {
+			return $job;
+		}
+
+		$candidates = $wpdb->get_results(
+			"SELECT * FROM `$table` WHERE dest_blog_id IS NOT NULL AND dest_blog_id > 0 ORDER BY id DESC"
+		) ?: [];
+		foreach ( $candidates as $candidate ) {
+			$site = get_site( (int) $candidate->dest_blog_id );
+			if ( $site && $site->domain === $domain ) {
+				return $candidate;
+			}
+		}
+
+		return null;
+	}
+
 	public static function all_sites_complete( int $migration_id ): bool {
 		$jobs = self::get_site_jobs_for_migration( $migration_id );
 		if ( empty( $jobs ) ) {

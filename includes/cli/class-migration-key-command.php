@@ -27,19 +27,24 @@ class MigrationKeyCommand {
 	 *
 	 * ## OPTIONS
 	 *
-	 * <migration_id>
-	 * : The hbm_migrations row ID. If you only know the affected site's domain, look
-	 * it up first via `SELECT migration_id FROM hbm_site_jobs WHERE source_domain =
-	 * '...'` — one destination migration can cover several source site jobs.
+	 * [<migration_id>]
+	 * : The hbm_migrations row ID. Omit this and pass --domain instead if you only know
+	 * the affected site's domain. Use `list` to browse migrations and site jobs.
+	 *
+	 * [--domain=<domain>]
+	 * : Look up the migration via a site's source or destination domain instead of a
+	 * migration ID.
 	 *
 	 * ## EXAMPLES
 	 *
 	 *     wp hbm migration source-key get 42
+	 *     wp hbm migration source-key get --domain=blog.example.com
 	 *
-	 * @param array $args Positional arguments.
+	 * @param array $args       Positional arguments.
+	 * @param array $assoc_args Associative arguments (flags).
 	 */
-	public function get( array $args ): void {
-		$migration = $this->require_migration( $args[0] );
+	public function get( array $args, array $assoc_args ): void {
+		$migration = $this->require_migration( $args, $assoc_args );
 
 		\WP_CLI::line( sprintf( 'Migration ID:   %d', $migration->id ) );
 		\WP_CLI::line( sprintf( 'Source URL:     %s', $migration->source_url ) );
@@ -57,23 +62,40 @@ class MigrationKeyCommand {
 	 *
 	 * ## OPTIONS
 	 *
-	 * <migration_id>
-	 * : The hbm_migrations row ID to update.
+	 * [<migration_id>]
+	 * : The hbm_migrations row ID to update. Omit this and pass --domain instead if you
+	 * only know the affected site's domain.
 	 *
 	 * <key>
 	 * : The new source_api_key value. Copy this from source's own `hbm_api_key`
 	 * network option — run `wp option get hbm_api_key` against source's main network
 	 * site, not a subsite.
 	 *
+	 * [--domain=<domain>]
+	 * : Look up the migration via a site's source or destination domain instead of a
+	 * migration ID.
+	 *
 	 * ## EXAMPLES
 	 *
 	 *     wp hbm migration source-key update 42 3f9c1e...a04b
+	 *     wp hbm migration source-key update --domain=blog.example.com 3f9c1e...a04b
 	 *
-	 * @param array $args Positional arguments.
+	 * @param array $args       Positional arguments.
+	 * @param array $assoc_args Associative arguments (flags).
 	 */
-	public function update( array $args ): void {
-		[ $migration_id_raw, $key ] = $args;
-		$migration = $this->require_migration( $migration_id_raw );
+	public function update( array $args, array $assoc_args ): void {
+		// <migration_id> is only present in $args when --domain wasn't used, so <key> is
+		// whichever positional comes last. A stray extra positional alongside --domain
+		// (e.g. `update 2 newkey --domain=...`) would otherwise silently swallow the
+		// migration_id into $key instead of catching the ambiguity — reject it explicitly.
+		$has_domain = ! empty( $assoc_args['domain'] );
+		if ( $has_domain && count( $args ) > 1 ) {
+			\WP_CLI::error( 'Pass either <migration_id> or --domain, not both.' );
+		}
+		$id_args = $has_domain ? [] : [ $args[0] ?? '' ];
+		$key     = $has_domain ? ( $args[0] ?? '' ) : ( $args[1] ?? '' );
+
+		$migration = $this->require_migration( $id_args, $assoc_args );
 
 		$key = trim( $key );
 		if ( '' === $key ) {
@@ -95,8 +117,13 @@ class MigrationKeyCommand {
 	 *
 	 * ## OPTIONS
 	 *
-	 * <migration_id>
-	 * : The hbm_migrations row ID to clear.
+	 * [<migration_id>]
+	 * : The hbm_migrations row ID to clear. Omit this and pass --domain instead if you
+	 * only know the affected site's domain.
+	 *
+	 * [--domain=<domain>]
+	 * : Look up the migration via a site's source or destination domain instead of a
+	 * migration ID.
 	 *
 	 * [--yes]
 	 * : Skip the confirmation prompt.
@@ -104,12 +131,13 @@ class MigrationKeyCommand {
 	 * ## EXAMPLES
 	 *
 	 *     wp hbm migration source-key delete 42
+	 *     wp hbm migration source-key delete --domain=blog.example.com
 	 *
 	 * @param array $args       Positional arguments.
 	 * @param array $assoc_args Associative arguments (flags).
 	 */
 	public function delete( array $args, array $assoc_args ): void {
-		$migration = $this->require_migration( $args[0] );
+		$migration = $this->require_migration( $args, $assoc_args );
 
 		\WP_CLI::confirm(
 			sprintf(
@@ -125,10 +153,112 @@ class MigrationKeyCommand {
 	}
 
 	/**
-	 * Resolves a raw CLI argument to an existing migration row, or halts with a clean
-	 * WP_CLI error (rather than a raw type/DB error) when it doesn't resolve to one.
+	 * Lists every migration's site jobs — status, source domain, and resolved
+	 * destination domain — so an operator can find the migration_id (or confirm the
+	 * --domain value) for `get`/`update`/`delete` without writing SQL. One row per site
+	 * job, not per migration: a migration's source_api_key is shared across all its
+	 * site jobs, but domains and status only ever exist at the site-job level.
+	 *
+	 * ## OPTIONS
+	 *
+	 * [--format=<format>]
+	 * : Render output in a different format.
+	 * ---
+	 * default: table
+	 * options:
+	 *   - table
+	 *   - csv
+	 *   - json
+	 *   - yaml
+	 *   - count
+	 * ---
+	 *
+	 * ## EXAMPLES
+	 *
+	 *     wp hbm migration source-key list
+	 *     wp hbm migration source-key list --format=csv
+	 *
+	 * @param array $args       Positional arguments (unused).
+	 * @param array $assoc_args Associative arguments (flags).
 	 */
-	private function require_migration( string $migration_id_raw ): object {
+	public function list( array $args, array $assoc_args ): void {
+		$rows = [];
+		foreach ( MigrationRegistry::list_migrations() as $migration ) {
+			foreach ( MigrationRegistry::get_site_jobs_for_migration( (int) $migration->id ) as $job ) {
+				$rows[] = [
+					'migration_id'  => (int) $migration->id,
+					'site_job_id'   => (int) $job->id,
+					'status'        => $job->status,
+					'source_domain' => $job->source_domain,
+					'dest_domain'   => self::resolve_dest_domain( $job ),
+				];
+			}
+		}
+
+		\WP_CLI\Utils\format_items(
+			\WP_CLI\Utils\get_flag_value( $assoc_args, 'format', 'table' ),
+			$rows,
+			[ 'migration_id', 'site_job_id', 'status', 'source_domain', 'dest_domain' ]
+		);
+	}
+
+	/**
+	 * Resolves a site job's destination domain via its dest_blog_id — not a stored
+	 * column, since a site job's destination is a WP_Site, addressed by ID (see
+	 * MigrationRegistry::find_site_job_by_domain()'s docblock for why).
+	 */
+	private static function resolve_dest_domain( object $job ): string {
+		if ( empty( $job->dest_blog_id ) ) {
+			return '(unassigned)';
+		}
+		$site = get_site( (int) $job->dest_blog_id );
+		return $site ? $site->domain : '(unknown)';
+	}
+
+	/**
+	 * Resolves a migration from either a positional migration_id or a --domain flag, or
+	 * halts with a clean WP_CLI error (rather than a raw type/DB error) when neither
+	 * resolves to one.
+	 *
+	 * @param array $id_args    Positional arguments containing only the identifier slot
+	 *                          (migration_id), if present — callers with additional
+	 *                          positionals (e.g. update()'s <key>) must slice those out
+	 *                          before calling this.
+	 * @param array $assoc_args Associative arguments (flags) — reads 'domain'.
+	 */
+	private function require_migration( array $id_args, array $assoc_args ): object {
+		$domain           = isset( $assoc_args['domain'] ) ? trim( (string) $assoc_args['domain'] ) : '';
+		// Not trimmed — resolve_migration_id() deliberately rejects whitespace-padded
+		// input rather than silently cleaning it (see its own tests).
+		$migration_id_raw = (string) ( $id_args[0] ?? '' );
+
+		if ( '' !== $domain ) {
+			if ( '' !== $migration_id_raw ) {
+				\WP_CLI::error( 'Pass either <migration_id> or --domain, not both.' );
+			}
+
+			$site_job = MigrationRegistry::find_site_job_by_domain( $domain );
+			if ( ! $site_job ) {
+				\WP_CLI::error( sprintf( 'No site job found for domain "%s". Use `list` to browse known domains.', $domain ) );
+			}
+
+			$migration = MigrationRegistry::get_migration( (int) $site_job->migration_id );
+			if ( ! $migration ) {
+				\WP_CLI::error( sprintf(
+					'Site job %d for domain "%s" references missing migration %d.',
+					$site_job->id,
+					$domain,
+					$site_job->migration_id
+				) );
+			}
+
+			return $migration;
+		}
+
+		if ( '' === $migration_id_raw ) {
+			\WP_CLI::error( 'Pass either <migration_id> or --domain.' );
+		}
+
 		$migration_id = self::resolve_migration_id( $migration_id_raw );
 		$migration    = null !== $migration_id ? MigrationRegistry::get_migration( $migration_id ) : null;
 

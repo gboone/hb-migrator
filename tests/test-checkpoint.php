@@ -97,6 +97,46 @@ class Test_MigrationRegistry extends WP_UnitTestCase {
 		$this->assertTrue( MigrationRegistry::all_sites_complete( $mid ) );
 	}
 
+	public function test_find_site_job_by_domain_matches_source_domain(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'blog.example.com', 'https://blog.example.com', '', '/blog/' );
+
+		$found = MigrationRegistry::find_site_job_by_domain( 'blog.example.com' );
+		$this->assertNotNull( $found );
+		$this->assertSame( $jid, (int) $found->id );
+	}
+
+	public function test_find_site_job_by_domain_matches_destination_domain(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'find_site_job_by_domain() dest-domain resolution requires multisite.' );
+		}
+
+		$dest_blog_id = (int) wp_insert_site( [
+			'domain'     => get_network()->domain,
+			'path'       => '/find-by-domain-test-' . wp_generate_password( 6, false ) . '/',
+			'network_id' => (int) get_network()->id,
+			'title'      => 'Find By Domain Test',
+			'user_id'    => 1,
+		] );
+
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		// Deliberately no source_domain match for the destination domain we'll search for,
+		// so this only resolves via the dest_blog_id -> get_site() fallback.
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'no-match-here.example.com', 'https://no-match-here.example.com', '', '/find-by-domain-test/' );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => $dest_blog_id ] );
+
+		$found = MigrationRegistry::find_site_job_by_domain( get_network()->domain );
+		$this->assertNotNull( $found );
+		$this->assertSame( $jid, (int) $found->id );
+	}
+
+	public function test_find_site_job_by_domain_returns_null_when_no_match(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		MigrationRegistry::create_site_job( $mid, 1, 'blog.example.com', 'https://blog.example.com', '', '/blog/' );
+
+		$this->assertNull( MigrationRegistry::find_site_job_by_domain( 'totally-unrelated.example.com' ) );
+	}
+
 	public function test_schema_upgrade_updates_version(): void {
 		delete_site_option( 'hbm_db_version' );
 		// maybe_create_or_upgrade() only runs in an admin or WP_CLI context (race-avoidance
