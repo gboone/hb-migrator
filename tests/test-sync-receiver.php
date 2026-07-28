@@ -18,6 +18,7 @@
  * business-rule and side-effect-parity assertions.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\SyncDispatcher;
 use HBMigrator\Destination\SyncReceiver;
 use HBMigrator\Destination\SyncScheduler;
@@ -112,6 +113,25 @@ class Test_SyncReceiver extends WP_UnitTestCase {
 				'filename' => null,
 			];
 		}, 10, 3 );
+	}
+
+	/**
+	 * U8: counts hbm_audit_report posts for a given site job — mirrors
+	 * tests/test-audit-report.php's identical helper, duplicated here rather than shared since
+	 * it's a small test-only lookup, not production code.
+	 */
+	private function count_report_posts_for_site_job( int $site_job_id ): int {
+		switch_to_blog( get_main_site_id() );
+		$count = count( get_posts( [
+			'post_type'   => AuditReport::POST_TYPE,
+			'post_status' => 'private',
+			'numberposts' => -1,
+			'fields'      => 'ids',
+			'meta_key'    => '_hbm_audit_site_job_id',
+			'meta_value'  => $site_job_id,
+		] ) );
+		restore_current_blog();
+		return $count;
 	}
 
 	private function pending_actions_for( int $site_job_id ): array {
@@ -487,6 +507,34 @@ class Test_SyncReceiver extends WP_UnitTestCase {
 
 		$this->assertSame( 200, $response->get_status() );
 		$this->assertEmpty( $this->pending_actions_for( $jid ), 'finalize_sync() must unschedule the recurring action, mirroring Admin\AdminPage::handle_finalize_sync().' );
+	}
+
+	// -------------------------------------------------------------------------
+	// finalize_sync() — U8: audit report cleanup, mirroring Admin\AdminPage::
+	// handle_finalize_sync()'s identical side effect.
+	// -------------------------------------------------------------------------
+
+	public function test_finalize_sync_deletes_the_site_jobs_report(): void {
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+		AuditReport::get_or_create_for_site_job( $jid );
+		$this->assertSame( 1, $this->count_report_posts_for_site_job( $jid ), 'Precondition: report exists before finalizing.' );
+
+		$response = SyncReceiver::finalize_sync( $this->job_request( $jid ) );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertSame( 0, $this->count_report_posts_for_site_job( $jid ), 'finalize_sync() must delete the site job\'s audit report.' );
+	}
+
+	public function test_finalize_sync_with_no_report_is_a_safe_noop(): void {
+		[ , $jid ] = $this->make_complete_site_job( get_current_blog_id() );
+		MigrationRegistry::enable_site_job_sync( $jid );
+		// Deliberately no AuditReport::get_or_create_for_site_job() call — no report exists.
+
+		$response = SyncReceiver::finalize_sync( $this->job_request( $jid ) );
+
+		$this->assertSame( 200, $response->get_status() );
+		$this->assertSame( 0, $this->count_report_posts_for_site_job( $jid ) );
 	}
 
 	public function test_finalizing_one_site_job_does_not_unschedule_another(): void {
