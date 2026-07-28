@@ -117,7 +117,20 @@ class SearchReplace {
 		// U7: enqueue the audit comparator's self-chaining entry point rather than calling it
 		// synchronously — comparison can take arbitrarily long across many self-chained batches
 		// (see AuditComparator::process()) and must never delay finalize() itself completing.
-		as_enqueue_async_action( 'hbm_audit_compare', [ 'site_job_id' => $site_job_id, 'last_pk' => 0 ], 'hb-migrator' );
+		// Wrapped in its own try/catch (found during code review): this call sits inside
+		// process()'s single outer try/catch, which on any \Throwable calls
+		// PipelineController::handle_batch_failure() with this invocation's original args — an
+		// unprotected failure here (e.g. a transient Action Scheduler/DB write error) would be
+		// caught AFTER the site job's status already flipped to 'complete' above, and after
+		// enough retries could regress an already-complete site job back to 'failed' purely
+		// because this one audit-layer enqueue call failed — exactly the failure cascade this
+		// whole feature is designed to prevent. Never let a failure here reach that path.
+		try {
+			as_enqueue_async_action( 'hbm_audit_compare', [ 'site_job_id' => $site_job_id, 'last_pk' => 0 ], 'hb-migrator' );
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: failed to enqueue hbm_audit_compare for site job ' . $site_job_id . ': ' . $e->getMessage() );
+		}
 
 		// complete_migration() uses a NOT EXISTS subquery to atomically check that all
 		// site jobs are complete before updating the migration row — no separate read needed.

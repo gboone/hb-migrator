@@ -465,6 +465,30 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		$this->assertSame( 'Second Attempt Title', $result['expected_title'] );
 	}
 
+	public function test_landed_post_is_still_compared_when_latest_entry_is_a_failed_retry(): void {
+		// Found during code review: a source_id can land successfully on an earlier attempt
+		// (real IdMap entry), then a LATER retried batch's wp_update_post() call can fail for
+		// that same source_id (e.g. a transient DB error), recording a 'failed' outcome without
+		// ever clearing the earlier successful IdMap entry. The comparator must gate on the real
+		// (non-zero) dest_id, not blindly trust the latest entry's outcome string, or it
+		// mischaracterizes a genuinely-landed, genuinely-divergent post as merely "not comparable".
+		$source_id = 902;
+		$dest_id   = $this->create_dest_post( [ 'post_title' => 'Stale Destination Title', 'post_name' => 'stale-slug' ] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+
+		// First (successful) attempt.
+		$this->record_post_entry( $source_id, 'created', [ 'post_title' => 'Original Title', 'post_name' => 'stale-slug' ] );
+		// Second (retried) attempt's wp_update_post() call fails — recorded 'failed', but the
+		// IdMap entry from the first attempt is untouched, so this source_id genuinely landed.
+		$this->record_post_entry( $source_id, 'failed', [ 'post_title' => 'Updated Title That Never Landed', 'post_name' => 'stale-slug' ] );
+
+		AuditComparator::compare_batch( $this->jid, 0 );
+		$result = $this->get_result( $source_id );
+
+		$this->assertTrue( $result['comparable'], 'A source_id with a real (non-zero) dest_id must still be compared, even if its LATEST write-trail entry outcome is "failed".' );
+		$this->assertNotSame( 'source_write_failed', $result['reason'] ?? null );
+	}
+
 	// -------------------------------------------------------------------------
 	// Nothing to compare: no IdMap posts at all, or a missing site job.
 	// -------------------------------------------------------------------------
@@ -475,6 +499,42 @@ class Test_AuditComparator extends WP_UnitTestCase {
 
 	public function test_compare_batch_returns_null_for_missing_site_job(): void {
 		$this->assertNull( AuditComparator::compare_batch( 999999999, 0 ) );
+	}
+
+	// -------------------------------------------------------------------------
+	// Found during code review: if the site job's status has moved on from 'complete' (sync was
+	// enabled, or sync was finalized/cleared and the report was already deleted) since this
+	// comparison run started, compare_batch()/process() must bail rather than diff against a
+	// possibly sync-modified destination or resurrect a deleted report post.
+	// -------------------------------------------------------------------------
+
+	public function test_compare_batch_bails_when_site_job_is_no_longer_complete(): void {
+		$source_id = 903;
+		$dest_id   = $this->create_dest_post();
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created' );
+
+		// Simulate sync having been enabled for this site job since the comparison was enqueued.
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'syncing' ] );
+
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ), 'compare_batch() must bail (return null) once the site job is no longer complete.' );
+		$this->assertSame( [], AuditComparator::get_post_comparison_results( $this->jid ), 'No comparison result should be stored once the site job has moved on from complete.' );
+	}
+
+	public function test_process_does_not_render_summary_when_site_job_is_no_longer_complete(): void {
+		$source_id = 904;
+		$dest_id   = $this->create_dest_post();
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created' );
+
+		// Simulate sync being enabled (or the report being deleted via sync finalize) in the
+		// narrow window between the last compare_batch() call and process()'s render step.
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'syncing' ] );
+
+		AuditComparator::process( $this->jid, 0 );
+
+		$content = $this->get_report_content();
+		$this->assertSame( '', $content, 'process() must not render a summary once the site job has moved on from complete.' );
 	}
 
 	// -------------------------------------------------------------------------
@@ -829,6 +889,56 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		// finalize() must never call the comparator synchronously — only the action is
 		// enqueued, no comparison work has actually run yet.
 		$this->assertSame( [], AuditComparator::get_post_comparison_results( $this->jid ), 'finalize() must not synchronously invoke compare_batch()/process() — comparison only runs once the enqueued action executes.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Found during code review: SearchReplace::finalize()'s hbm_audit_compare enqueue call sits
+	// inside SearchReplace::process()'s own outer try/catch, which feeds
+	// PipelineController::handle_batch_failure() on any \Throwable. If the enqueue itself throws
+	// (e.g. a transient Action Scheduler/DB error) and isn't independently contained, that
+	// failure could eventually regress an already-'complete' site job back to 'failed' — exactly
+	// the cascade this whole feature is designed to prevent. Verifies finalize() itself survives
+	// (and the migration still completes) even when the enqueue call throws.
+	// -------------------------------------------------------------------------
+
+	public function test_finalize_survives_a_forced_audit_compare_enqueue_failure(): void {
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'running' ] );
+		MigrationRegistry::update_migration_status( $this->mid, 'running' );
+
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) {
+			if ( 'hbm_audit_compare' === $hook ) {
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure.' );
+			}
+			return $pre;
+		}, 10, 2 );
+
+		$ref    = new ReflectionClass( SearchReplace::class );
+		$method = $ref->getMethod( 'finalize' );
+		$method->setAccessible( true );
+
+		global $wpdb;
+		$suppress = $wpdb->suppress_errors( true );
+		try {
+			// The forced RuntimeException above must not propagate out of finalize() itself.
+			$method->invoke( null, $this->jid, $this->mid, get_current_blog_id() );
+		} finally {
+			$wpdb->suppress_errors( $suppress );
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+		}
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 'complete', $job->status, 'A failure enqueuing hbm_audit_compare must never regress the site job away from complete.' );
+
+		$migration = MigrationRegistry::get_migration( $this->mid );
+		$this->assertSame( 'complete', $migration->status, 'finalize() must still complete the migration even when the audit-compare enqueue fails.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => 0 ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 10,
+		] );
+		$this->assertCount( 0, $scheduled, 'No action should have actually been enqueued given the forced failure.' );
 	}
 
 	// -------------------------------------------------------------------------

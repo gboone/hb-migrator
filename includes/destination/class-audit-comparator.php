@@ -115,7 +115,30 @@ class AuditComparator {
 			return null;
 		}
 
-		$driving_map = self::load_driving_post_map( $site_job_id );
+		// Bail if the site job has moved on from 'complete' since this comparison run started
+		// (found during code review). Two races this guards against: (1) sync gets enabled
+		// (status -> 'syncing') while a large migration's self-chained comparison is still
+		// in-flight — without this check, a later batch would diff the destination's current
+		// (sync-modified) content against the stale pre-sync cached snapshot and misreport a
+		// legitimate sync write as drift; (2) sync gets finalized/cleared (which can only happen
+		// after status has already left 'complete') and AuditReport::delete_for_site_job() runs —
+		// without this check, a still-in-flight batch would call get_or_create_for_site_job() and
+		// resurrect the just-deleted report post full of "not comparable" garbage. Re-checked
+		// fresh on every self-chained invocation (this method re-fetches $job every call), not
+		// just once, since sync can be enabled at any point after finalize() first enqueues this.
+		if ( 'complete' !== $job->status ) {
+			return null;
+		}
+
+		// Built once per compare_batch() call, not cached across calls — an accepted tradeoff
+		// (see final report): re-reads every _hbm_audit_write row for this report post on every
+		// call, which is the cost of not introducing any new cross-call persistence beyond this
+		// unit's own scope. Computed exactly once here (found during code review — this used to
+		// be loaded a second time inside load_driving_post_map() with identical arguments) and
+		// passed to both load_driving_post_map() and the per-item loop below.
+		$write_entries = self::load_latest_write_entries( $site_job_id, 'post' );
+
+		$driving_map = self::load_driving_post_map( $site_job_id, $write_entries );
 		if ( empty( $driving_map ) ) {
 			return null;
 		}
@@ -130,11 +153,6 @@ class AuditComparator {
 
 		$replacements   = self::build_replacements( $job );
 		$attachment_map = IdMap::get_all_for_job( $site_job_id, 'attachment' );
-		// Built once per compare_batch() call, not cached across calls — an accepted tradeoff
-		// (see final report): re-reads every _hbm_audit_write row for this report post on every
-		// call, which is the cost of not introducing any new cross-call persistence beyond this
-		// unit's own scope.
-		$write_entries = self::load_latest_write_entries( $site_job_id, 'post' );
 
 		$started    = microtime( true );
 		$time_limit = self::time_limit();
@@ -169,21 +187,33 @@ class AuditComparator {
 	 * The keyset-paginated "table" compare_batch() scans, sorted ascending for a stable cursor.
 	 * IdMap::get_all_for_job() is the authoritative, deduplicated "what actually landed" list
 	 * (a source_id only appears here once it has a real destination row — see plan's IdMap
-	 * grounding), so it is the base of this map. A source_id whose *latest* write-trail entry is
-	 * 'failed' never gets an IdMap entry at all (PostImporter only calls IdMap::set() on
-	 * success) — but the plan explicitly wants failed attempts surfaced as "not comparable/
-	 * failed to import" rather than silently dropped (see compare_post()). Reconciling both:
-	 * failed-only source_ids (no IdMap entry, latest outcome 'failed') are added to the driving
-	 * map with a dest_id of 0 (no destination row exists to compare against), merged into the
-	 * same sorted keyset so a single cursor covers both landed and permanently-failed items in
-	 * one deterministic pass. This is a judgment call beyond the plan's literal prose — flagged
-	 * in the final report.
+	 * grounding), so it is the base of this map. A source_id with NO IdMap entry at all and a
+	 * *latest* write-trail outcome of 'failed' never landed (PostImporter only calls
+	 * IdMap::set() on success) — but the plan explicitly wants failed attempts surfaced as "not
+	 * comparable/failed to import" rather than silently dropped (see compare_post()). Reconciling
+	 * both: failed-only source_ids (no IdMap entry, latest outcome 'failed') are added to the
+	 * driving map with a dest_id of 0 (no destination row exists to compare against), merged into
+	 * the same sorted keyset so a single cursor covers both landed and permanently-failed items in
+	 * one deterministic pass. This is a judgment call beyond the plan's literal prose.
+	 *
+	 * Note this is NOT a claim that 'failed' outcome and IdMap-presence are mutually exclusive in
+	 * general — a resumed/retried batch can record a LATER 'failed' entry (e.g. a wp_update_post()
+	 * failure) for a source_id that already landed on an EARLIER successful attempt, so IdMap
+	 * still holds a real dest_id for it. Those source_ids stay in $landed with their real dest_id
+	 * (never added to $failed here, since `isset($landed[$source_id])` is false only for
+	 * genuinely-never-landed items) — compare_post() is responsible for not re-deriving "did this
+	 * land" purely from the latest outcome string once a real dest_id is in hand (found during
+	 * code review — see that method's $dest_id <= 0 gate).
+	 *
+	 * @param array $write_entries Pre-loaded via load_latest_write_entries($site_job_id, 'post')
+	 *                             — passed in rather than reloaded here (found during code
+	 *                             review: this method used to re-fetch the exact same data
+	 *                             compare_batch_inner() had already loaded moments earlier).
 	 */
-	private static function load_driving_post_map( int $site_job_id ): array {
+	private static function load_driving_post_map( int $site_job_id, array $write_entries ): array {
 		$landed = IdMap::get_all_for_job( $site_job_id, 'post' );
 
-		$write_entries = self::load_latest_write_entries( $site_job_id, 'post' );
-		$failed        = [];
+		$failed = [];
 		foreach ( $write_entries as $source_id => $entry ) {
 			if ( ! isset( $landed[ $source_id ] ) && 'failed' === (string) ( $entry['outcome'] ?? '' ) ) {
 				$failed[ $source_id ] = 0;
@@ -224,8 +254,16 @@ class AuditComparator {
 		}
 
 		$outcome = (string) ( $entry['outcome'] ?? '' );
-		if ( 'failed' === $outcome ) {
-			// Nothing landed on destination for this item — surfaced as "not comparable /
+		// Gate on $dest_id, not the latest entry's outcome alone: a resumed/retried batch can
+		// record a 'failed' entry for a source_id that already landed on an EARLIER successful
+		// attempt (PostImporter::import_batch()'s update branch records 'failed' on a
+		// wp_update_post() failure without ever clearing that item's IdMap entry from its prior
+		// successful insert). load_driving_post_map() already resolves the correct non-zero
+		// $dest_id for this case from IdMap — trusting the latest entry's outcome instead would
+		// mischaracterize a genuinely-landed post as "not comparable", hiding real drift on
+		// exactly the posts most likely to have it (found during code review).
+		if ( 'failed' === $outcome && $dest_id <= 0 ) {
+			// Nothing ever landed on destination for this item — surfaced as "not comparable /
 			// failed to import" per the plan, not silently dropped, but not hashed either.
 			return $base + [
 				'comparable' => false,
@@ -442,6 +480,15 @@ class AuditComparator {
 					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
 					'hb-migrator'
 				);
+				return;
+			}
+
+			// Same status guard as compare_batch_inner() (found during code review): if sync was
+			// enabled/finalized in the narrow window between the last compare_batch() call
+			// returning null and this render step, skip rendering — a stale-vs-post-sync summary,
+			// or resurrecting a just-deleted report post, is worse than no final render at all.
+			$job = MigrationRegistry::get_site_job( $site_job_id );
+			if ( ! $job || 'complete' !== $job->status ) {
 				return;
 			}
 
