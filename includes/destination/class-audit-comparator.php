@@ -345,7 +345,12 @@ class AuditComparator {
 
 		switch_to_blog( get_main_site_id() );
 		try {
-			add_post_meta( $post_id, self::META_RESULT, $result, false );
+			// add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
+			// wp_unslash()'s $meta_value before storing, silently stripping any backslash a
+			// source-derived field (expected_title/expected_slug, etc.) might legitimately
+			// contain — wp_slash() here cancels that out, mirroring the identical fix in
+			// AuditReport::append_entry().
+			add_post_meta( $post_id, self::META_RESULT, wp_slash( $result ), false );
 			// Same rationale as AuditReport::append_entry(): a caller mid-loop (PostImporter's
 			// own import_batch()) may have set wp_suspend_cache_invalidation( true ) earlier in
 			// the same request — though by the time the comparator runs (after SearchReplace::

@@ -97,6 +97,26 @@ class Test_Audit_Report extends WP_UnitTestCase {
 		$this->assertSame( [ 1, 2, 3 ], $object_ids );
 	}
 
+	public function test_record_preserves_backslashes_in_entry_data(): void {
+		// add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
+		// wp_unslash()'s the meta_value before storing it — even data that was never slashed in
+		// the first place — so a raw source field containing a backslash (a Windows-style file
+		// path, an escaped character in post content, etc.) is silently corrupted unless the
+		// caller counters that with wp_slash() first. append_entry() must do this internally so
+		// no caller of record()/record_for_migration() needs to know about it.
+		$jid = $this->make_site_job();
+		$raw = 'C:\Windows\Path and a \' quote';
+
+		AuditReport::record( $jid, 'site_job', [ 'type' => 'write', 'post_title' => $raw ] );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+
+		$this->assertSame( $raw, $rows[0]['post_title'], 'Backslashes in entry data must survive the postmeta round-trip.' );
+	}
+
 	public function test_record_stores_scope_as_part_of_entry_data(): void {
 		$jid = $this->make_site_job();
 

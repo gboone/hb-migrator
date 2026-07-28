@@ -372,10 +372,15 @@ class AuditReport {
 
 			switch_to_blog( get_main_site_id() );
 			try {
-				$result = wp_update_post( [
+				// wp_update_post() only wp_slash()'s for you when $postarr is an object, not a
+				// plain array (see wp-includes/post.php) — mirrors the same convention already
+				// established in PostImporter::import_batch(). Without this, wp_unslash() further
+				// downstream would silently strip any backslash in $rendered (e.g. from a
+				// source-derived title/slug containing one).
+				$result = wp_update_post( wp_slash( [
 					'ID'           => $post_id,
 					'post_content' => $rendered,
-				], true );
+				] ), true );
 
 				if ( is_wp_error( $result ) ) {
 					// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
@@ -581,7 +586,14 @@ class AuditReport {
 		$meta_key = ( isset( $entry['type'] ) && 'request' === $entry['type'] ) ? self::META_REQUEST : self::META_WRITE;
 		$data     = array_merge( $entry, [ 'scope' => $scope ] );
 
-		add_post_meta( $post_id, $meta_key, $data, false );
+		// add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
+		// wp_unslash()'s $meta_value before storing — even for a value that was never slashed in
+		// the first place — silently stripping any backslash a cached source field (post
+		// content, a Windows-style file path, etc.) might legitimately contain. wp_slash() here
+		// cancels that internal unslash out, the same convention wp_insert_post()/wp_update_post()
+		// require for plain-array input (see PostImporter::import_batch()/AuditReport's own
+		// render_summary()).
+		add_post_meta( $post_id, $meta_key, wp_slash( $data ), false );
 		clean_post_cache( $post_id );
 	}
 

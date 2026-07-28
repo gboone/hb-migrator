@@ -713,6 +713,29 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		$this->assertStringNotContainsString( '<b>Dest</b>', $content, 'Destination-side title must also be escaped before embedding.' );
 	}
 
+	public function test_backslash_in_source_derived_title_survives_render(): void {
+		$source_id = 2302;
+		$dest_id   = $this->create_dest_post( [
+			'post_title' => 'Dest Title',
+			'post_name'  => 'backslash-slug',
+		] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [
+			'post_title' => 'C:\\Windows\\Path and a \' quote',
+			'post_name'  => 'backslash-slug',
+		] );
+
+		AuditComparator::process( $this->jid, 0 );
+
+		$content = $this->get_report_content();
+
+		$this->assertStringContainsString(
+			'C:\\Windows\\Path',
+			$content,
+			'wp_update_post() only wp_slash()\'s automatically for object input, not a plain array — render_summary() must slash its own array input or wp_unslash() further downstream silently strips backslashes.'
+		);
+	}
+
 	// -------------------------------------------------------------------------
 	// Integration: a comparison spanning multiple self-chained process() invocations only
 	// renders the final summary once, after the last batch completes — not after every
