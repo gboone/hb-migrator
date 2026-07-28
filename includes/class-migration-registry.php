@@ -293,9 +293,15 @@ class MigrationRegistry {
 	 * displays per migration — a migration's own hbm_migrations row has no domain or
 	 * per-site sync-timestamp columns, since those only exist at the site-job level (a
 	 * migration can cover several site jobs), so a per-migration view aggregates them:
-	 * every distinct source domain, every distinct resolved destination domain (see
-	 * find_site_job_by_domain()'s docblock for why this isn't a stored column), and the
-	 * most recent sync_last_pass_at across all its site jobs.
+	 * every distinct source domain+subdirectory, every distinct resolved destination
+	 * domain+subdirectory (see find_site_job_by_domain()'s docblock for why destination
+	 * domain isn't a stored column), and the most recent sync_last_pass_at across all
+	 * its site jobs.
+	 *
+	 * Domain alone is not a unique identifier for either side: a subdirectory (path-based)
+	 * multisite network hosts many subsites under one shared domain, differentiated only
+	 * by path — appending it (via format_domain_with_path()) keeps distinct subsites from
+	 * collapsing into one indistinguishable entry after the in_array() dedup below.
 	 *
 	 * @return array{source_domains: string[], dest_domains: string[], last_sync: ?string}
 	 */
@@ -305,14 +311,21 @@ class MigrationRegistry {
 		$last_sync      = null;
 
 		foreach ( self::get_site_jobs_for_migration( $migration_id ) as $job ) {
-			if ( ! empty( $job->source_domain ) && ! in_array( $job->source_domain, $source_domains, true ) ) {
-				$source_domains[] = $job->source_domain;
+			if ( ! empty( $job->source_domain ) ) {
+				$source_path   = (string) ( wp_parse_url( (string) $job->source_siteurl, PHP_URL_PATH ) ?: '' );
+				$source_domain = self::format_domain_with_path( $job->source_domain, $source_path );
+				if ( ! in_array( $source_domain, $source_domains, true ) ) {
+					$source_domains[] = $source_domain;
+				}
 			}
 
 			if ( ! empty( $job->dest_blog_id ) ) {
 				$site = get_site( (int) $job->dest_blog_id );
-				if ( $site && ! in_array( $site->domain, $dest_domains, true ) ) {
-					$dest_domains[] = $site->domain;
+				if ( $site ) {
+					$dest_domain = self::format_domain_with_path( $site->domain, $site->path );
+					if ( ! in_array( $dest_domain, $dest_domains, true ) ) {
+						$dest_domains[] = $dest_domain;
+					}
 				}
 			}
 
@@ -326,6 +339,16 @@ class MigrationRegistry {
 			'dest_domains'   => $dest_domains,
 			'last_sync'      => $last_sync,
 		];
+	}
+
+	/**
+	 * Combines a domain with a non-root path suffix for display (e.g. "example.org/blog1")
+	 * — omits the suffix entirely for a root-path site, so a subdomain-only or
+	 * single-site source/destination isn't shown with a meaningless trailing slash.
+	 */
+	private static function format_domain_with_path( string $domain, string $path ): string {
+		$path = rtrim( $path, '/' );
+		return '' !== $path ? $domain . $path : $domain;
 	}
 
 	public static function all_sites_complete( int $migration_id ): bool {

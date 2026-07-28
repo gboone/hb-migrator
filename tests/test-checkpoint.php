@@ -146,13 +146,14 @@ class Test_MigrationRegistry extends WP_UnitTestCase {
 		$this->assertSame( [ 'blog1.example.com', 'blog2.example.com' ], $summary['source_domains'] );
 	}
 
-	public function test_summarize_site_jobs_dedupes_destination_domains(): void {
+	public function test_summarize_site_jobs_distinguishes_subdirectory_destinations(): void {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'summarize_site_jobs() dest-domain resolution requires multisite.' );
 		}
 
-		// Path-based multisite: both site jobs resolve to the SAME destination domain,
-		// differing only by path — the summary must not repeat it twice.
+		// Path-based multisite: both site jobs share the SAME destination network
+		// domain, differing only by subdirectory — the summary must show each distinct
+		// domain+path pair, not collapse them into one indistinguishable domain.
 		$dest_blog_id_1 = (int) wp_insert_site( [
 			'domain'     => get_network()->domain,
 			'path'       => '/summarize-test-a-' . wp_generate_password( 6, false ) . '/',
@@ -175,7 +176,27 @@ class Test_MigrationRegistry extends WP_UnitTestCase {
 		MigrationRegistry::update_site_job( $j2, [ 'dest_blog_id' => $dest_blog_id_2 ] );
 
 		$summary = MigrationRegistry::summarize_site_jobs( $mid );
-		$this->assertSame( [ get_network()->domain ], $summary['dest_domains'] );
+		$site_1  = get_site( $dest_blog_id_1 );
+		$site_2  = get_site( $dest_blog_id_2 );
+		$this->assertSame(
+			[ $site_1->domain . rtrim( $site_1->path, '/' ), $site_2->domain . rtrim( $site_2->path, '/' ) ],
+			$summary['dest_domains']
+		);
+	}
+
+	public function test_summarize_site_jobs_includes_source_subdirectory(): void {
+		$mid = MigrationRegistry::create_migration( 'https://sourcenetwork.example.com', 'key', null );
+		MigrationRegistry::create_site_job(
+			$mid,
+			1,
+			'sourcenetwork.example.com',
+			'https://sourcenetwork.example.com/blog1/',
+			'',
+			'/blog1/'
+		);
+
+		$summary = MigrationRegistry::summarize_site_jobs( $mid );
+		$this->assertSame( [ 'sourcenetwork.example.com/blog1' ], $summary['source_domains'] );
 	}
 
 	public function test_summarize_site_jobs_last_sync_is_the_most_recent_pass_across_jobs(): void {
