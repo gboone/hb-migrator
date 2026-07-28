@@ -114,6 +114,12 @@ class PostImporter {
 			return [ 'max_id' => 0, 'failed_ids' => [] ];
 		}
 
+		// U5 write-action trail (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md,
+		// "U5. Write-action trail: posts and media (sync-gated)"). PostSyncStage is the only other
+		// caller of import_batch() and it only ever runs while the site job's own status is
+		// 'syncing' — gating on pending/running keeps sync passes out of the audit trail entirely.
+		$should_audit = in_array( $job->status, [ 'pending', 'running' ], true );
+
 		$max_id     = 0;
 		$failed_ids = [];
 		$touched_ids = [];
@@ -187,6 +193,9 @@ class PostImporter {
 						// wp_insert_post() failure. Recorded in $failed_ids so callers (e.g.
 						// PostSyncStage) never advance a cursor past this source ID.
 						$failed_ids[] = $source_id;
+						if ( $should_audit ) {
+							self::record_write_trail( $site_job_id, $source_id, 'failed', $p );
+						}
 						continue;
 					}
 
@@ -205,12 +214,22 @@ class PostImporter {
 						);
 					}
 					$wpdb->query( 'COMMIT' ); // phpcs:ignore WordPress.DB.DirectDatabaseQuery
+
+					// U5: an already-IdMap-mapped item being re-processed (resumed/retried
+					// batch) is "updated," not "created" — matches this branch's own
+					// insert-vs-update signal, avoiding double-counting a retried item.
+					if ( $should_audit ) {
+						self::record_write_trail( $site_job_id, $source_id, 'updated', $p );
+					}
 				} else {
 					$dest_id = wp_insert_post( wp_slash( array_merge( $post_data, [ 'import_id' => $source_id ] ) ), false, false );
 					if ( is_wp_error( $dest_id ) || ! $dest_id ) {
 						// Recorded in $failed_ids so callers (e.g. PostSyncStage) never
 						// advance a cursor past this source ID.
 						$failed_ids[] = $source_id;
+						if ( $should_audit ) {
+							self::record_write_trail( $site_job_id, $source_id, 'failed', $p );
+						}
 						continue;
 					}
 
@@ -227,6 +246,11 @@ class PostImporter {
 								'meta_value' => $meta['value'],
 							]
 						);
+					}
+
+					// U5: a fresh insert (no prior IdMap entry) is "created" -- the happy path.
+					if ( $should_audit ) {
+						self::record_write_trail( $site_job_id, $source_id, 'created', $p );
 					}
 				}
 
@@ -261,5 +285,31 @@ class PostImporter {
 		}
 
 		return [ 'max_id' => $max_id, 'failed_ids' => $failed_ids ];
+	}
+
+	/**
+	 * U5 write-action trail entry for a single post item — see
+	 * docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U5. Write-action trail:
+	 * posts and media (sync-gated)". Callers must already have checked the site job's
+	 * pending/running status gate (import_batch()'s $should_audit) before calling this — no
+	 * gating happens here.
+	 *
+	 * The recorded entry doubles as the cached source snapshot a later unit (U6, not this
+	 * unit's concern) hashes against, so it carries the raw source fields needed to re-derive a
+	 * normalized content/postmeta hash later: post content, excerpt, serialized postmeta, and
+	 * the source author identifier (post_author_email — the same field import_batch() itself
+	 * uses to resolve the destination author above).
+	 */
+	private static function record_write_trail( int $site_job_id, int $source_id, string $outcome, array $p ): void {
+		AuditReport::record( $site_job_id, 'site_job', [
+			'type'          => 'write',
+			'object_type'   => 'post',
+			'source_id'     => $source_id,
+			'outcome'       => $outcome,
+			'post_content'  => $p['post_content'] ?? '',
+			'post_excerpt'  => $p['post_excerpt'] ?? '',
+			'meta'          => $p['meta'] ?? [],
+			'source_author' => $p['post_author_email'] ?? '',
+		] );
 	}
 }
