@@ -33,6 +33,10 @@ class Plugin {
 		if ( is_admin() || is_network_admin() ) {
 			Admin\AdminPage::init();
 		}
+
+		if ( defined( 'WP_CLI' ) && WP_CLI ) {
+			\WP_CLI::add_command( 'hbm migration source-key', Cli\MigrationKeyCommand::class );
+		}
 	}
 
 	public function register_rest_routes(): void {
