@@ -35,6 +35,7 @@ class Plugin {
 		}
 
 		if ( defined( 'WP_CLI' ) && WP_CLI ) {
+			\WP_CLI::add_command( 'hbm migration', Cli\MigrationCommand::class );
 			\WP_CLI::add_command( 'hbm migration source-key', Cli\MigrationKeyCommand::class );
 		}
 	}

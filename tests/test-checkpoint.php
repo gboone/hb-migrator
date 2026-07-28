@@ -137,6 +137,67 @@ class Test_MigrationRegistry extends WP_UnitTestCase {
 		$this->assertNull( MigrationRegistry::find_site_job_by_domain( 'totally-unrelated.example.com' ) );
 	}
 
+	public function test_summarize_site_jobs_collects_distinct_source_domains(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		MigrationRegistry::create_site_job( $mid, 1, 'blog1.example.com', 'https://blog1.example.com', '', '/blog1/' );
+		MigrationRegistry::create_site_job( $mid, 2, 'blog2.example.com', 'https://blog2.example.com', '', '/blog2/' );
+
+		$summary = MigrationRegistry::summarize_site_jobs( $mid );
+		$this->assertSame( [ 'blog1.example.com', 'blog2.example.com' ], $summary['source_domains'] );
+	}
+
+	public function test_summarize_site_jobs_dedupes_destination_domains(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'summarize_site_jobs() dest-domain resolution requires multisite.' );
+		}
+
+		// Path-based multisite: both site jobs resolve to the SAME destination domain,
+		// differing only by path — the summary must not repeat it twice.
+		$dest_blog_id_1 = (int) wp_insert_site( [
+			'domain'     => get_network()->domain,
+			'path'       => '/summarize-test-a-' . wp_generate_password( 6, false ) . '/',
+			'network_id' => (int) get_network()->id,
+			'title'      => 'Summarize Test A',
+			'user_id'    => 1,
+		] );
+		$dest_blog_id_2 = (int) wp_insert_site( [
+			'domain'     => get_network()->domain,
+			'path'       => '/summarize-test-b-' . wp_generate_password( 6, false ) . '/',
+			'network_id' => (int) get_network()->id,
+			'title'      => 'Summarize Test B',
+			'user_id'    => 1,
+		] );
+
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$j1  = MigrationRegistry::create_site_job( $mid, 1, 'blog1.example.com', 'https://blog1.example.com', '', '/a/' );
+		$j2  = MigrationRegistry::create_site_job( $mid, 2, 'blog2.example.com', 'https://blog2.example.com', '', '/b/' );
+		MigrationRegistry::update_site_job( $j1, [ 'dest_blog_id' => $dest_blog_id_1 ] );
+		MigrationRegistry::update_site_job( $j2, [ 'dest_blog_id' => $dest_blog_id_2 ] );
+
+		$summary = MigrationRegistry::summarize_site_jobs( $mid );
+		$this->assertSame( [ get_network()->domain ], $summary['dest_domains'] );
+	}
+
+	public function test_summarize_site_jobs_last_sync_is_the_most_recent_pass_across_jobs(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+		$j1  = MigrationRegistry::create_site_job( $mid, 1, 'blog1.example.com', 'https://blog1.example.com', '', '/blog1/' );
+		$j2  = MigrationRegistry::create_site_job( $mid, 2, 'blog2.example.com', 'https://blog2.example.com', '', '/blog2/' );
+		MigrationRegistry::update_site_job( $j1, [ 'sync_last_pass_at' => '2026-01-01 00:00:00' ] );
+		MigrationRegistry::update_site_job( $j2, [ 'sync_last_pass_at' => '2026-06-15 12:30:00' ] );
+
+		$summary = MigrationRegistry::summarize_site_jobs( $mid );
+		$this->assertSame( '2026-06-15 12:30:00', $summary['last_sync'] );
+	}
+
+	public function test_summarize_site_jobs_with_no_site_jobs_returns_empty_summary(): void {
+		$mid = MigrationRegistry::create_migration( 'https://source.example.com', 'key', null );
+
+		$summary = MigrationRegistry::summarize_site_jobs( $mid );
+		$this->assertSame( [], $summary['source_domains'] );
+		$this->assertSame( [], $summary['dest_domains'] );
+		$this->assertNull( $summary['last_sync'] );
+	}
+
 	public function test_schema_upgrade_updates_version(): void {
 		delete_site_option( 'hbm_db_version' );
 		// maybe_create_or_upgrade() only runs in an admin or WP_CLI context (race-avoidance

@@ -288,6 +288,46 @@ class MigrationRegistry {
 		return null;
 	}
 
+	/**
+	 * Aggregates a migration's site jobs into the summary Cli\MigrationCommand's `list`
+	 * displays per migration — a migration's own hbm_migrations row has no domain or
+	 * per-site sync-timestamp columns, since those only exist at the site-job level (a
+	 * migration can cover several site jobs), so a per-migration view aggregates them:
+	 * every distinct source domain, every distinct resolved destination domain (see
+	 * find_site_job_by_domain()'s docblock for why this isn't a stored column), and the
+	 * most recent sync_last_pass_at across all its site jobs.
+	 *
+	 * @return array{source_domains: string[], dest_domains: string[], last_sync: ?string}
+	 */
+	public static function summarize_site_jobs( int $migration_id ): array {
+		$source_domains = [];
+		$dest_domains   = [];
+		$last_sync      = null;
+
+		foreach ( self::get_site_jobs_for_migration( $migration_id ) as $job ) {
+			if ( ! empty( $job->source_domain ) && ! in_array( $job->source_domain, $source_domains, true ) ) {
+				$source_domains[] = $job->source_domain;
+			}
+
+			if ( ! empty( $job->dest_blog_id ) ) {
+				$site = get_site( (int) $job->dest_blog_id );
+				if ( $site && ! in_array( $site->domain, $dest_domains, true ) ) {
+					$dest_domains[] = $site->domain;
+				}
+			}
+
+			if ( ! empty( $job->sync_last_pass_at ) && ( null === $last_sync || $job->sync_last_pass_at > $last_sync ) ) {
+				$last_sync = $job->sync_last_pass_at;
+			}
+		}
+
+		return [
+			'source_domains' => $source_domains,
+			'dest_domains'   => $dest_domains,
+			'last_sync'      => $last_sync,
+		];
+	}
+
 	public static function all_sites_complete( int $migration_id ): bool {
 		$jobs = self::get_site_jobs_for_migration( $migration_id );
 		if ( empty( $jobs ) ) {

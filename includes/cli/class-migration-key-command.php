@@ -29,7 +29,7 @@ class MigrationKeyCommand {
 	 *
 	 * [<migration_id>]
 	 * : The hbm_migrations row ID. Omit this and pass --domain instead if you only know
-	 * the affected site's domain. Use `list` to browse migrations and site jobs.
+	 * the affected site's domain. Use `wp hbm migration list` to browse migrations.
 	 *
 	 * [--domain=<domain>]
 	 * : Look up the migration via a site's source or destination domain instead of a
@@ -153,69 +153,6 @@ class MigrationKeyCommand {
 	}
 
 	/**
-	 * Lists every migration's site jobs — status, source domain, and resolved
-	 * destination domain — so an operator can find the migration_id (or confirm the
-	 * --domain value) for `get`/`update`/`delete` without writing SQL. One row per site
-	 * job, not per migration: a migration's source_api_key is shared across all its
-	 * site jobs, but domains and status only ever exist at the site-job level.
-	 *
-	 * ## OPTIONS
-	 *
-	 * [--format=<format>]
-	 * : Render output in a different format.
-	 * ---
-	 * default: table
-	 * options:
-	 *   - table
-	 *   - csv
-	 *   - json
-	 *   - yaml
-	 *   - count
-	 * ---
-	 *
-	 * ## EXAMPLES
-	 *
-	 *     wp hbm migration source-key list
-	 *     wp hbm migration source-key list --format=csv
-	 *
-	 * @param array $args       Positional arguments (unused).
-	 * @param array $assoc_args Associative arguments (flags).
-	 */
-	public function list( array $args, array $assoc_args ): void {
-		$rows = [];
-		foreach ( MigrationRegistry::list_migrations() as $migration ) {
-			foreach ( MigrationRegistry::get_site_jobs_for_migration( (int) $migration->id ) as $job ) {
-				$rows[] = [
-					'migration_id'  => (int) $migration->id,
-					'site_job_id'   => (int) $job->id,
-					'status'        => $job->status,
-					'source_domain' => $job->source_domain,
-					'dest_domain'   => self::resolve_dest_domain( $job ),
-				];
-			}
-		}
-
-		\WP_CLI\Utils\format_items(
-			\WP_CLI\Utils\get_flag_value( $assoc_args, 'format', 'table' ),
-			$rows,
-			[ 'migration_id', 'site_job_id', 'status', 'source_domain', 'dest_domain' ]
-		);
-	}
-
-	/**
-	 * Resolves a site job's destination domain via its dest_blog_id — not a stored
-	 * column, since a site job's destination is a WP_Site, addressed by ID (see
-	 * MigrationRegistry::find_site_job_by_domain()'s docblock for why).
-	 */
-	private static function resolve_dest_domain( object $job ): string {
-		if ( empty( $job->dest_blog_id ) ) {
-			return '(unassigned)';
-		}
-		$site = get_site( (int) $job->dest_blog_id );
-		return $site ? $site->domain : '(unknown)';
-	}
-
-	/**
 	 * Resolves a migration from either a positional migration_id or a --domain flag, or
 	 * halts with a clean WP_CLI error (rather than a raw type/DB error) when neither
 	 * resolves to one.
@@ -239,7 +176,7 @@ class MigrationKeyCommand {
 
 			$site_job = MigrationRegistry::find_site_job_by_domain( $domain );
 			if ( ! $site_job ) {
-				\WP_CLI::error( sprintf( 'No site job found for domain "%s". Use `list` to browse known domains.', $domain ) );
+				\WP_CLI::error( sprintf( 'No site job found for domain "%s". Use `wp hbm migration list` to browse known domains.', $domain ) );
 			}
 
 			$migration = MigrationRegistry::get_migration( (int) $site_job->migration_id );
