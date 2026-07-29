@@ -471,4 +471,46 @@ class Test_PostImporter extends WP_UnitTestCase {
 
 		remove_all_filters( 'wp_insert_post_empty_content' );
 	}
+
+	/**
+	 * U3 (hardening pass, docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md): the
+	 * other 'failed' record_write_trail() call site — the wp_update_post() failure branch for an
+	 * already-IdMap-mapped (retried) item — had no assertion. wp_update_post() internally
+	 * re-invokes wp_insert_post() with the merged post array, so the same
+	 * wp_insert_post_empty_content + 'FAIL_ME' trick used for the insert-failure test above also
+	 * forces the update branch to fail (verified empirically by this test passing).
+	 */
+	public function test_import_batch_records_failed_entry_for_wp_update_post_failure_on_mapped_item(): void {
+		$post = $this->make_source_post( [ 'ID' => 740 ] );
+
+		// First pass: successful import populates IdMap so the second pass takes the
+		// existing-row (update) branch, not the insert branch.
+		PostImporter::import_batch( $this->jid, [ $post ] );
+		$dest_id = \HBMigrator\IdMap::get( $this->jid, 'post', 740 );
+		$this->assertNotNull( $dest_id, 'First pass must have created and mapped the post.' );
+
+		add_filter( 'wp_insert_post_empty_content', function ( $maybe_empty, $postarr ) {
+			if ( 'FAIL_ME' === ( $postarr['post_title'] ?? '' ) ) {
+				return true;
+			}
+			return $maybe_empty;
+		}, 10, 2 );
+
+		$edited = $this->make_source_post( [ 'ID' => 740, 'post_title' => 'FAIL_ME' ] );
+		$result = PostImporter::import_batch( $this->jid, [ $edited ] );
+
+		remove_all_filters( 'wp_insert_post_empty_content' );
+
+		$this->assertSame( [ 740 ], $result['failed_ids'], 'The wp_update_post() failure must be reported by source ID.' );
+
+		$rows = $this->get_write_trail_rows();
+		$this->assertCount( 2, $rows, 'First pass records created; second (failed update) pass records its own entry.' );
+		$this->assertSame( 'created', $rows[0]['outcome'] );
+		$this->assertSame( 'failed', $rows[1]['outcome'], 'A wp_update_post() failure on an already-mapped item must be recorded as failed.' );
+		$this->assertSame( 740, $rows[1]['source_id'] );
+
+		// The pre-existing destination row must be left untouched, not partially updated.
+		$post_row = get_post( $dest_id );
+		$this->assertNotSame( 'FAIL_ME', $post_row->post_title, 'A failed update must leave the existing destination row untouched.' );
+	}
 }
