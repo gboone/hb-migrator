@@ -8,6 +8,7 @@
  * is ever called can use any URL.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\MigrationReceiver;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\QueueTable;
@@ -365,5 +366,94 @@ class Test_MigrationReceiver extends WP_UnitTestCase {
 
 		$this->assertArrayHasKey( 'status_token', $data );
 		$this->assertNotEmpty( $data['status_token'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: request-trail capture for the source/sites listing (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U3. Request-trail
+	// capture at every outbound source call"). This is a migration-level call — no site job
+	// exists yet at the point of the SourceClient::get() call itself, so the entry is only
+	// attributable via record_for_migration() once migration_id is known, i.e. on the success
+	// path only. See the deviation note at the SourceClient::get() call site in
+	// MigrationReceiver::begin() for why the failure path below asserts unchanged existing
+	// behavior (502) rather than a trail entry: no migration_id exists yet to attach one to.
+	// -------------------------------------------------------------------------
+
+	private function mock_source_sites( array $sites ): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) use ( $sites ) {
+			if ( false !== strpos( $url, '/source/sites' ) ) {
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => wp_json_encode( $sites ),
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+	}
+
+	public function test_begin_records_migration_scoped_request_trail_entry_on_success(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'Destination must be multisite.' );
+		}
+		$source_url = 'https://93.184.216.34';
+		$this->mock_source_sites( [
+			[ 'blog_id' => 1, 'domain' => 'example.com', 'siteurl' => $source_url, 'upload_url' => '' ],
+		] );
+
+		$req = new WP_REST_Request( 'POST', '/' . HBM_API_NAMESPACE . '/destination/begin' );
+		$req->set_param( 'source_url', $source_url );
+		$req->set_param( 'source_api_key', 'key' );
+		$req->set_param( 'site_ids', [ 1 ] );
+		$response = MigrationReceiver::begin( $req );
+
+		$this->assertSame( 201, $response->get_status() );
+		$migration_id = (int) $response->get_data()['migration_id'];
+
+		$jobs = MigrationRegistry::get_site_jobs_for_migration( $migration_id );
+		$this->assertNotEmpty( $jobs, 'begin() must have created a site job for blog_id 1.' );
+
+		$post_id = AuditReport::get_or_create_for_site_job( (int) $jobs[0]->id );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'migration', $rows[0]['scope'] );
+		$this->assertSame( 'source/sites', $rows[0]['path'] );
+		$this->assertTrue( $rows[0]['success'] );
+		$this->assertSame( 1, $rows[0]['count'] );
+	}
+
+	public function test_begin_returns_502_and_records_no_trail_entry_when_source_unreachable(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'Destination must be multisite.' );
+		}
+		$source_url = 'https://93.184.216.34';
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/source/sites' ) ) {
+				return new \WP_Error( 'http_request_failed', 'Could not resolve host.' );
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		$req = new WP_REST_Request( 'POST', '/' . HBM_API_NAMESPACE . '/destination/begin' );
+		$req->set_param( 'source_url', $source_url );
+		$req->set_param( 'source_api_key', 'key' );
+		$req->set_param( 'site_ids', [ 1 ] );
+		$response = MigrationReceiver::begin( $req );
+
+		// Existing error-handling behavior is completely unchanged by U3.
+		$this->assertSame( 502, $response->get_status() );
+		$this->assertArrayHasKey( 'error', $response->get_data() );
+
+		// No migration was ever created for this failed attempt, so there is nothing to
+		// look up a report for — confirms U3 did not smuggle in a side effect on this path.
+		$this->assertNull(
+			MigrationRegistry::find_active_migration_for_source( $source_url ),
+			'A failed source/sites fetch must not leave behind a migration row.'
+		);
 	}
 }

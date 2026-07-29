@@ -3,6 +3,7 @@
 namespace HBMigrator\Admin;
 
 use HBMigrator\ApiAuth;
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\SyncReceiver;
 use HBMigrator\Destination\SyncScheduler;
 use HBMigrator\MigrationRegistry;
@@ -494,6 +495,9 @@ class AdminPage {
 		// U7: stop the cron safety-net pass — does not abort an in-flight pass, only future scheduling.
 		SyncScheduler::unschedule( $site_job_id );
 
+		// U8: sync is finalized for this site job, so its audit report is no longer needed.
+		AuditReport::delete_for_site_job( $site_job_id );
+
 		wp_safe_redirect( network_admin_url( 'settings.php?page=hb-migrator&sync_finalized=1' ) );
 		exit;
 	}
@@ -557,6 +561,8 @@ class AdminPage {
 		foreach ( MigrationRegistry::get_syncing_site_jobs_for_migration( $migration_id ) as $job ) {
 			if ( MigrationRegistry::finalize_site_job_sync( (int) $job->id ) ) {
 				SyncScheduler::unschedule( (int) $job->id );
+				// U8: sync is finalized for this site job, so its audit report is no longer needed.
+				AuditReport::delete_for_site_job( (int) $job->id );
 			}
 		}
 	}

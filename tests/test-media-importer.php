@@ -3,6 +3,7 @@
  * Tests for MediaImporter media conflict policy behaviour.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\MediaImporter;
 use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
@@ -799,5 +800,212 @@ class Test_Media_Importer extends WP_UnitTestCase {
 			'per_page' => 20,
 		] );
 		$this->assertNotEmpty( $scheduled, 'process() must still enqueue hbm_import_options after import_batch() extraction.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: request-trail capture for MediaImporter's source/sites/{id}/media listing (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U3. Request-trail
+	// capture at every outbound source call"). MediaImporter is site-job-scoped, so entries
+	// are recorded via AuditReport::record() (scope: site_job).
+	// -------------------------------------------------------------------------
+
+	public function test_process_records_site_job_scoped_request_trail_entry_on_success(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 950, 'audit-success.jpg' ) ] );
+		$this->mock_download_failure(); // download outcome is irrelevant to the request-trail entry itself
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertTrue( $rows[0]['success'] );
+		$this->assertSame( 1, $rows[0]['count'] );
+	}
+
+	public function test_process_records_failed_request_trail_entry_when_source_unreachable(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/source/sites/' ) && false !== strpos( $url, '/media' ) ) {
+				return [
+					'response' => [ 'code' => 500, 'message' => 'Internal Server Error' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		// Existing error-handling behavior is unchanged by U3: a retryable failure at
+		// attempt 0 is rescheduled by PipelineController, not marked failed outright.
+		$job = MigrationRegistry::get_site_job( $jid );
+		$this->assertNotSame( 'failed', $job->status );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertFalse( $rows[0]['success'] );
+		$this->assertArrayHasKey( 'error', $rows[0] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U5: write-action trail for media (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U5. Write-action trail:
+	// posts and media (sync-gated)"). import_batch() is the only method MediaSyncStage also
+	// calls, so the status gate below is the single most important test in this file — a leak
+	// here would mean audit data silently appearing for out-of-scope sync passes.
+	// -------------------------------------------------------------------------
+
+	private function get_write_trail_rows( int $jid ): array {
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+		return $rows;
+	}
+
+	/**
+	 * Critical, non-obvious behavior (plan's explicit Execution note): a call to import_batch()
+	 * for a site job whose status is NOT pending/running (simulating MediaSyncStage's own call,
+	 * which only ever runs while status is 'syncing') must produce ZERO write-trail entries.
+	 */
+	public function test_import_batch_records_no_write_trail_entries_when_site_job_is_syncing(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id(), 'status' => 'syncing' ] );
+
+		$this->mock_download_failure();
+
+		MediaImporter::import_batch( $jid, [ $this->make_attachment_item( 970, 'sync-gate.jpg' ) ] );
+
+		$this->assertCount(
+			0,
+			$this->get_write_trail_rows( $jid ),
+			'A sync-context (status: syncing) call to import_batch() must not produce any write-trail entries.'
+		);
+	}
+
+	/** Same gate, for the 'complete' status (also used by the sync pipeline's own callers). */
+	public function test_import_batch_records_no_write_trail_entries_when_site_job_is_complete(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id(), 'status' => 'complete' ] );
+
+		$this->mock_download_failure();
+
+		MediaImporter::import_batch( $jid, [ $this->make_attachment_item( 971, 'sync-gate-complete.jpg' ) ] );
+
+		$this->assertCount(
+			0,
+			$this->get_write_trail_rows( $jid ),
+			'A sync-context (status: complete) call to import_batch() must not produce any write-trail entries.'
+		);
+	}
+
+	public function test_import_batch_records_created_entry_with_raw_source_fields_for_new_attachment(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] ); // status stays 'pending'
+
+		$this->mock_successful_png_download();
+
+		$item = array_merge( $this->make_attachment_item( 980, 'created-entry.png' ), [
+			'description' => 'Raw source description.',
+			'caption'     => 'Raw source caption.',
+			'alt_text'    => 'Raw alt text.',
+		] );
+
+		MediaImporter::import_batch( $jid, [ $item ] );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'write', $rows[0]['type'] );
+		$this->assertSame( 'attachment', $rows[0]['object_type'] );
+		$this->assertSame( 980, $rows[0]['source_id'] );
+		$this->assertSame( 'created', $rows[0]['outcome'] );
+		$this->assertSame( $item['file_url'], $rows[0]['file_url'] );
+		$this->assertSame( 'Raw source description.', $rows[0]['description'] );
+		$this->assertSame( 'Raw source caption.', $rows[0]['caption'] );
+		$this->assertSame( 'Raw alt text.', $rows[0]['alt_text'] );
+	}
+
+	public function test_import_batch_records_updated_entry_for_already_mapped_retried_item(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_successful_png_download();
+
+		$item = $this->make_attachment_item( 981, 'retry-entry.png' );
+		MediaImporter::import_batch( $jid, [ $item ] );
+
+		// Same item re-processed (resumed/retried pass) — already IdMap-mapped for this job.
+		MediaImporter::import_batch( $jid, [ $item ] );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 2, $rows, 'Each attempt gets its own trail entry (request-trail-style duplication).' );
+		$this->assertSame( 'created', $rows[0]['outcome'] );
+		$this->assertSame( 'updated', $rows[1]['outcome'], 'A retried already-mapped item must be recorded as updated, not created (no double-counting).' );
+	}
+
+	public function test_import_batch_records_failed_entry_tagged_to_correct_source_id(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_download_failure();
+
+		MediaImporter::import_batch( $jid, [ $this->make_attachment_item( 982, 'download-fail-entry.jpg' ) ] );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'failed', $rows[0]['outcome'] );
+		$this->assertSame( 982, $rows[0]['source_id'] );
 	}
 }

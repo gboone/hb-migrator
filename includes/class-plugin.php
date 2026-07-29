@@ -24,6 +24,12 @@ class Plugin {
 		// so we can't re-add to plugins_loaded at an earlier priority.
 		$this->register_action_hooks();
 
+		// U1: register the hbm_audit_report post type (docs/plans/2026-07-28-001-feat-
+		// migration-audit-report-plan.md). Registered unconditionally on every request, like
+		// everything else in this method — the plugin is network-activated and already
+		// registers everything on every page load.
+		add_action( 'init', [ Destination\AuditReport::class, 'register_post_type' ] );
+
 		// Source-side content-event hooks for U8's webhook trigger. Registered
 		// unconditionally on every install — each hook is a no-op unless this blog has a
 		// sync_webhook_token on file (see Source\SyncWebhook::get_sync_config()), since this
@@ -54,6 +60,7 @@ class Plugin {
 		add_action( 'hbm_import_media',         [ Destination\MediaImporter::class, 'process' ], 10, 4 );
 		add_action( 'hbm_import_options',       [ Destination\OptionImporter::class, 'process' ], 10, 3 );
 		add_action( 'hbm_search_replace',       [ Destination\SearchReplace::class, 'process' ], 10, 4 );
+		add_action( 'hbm_audit_compare',        [ Destination\AuditComparator::class, 'process' ], 10, 2 );
 		add_action( 'hbm_sync_pass',            [ Destination\SyncDispatcher::class, 'run_sync_pass' ], 10, 1 );
 
 		// Register U3's real 'posts' sync stage. SyncDispatcher depends only on

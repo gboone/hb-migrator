@@ -34,6 +34,22 @@ class IdMap {
 		return null !== $val ? (int) $val : null;
 	}
 
+	public static function get_all_for_job( int $site_job_id, string $object_type ): array {
+		global $wpdb;
+		$table = $wpdb->base_prefix . 'hbm_id_map';
+		$rows  = $wpdb->get_results( $wpdb->prepare(
+			"SELECT source_id, dest_id FROM `{$table}` WHERE site_job_id = %d AND object_type = %s",
+			$site_job_id,
+			$object_type
+		) );
+
+		$map = [];
+		foreach ( $rows as $row ) {
+			$map[ (int) $row->source_id ] = (int) $row->dest_id;
+		}
+		return $map;
+	}
+
 	public static function delete_for_job( int $site_job_id ): void {
 		global $wpdb;
 		$wpdb->delete( $wpdb->base_prefix . 'hbm_id_map', [ 'site_job_id' => $site_job_id ] );

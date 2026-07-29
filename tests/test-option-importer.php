@@ -7,6 +7,7 @@
  * validation without a real DNS lookup.
  */
 
+use HBMigrator\Destination\AuditReport;
 use HBMigrator\Destination\OptionImporter;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\QueueTable;
@@ -203,5 +204,126 @@ class Test_OptionImporter extends WP_UnitTestCase {
 		$active = (array) get_option( 'active_plugins', [] );
 		$this->assertNotContains( '../../wp-config.php', $active );
 		$this->assertNotContains( '../../../secrets.php', $active );
+	}
+
+	// -------------------------------------------------------------------------
+	// U3: request-trail capture for OptionImporter's source/sites/{id}/options listing (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U3. Request-trail
+	// capture at every outbound source call"). OptionImporter is site-job-scoped, so entries
+	// are recorded via AuditReport::record() (scope: site_job).
+	// -------------------------------------------------------------------------
+
+	public function test_process_records_site_job_scoped_request_trail_entry_on_success(): void {
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'audit-trail-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertTrue( $rows[0]['success'] );
+		$this->assertSame( 1, $rows[0]['count'] );
+	}
+
+	public function test_process_records_failed_request_trail_entry_when_source_unreachable(): void {
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) {
+			if ( false !== strpos( $url, '/options' ) ) {
+				return [
+					'response' => [ 'code' => 500, 'message' => 'Internal Server Error' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => null,
+				];
+			}
+			return $preempt;
+		}, 10, 3 );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		// Existing error-handling behavior is unchanged by U3: a retryable failure at
+		// attempt 0 is rescheduled by PipelineController, not marked failed outright.
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertNotSame( 'failed', $job->status );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_request', false );
+		restore_current_blog();
+
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'site_job', $rows[0]['scope'] );
+		$this->assertFalse( $rows[0]['success'] );
+		$this->assertArrayHasKey( 'error', $rows[0] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U4: write-action trail for options (see
+	// docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U4. Write-action trail:
+	// terms, users, options"). OptionImporter is site-job-scoped, so entries are recorded via
+	// AuditReport::record() (scope: site_job). This is the one importer in U4 that needed new
+	// bookkeeping: a get_option() read before update_option() so the trail entry can record a
+	// real created/updated/unchanged outcome.
+	// -------------------------------------------------------------------------
+
+	private function get_write_rows(): array {
+		$post_id = AuditReport::get_or_create_for_site_job( $this->jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+		return $rows;
+	}
+
+	public function test_process_records_created_outcome_for_option_that_did_not_exist(): void {
+		delete_option( 'hbm_test_imported_option' );
+
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'brand-new-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$rows        = $this->get_write_rows();
+		$option_rows = array_values( array_filter( $rows, fn( $r ) => 'hbm_test_imported_option' === ( $r['name'] ?? null ) ) );
+		$this->assertCount( 1, $option_rows );
+		$this->assertSame( 'created', $option_rows[0]['outcome'] );
+	}
+
+	public function test_process_records_updated_outcome_for_option_that_changed(): void {
+		update_option( 'hbm_test_imported_option', 'old-value' );
+
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'new-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$this->assertSame( 'new-value', get_option( 'hbm_test_imported_option' ) );
+
+		$rows        = $this->get_write_rows();
+		$option_rows = array_values( array_filter( $rows, fn( $r ) => 'hbm_test_imported_option' === ( $r['name'] ?? null ) ) );
+		$this->assertCount( 1, $option_rows );
+		$this->assertSame( 'updated', $option_rows[0]['outcome'] );
+	}
+
+	public function test_process_records_unchanged_outcome_for_option_with_same_value(): void {
+		update_option( 'hbm_test_imported_option', 'same-value' );
+
+		$this->mock_options_response( [
+			'hbm_test_imported_option' => 'same-value',
+		] );
+
+		OptionImporter::process( $this->jid, 0, 0 );
+
+		$rows        = $this->get_write_rows();
+		$option_rows = array_values( array_filter( $rows, fn( $r ) => 'hbm_test_imported_option' === ( $r['name'] ?? null ) ) );
+		$this->assertCount( 1, $option_rows );
+		$this->assertSame( 'unchanged', $option_rows[0]['outcome'], 'An option whose value did not actually change must be "unchanged", not "updated".' );
 	}
 }

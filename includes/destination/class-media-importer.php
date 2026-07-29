@@ -6,6 +6,7 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\SourceClientException;
 
 class MediaImporter {
 
@@ -37,14 +38,34 @@ class MediaImporter {
 				MigrationRegistry::update_site_job( $site_job_id, [ 'status' => 'running', 'current_stage' => 'media', 'error_message' => null ] );
 			}
 
-			$media = SourceClient::get(
-				$migration->source_url,
-				$migration->source_api_key,
-				'source/sites/' . (int) $job->source_blog_id . '/media',
-				$is_retry_pass
-					? [ 'ids' => $source_attachment_ids ]
-					: [ 'per_page' => 50, 'offset' => $offset, 'attached_only' => ( 'attached_only' === $media_scope ) ? 1 : 0 ]
-			);
+			// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+			// MediaImporter is site-job-scoped, so this is recorded via record() (scope: site_job).
+			$media_path = 'source/sites/' . (int) $job->source_blog_id . '/media';
+			try {
+				$media = SourceClient::get(
+					$migration->source_url,
+					$migration->source_api_key,
+					$media_path,
+					$is_retry_pass
+						? [ 'ids' => $source_attachment_ids ]
+						: [ 'per_page' => 50, 'offset' => $offset, 'attached_only' => ( 'attached_only' === $media_scope ) ? 1 : 0 ]
+				);
+			} catch ( SourceClientException $e ) {
+				AuditReport::record( $site_job_id, 'site_job', [
+					'type'    => 'request',
+					'path'    => $media_path,
+					'success' => false,
+					'error'   => $e->getMessage(),
+				] );
+				throw $e;
+			}
+
+			AuditReport::record( $site_job_id, 'site_job', [
+				'type'    => 'request',
+				'path'    => $media_path,
+				'success' => true,
+				'count'   => count( $media ),
+			] );
 
 			$failed_items = self::import_batch( $site_job_id, $media );
 
@@ -133,6 +154,12 @@ class MediaImporter {
 			return [];
 		}
 
+		// U5 write-action trail (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md,
+		// "U5. Write-action trail: posts and media (sync-gated)"). MediaSyncStage is the only
+		// other caller of import_batch() and it only ever runs while the site job's own status is
+		// 'syncing' -- gating on pending/running keeps sync passes out of the audit trail entirely.
+		$should_audit = in_array( $job->status, [ 'pending', 'running' ], true );
+
 		$migration = MigrationRegistry::get_migration( (int) $job->migration_id );
 		if ( ! $migration ) {
 			return [];
@@ -156,6 +183,9 @@ class MediaImporter {
 
 				// Skip if already imported (idempotency on retry).
 				if ( $source_att_id && IdMap::get( $site_job_id, 'attachment', $source_att_id ) ) {
+					if ( $should_audit ) {
+						self::record_write_trail( $site_job_id, $source_att_id, 'updated', $att );
+					}
 					continue;
 				}
 
@@ -177,6 +207,9 @@ class MediaImporter {
 						if ( ! empty( $prev_meta ) ) {
 							// Healthy prior import — record in IdMap and skip re-download.
 							IdMap::set( $site_job_id, 'attachment', $source_att_id, $prev_id );
+							if ( $should_audit ) {
+								self::record_write_trail( $site_job_id, $source_att_id, 'created', $att );
+							}
 							continue;
 						}
 						// Broken prior import — delete it so the re-sideload won't get a -1 suffix.
@@ -200,6 +233,9 @@ class MediaImporter {
 						] );
 						if ( ! empty( $existing_atts ) ) {
 							IdMap::set( $site_job_id, 'attachment', $source_att_id, (int) $existing_atts[0] );
+							if ( $should_audit ) {
+								self::record_write_trail( $site_job_id, $source_att_id, 'created', $att );
+							}
 							continue;
 						}
 					}
@@ -220,6 +256,9 @@ class MediaImporter {
 				if ( is_wp_error( $tmp ) ) {
 					if ( $source_att_id ) {
 						$failed_items[ $source_att_id ] = 'download failed: ' . $tmp->get_error_message();
+						if ( $should_audit ) {
+							self::record_write_trail( $site_job_id, $source_att_id, 'failed', $att );
+						}
 					}
 					continue;
 				}
@@ -241,6 +280,9 @@ class MediaImporter {
 					@unlink( $tmp ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 					if ( $source_att_id ) {
 						$failed_items[ $source_att_id ] = 'sideload failed: ' . $sideload['error'];
+						if ( $should_audit ) {
+							self::record_write_trail( $site_job_id, $source_att_id, 'failed', $att );
+						}
 					}
 					continue;
 				}
@@ -266,6 +308,9 @@ class MediaImporter {
 					@unlink( $sideload['file'] ); // phpcs:ignore WordPress.PHP.NoSilencedErrors
 					if ( $source_att_id ) {
 						$failed_items[ $source_att_id ] = 'insert failed: ' . $dest_att_id->get_error_message();
+						if ( $should_audit ) {
+							self::record_write_trail( $site_job_id, $source_att_id, 'failed', $att );
+						}
 					}
 					continue;
 				}
@@ -279,6 +324,9 @@ class MediaImporter {
 					wp_delete_attachment( $dest_att_id, true );
 					if ( $source_att_id ) {
 						$failed_items[ $source_att_id ] = 'metadata generation failed — image may be corrupt or unprocessable';
+						if ( $should_audit ) {
+							self::record_write_trail( $site_job_id, $source_att_id, 'failed', $att );
+						}
 					}
 					continue;
 				}
@@ -290,6 +338,9 @@ class MediaImporter {
 
 				if ( $source_att_id ) {
 					IdMap::set( $site_job_id, 'attachment', $source_att_id, $dest_att_id );
+					if ( $should_audit ) {
+						self::record_write_trail( $site_job_id, $source_att_id, 'created', $att );
+					}
 				}
 			}
 		} finally {
@@ -355,5 +406,33 @@ class MediaImporter {
 		};
 		add_filter( 'upload_dir', $filter );
 		return $filter;
+	}
+
+	/**
+	 * U5 write-action trail entry for a single media item — see
+	 * docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md, "U5. Write-action trail:
+	 * posts and media (sync-gated)". Callers must already have checked the site job's
+	 * pending/running status gate (import_batch()'s $should_audit) before calling this — no
+	 * gating happens here.
+	 *
+	 * The recorded entry doubles as the cached source snapshot a later unit (U6, not this
+	 * unit's concern) hashes against, so it carries the raw source fields needed to re-derive a
+	 * normalized hash later — the media equivalent of PostImporter::record_write_trail()'s
+	 * content/excerpt/meta/author fields: the source file URL, title, description (post_content
+	 * equivalent), caption (post_excerpt equivalent), and alt text.
+	 */
+	private static function record_write_trail( int $site_job_id, int $source_att_id, string $outcome, array $att ): void {
+		AuditReport::record( $site_job_id, 'site_job', [
+			'type'           => 'write',
+			'object_type'    => 'attachment',
+			'source_id'      => $source_att_id,
+			'outcome'        => $outcome,
+			'file_url'       => $att['file_url'] ?? '',
+			'post_title'     => $att['post_title'] ?? '',
+			'description'    => $att['description'] ?? '',
+			'caption'        => $att['caption'] ?? '',
+			'alt_text'       => $att['alt_text'] ?? '',
+			'post_mime_type' => $att['post_mime_type'] ?? '',
+		] );
 	}
 }

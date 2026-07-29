@@ -6,6 +6,7 @@ use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
 use HBMigrator\PipelineController;
 use HBMigrator\SourceClient;
+use HBMigrator\SourceClientException;
 use HBMigrator\UserSiteRoles;
 
 class UserImporter {
@@ -27,12 +28,33 @@ class UserImporter {
 				UserSiteRoles::delete_for_migration( $migration_id );
 			}
 
-			$users = SourceClient::get(
-				$migration->source_url,
-				$migration->source_api_key,
-				'source/users',
-				[ 'per_page' => 100, 'offset' => $offset ]
-			);
+			// U3 request-trail capture (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md).
+			// UserImporter runs once per migration, before any site-job-specific stage, so this is
+			// recorded via record_for_migration() (scope: migration) rather than record() — copied
+			// into every sibling site job's report the first time each one is created.
+			try {
+				$users = SourceClient::get(
+					$migration->source_url,
+					$migration->source_api_key,
+					'source/users',
+					[ 'per_page' => 100, 'offset' => $offset ]
+				);
+			} catch ( SourceClientException $e ) {
+				AuditReport::record_for_migration( $migration_id, 'migration', [
+					'type'    => 'request',
+					'path'    => 'source/users',
+					'success' => false,
+					'error'   => $e->getMessage(),
+				] );
+				throw $e;
+			}
+
+			AuditReport::record_for_migration( $migration_id, 'migration', [
+				'type'    => 'request',
+				'path'    => 'source/users',
+				'success' => true,
+				'count'   => count( $users ),
+			] );
 
 			wp_suspend_cache_invalidation( true );
 
@@ -48,11 +70,16 @@ class UserImporter {
 
 			foreach ( $users as $u ) {
 				$dest_user_id = null;
+				// U4 write-action trail (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md):
+				// reuses this loop's own existing merge-vs-create control-flow signal — no new
+				// bookkeeping needed beyond tracking which branch was taken.
+				$outcome      = null;
 
 				if ( 'merge' === $policy ) {
 					$existing = get_user_by( 'email', $u['user_email'] );
 					if ( $existing ) {
 						$dest_user_id = $existing->ID;
+						$outcome      = 'merged';
 					}
 				}
 
@@ -78,10 +105,18 @@ class UserImporter {
 					}
 
 					if ( is_wp_error( $new_id ) ) {
+						AuditReport::record_for_migration( $migration_id, 'migration', [
+							'type'        => 'write',
+							'object_type' => 'user',
+							'source_id'   => (int) $u['source_user_id'],
+							'outcome'     => 'failed',
+							'error'       => $new_id->get_error_message(),
+						] );
 						continue;
 					}
 
 					$dest_user_id = (int) $new_id;
+					$outcome      = 'created';
 
 					if ( 'create' === $policy ) {
 						update_user_meta( $dest_user_id, 'hbm_original_email', $u['user_email'] );
@@ -89,6 +124,14 @@ class UserImporter {
 				}
 
 				IdMap::set( IdMap::NETWORK, 'user', (int) $u['source_user_id'], $dest_user_id );
+
+				AuditReport::record_for_migration( $migration_id, 'migration', [
+					'type'        => 'write',
+					'object_type' => 'user',
+					'source_id'   => (int) $u['source_user_id'],
+					'dest_id'     => $dest_user_id,
+					'outcome'     => $outcome,
+				] );
 
 				// Store per-site roles so TermImporter can assign them after subsite creation
 				// without making additional HTTP requests.

@@ -176,6 +176,9 @@ class SyncReceiver {
 		// makes right after the same transition. Does not abort an in-flight pass.
 		SyncScheduler::unschedule( $site_job_id );
 
+		// U8: sync is finalized for this site job, so its audit report is no longer needed.
+		AuditReport::delete_for_site_job( $site_job_id );
+
 		$job = MigrationRegistry::get_site_job( $site_job_id );
 		return new \WP_REST_Response( [
 			'status'            => $job->status,
