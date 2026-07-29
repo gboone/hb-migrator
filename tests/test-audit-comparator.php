@@ -1066,4 +1066,193 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		$this->assertSame( $existing_user_id, $result['actual_author_id'] );
 		$this->assertFalse( $result['diverged'] );
 	}
+
+	// -------------------------------------------------------------------------
+	// U4 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U4. Comparator
+	// trail-read caching"): load_latest_write_entries()'s per-site-job/per-object-type transient
+	// cache. Integration: across a full, multi-batch comparison run (compare_batch() checkpointed
+	// via the batch_size/time_limit filters, then compute_counts()), the underlying get_post_meta()
+	// call AuditReport::get_write_entries_for_site_job() makes for the write trail must be invoked
+	// exactly once per object_type actually read ('post', 'attachment', 'term') — not zero, not
+	// once per checkpoint. Spied via the get_post_metadata filter (applied on every get_post_meta()
+	// call regardless of the object cache, see WP core's get_metadata()), scoped to the exact
+	// meta_key/$single shape AuditReport::get_write_entries_for_site_job() uses.
+	// -------------------------------------------------------------------------
+
+	public function test_write_trail_read_is_cached_and_get_post_meta_invoked_once_per_object_type(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+
+		$ids = [ 3001, 3002, 3003 ];
+		foreach ( $ids as $sid ) {
+			$dest_id = $this->create_dest_post( [ 'post_title' => "Cache {$sid}", 'post_name' => "cache-{$sid}" ] );
+			IdMap::set( $this->jid, 'post', $sid, $dest_id );
+			$this->record_post_entry( $sid, 'created', [ 'post_title' => "Cache {$sid}", 'post_name' => "cache-{$sid}" ] );
+		}
+
+		IdMap::set( $this->jid, 'attachment', 3101, $this->create_dest_attachment() );
+		$this->record_attachment_entry( 3101, 'created' );
+
+		$term = wp_insert_term( 'Cache Term ' . wp_generate_password( 6, false ), 'category' );
+		IdMap::set( $this->jid, 'term', 3201, (int) $term['term_id'] );
+		$this->record_term_entry( 3201, 'created', (int) $term['term_id'] );
+
+		$calls = 0;
+		$spy   = function ( $value, $post_id, $meta_key, $single ) use ( &$calls ) {
+			if ( '_hbm_audit_write' === $meta_key && false === $single ) {
+				++$calls;
+			}
+			return $value;
+		};
+		add_filter( 'get_post_metadata', $spy, 10, 4 );
+
+		$checkpoint = 0;
+		$iterations = 0;
+		do {
+			$checkpoint = AuditComparator::compare_batch( $this->jid, $checkpoint );
+			++$iterations;
+		} while ( null !== $checkpoint && $iterations < 10 );
+		$this->assertGreaterThan( 1, $iterations, 'batch_size=1 with an always-exceeded budget must take more than one call to drain 3 posts — the scenario this cache is meant to help.' );
+
+		$counts = AuditComparator::compute_counts( $this->jid );
+
+		remove_filter( 'get_post_metadata', $spy, 10 );
+		remove_all_filters( 'hbm_audit_compare_batch_size' );
+		remove_all_filters( 'hbm_audit_compare_time_limit' );
+
+		$this->assertSame(
+			3,
+			$calls,
+			'get_post_meta() for the write trail must be invoked exactly once per object_type read (post, attachment, term) across the whole run, not once per compare_batch() checkpoint and not skipped for any object_type.'
+		);
+
+		// Sanity: the run actually produced correct data through the cache, not just the right
+		// call count.
+		$this->assertCount( 3, AuditComparator::get_post_comparison_results( $this->jid ) );
+		$this->assertSame( 1, $counts['attachment']['attempted'] );
+		$this->assertSame( 1, $counts['term']['attempted'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U4 edge case — the specific regression this fix targets: compute_counts()'s 'attachment'/
+	// 'term' reads must NOT be served the 'post'-object-type cache entry compare_batch_inner()
+	// populates earlier in the same run. A cache keyed on site_job_id alone would leak the
+	// 'post'-filtered map into these calls; keying on site_job_id + object_type (as implemented)
+	// keeps them isolated. Uses deliberately distinguishable counts (3 post entries vs. 1
+	// attachment vs. 1 failed-only term entry) so a cache-key leak would be impossible to miss.
+	// -------------------------------------------------------------------------
+
+	public function test_compute_counts_after_compare_batch_is_not_served_the_post_cache_entry(): void {
+		$post_ids = [ 3301, 3302, 3303 ];
+		foreach ( $post_ids as $sid ) {
+			$dest_id = $this->create_dest_post( [ 'post_title' => "Iso {$sid}", 'post_name' => "iso-{$sid}" ] );
+			IdMap::set( $this->jid, 'post', $sid, $dest_id );
+			$this->record_post_entry( $sid, 'created', [ 'post_title' => "Iso {$sid}", 'post_name' => "iso-{$sid}" ] );
+		}
+
+		IdMap::set( $this->jid, 'attachment', 3401, $this->create_dest_attachment() );
+		$this->record_attachment_entry( 3401, 'created' );
+
+		// A failed-only term entry (no IdMap entry, outcome 'failed') — attempted=1, landed=0,
+		// failed=1, deliberately distinct from the 3-post cache's shape.
+		$this->record_term_entry( 3501, 'failed' );
+
+		// Warms the 'post'-keyed cache entry first — exactly what a real run does via
+		// compare_batch_inner() before compute_counts_inner() ever runs.
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+
+		$counts = AuditComparator::compute_counts( $this->jid );
+
+		$this->assertSame(
+			1,
+			$counts['attachment']['attempted'],
+			"compute_counts()'s attachment read must not be served the 'post'-object-type cache entry populated by the earlier compare_batch() call (which would leak the 3-post-entry count here)."
+		);
+		$this->assertSame( 1, $counts['attachment']['landed'] );
+		$this->assertSame( 0, $counts['attachment']['failed'] );
+
+		$this->assertSame(
+			1,
+			$counts['term']['attempted'],
+			"compute_counts()'s term read must not be served the 'post'-object-type cache entry populated by the earlier compare_batch() call."
+		);
+		$this->assertSame( 0, $counts['term']['landed'] );
+		$this->assertSame( 1, $counts['term']['failed'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U4 edge case: the transient cache is explicitly deleted once process() finishes rendering
+	// the final summary — a later comparison run for the same site job (simulated here by
+	// recording a new write-trail entry and re-running compare_batch() after process() has
+	// already cleaned up) must see fresh data, not whatever was cached during the prior run.
+	// -------------------------------------------------------------------------
+
+	public function test_write_cache_is_cleared_after_process_renders_and_a_later_run_sees_fresh_data(): void {
+		$first_source_id = 3601;
+		$first_dest_id    = $this->create_dest_post( [ 'post_title' => 'First', 'post_name' => 'clear-first' ] );
+		IdMap::set( $this->jid, 'post', $first_source_id, $first_dest_id );
+		$this->record_post_entry( $first_source_id, 'created', [ 'post_title' => 'First', 'post_name' => 'clear-first' ] );
+
+		AuditComparator::process( $this->jid, 0 );
+		$this->assertArrayHasKey( $first_source_id, AuditComparator::get_post_comparison_results( $this->jid ) );
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			foreach ( [ 'post', 'attachment', 'term' ] as $object_type ) {
+				$this->assertFalse(
+					get_transient( 'hbm_audit_write_cache_' . $this->jid . '_' . $object_type ),
+					"The '{$object_type}' write-trail cache must be deleted once process() finishes rendering the final summary."
+				);
+			}
+		} finally {
+			restore_current_blog();
+		}
+
+		// A later comparison for this same site job (only hypothetical in production, since
+		// write-trail entries are immutable once comparison starts — but exercised here to prove
+		// the deleted cache isn't stuck serving stale data) must see a newly recorded entry.
+		$second_source_id = 3602;
+		$second_dest_id    = $this->create_dest_post( [ 'post_title' => 'Second', 'post_name' => 'clear-second' ] );
+		IdMap::set( $this->jid, 'post', $second_source_id, $second_dest_id );
+		$this->record_post_entry( $second_source_id, 'created', [ 'post_title' => 'Second', 'post_name' => 'clear-second' ] );
+
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+		$results = AuditComparator::get_post_comparison_results( $this->jid );
+		$this->assertArrayHasKey(
+			$second_source_id,
+			$results,
+			'A later comparison run must see a newly recorded write-trail entry, not stale cached data from the prior (already-cleaned-up) run.'
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// U4 edge case: a fresh comparison run for a DIFFERENT site job never sees the other job's
+	// cached write-trail data — proves the cache key is scoped per site_job_id, not global.
+	// -------------------------------------------------------------------------
+
+	public function test_write_cache_does_not_leak_between_different_site_jobs(): void {
+		$source_id = 3701;
+		$dest_id   = $this->create_dest_post( [ 'post_title' => 'Job One', 'post_name' => 'job-one' ] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [ 'post_title' => 'Job One', 'post_name' => 'job-one' ] );
+
+		// Warms this->jid's 'post' cache entry.
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+
+		$other_jid        = $this->make_site_job();
+		$other_source_id  = 3801;
+		$other_dest_id    = $this->create_dest_post( [ 'post_title' => 'Job Two', 'post_name' => 'job-two' ] );
+		IdMap::set( $other_jid, 'post', $other_source_id, $other_dest_id );
+		$this->record_post_entry( $other_source_id, 'created', [ 'post_title' => 'Job Two', 'post_name' => 'job-two' ], $other_jid );
+
+		$this->assertNull( AuditComparator::compare_batch( $other_jid, 0 ) );
+
+		$other_results = AuditComparator::get_post_comparison_results( $other_jid );
+		$this->assertArrayHasKey(
+			$other_source_id,
+			$other_results,
+			"A different site job's comparison must not be served the first job's cached write-trail entries."
+		);
+		$this->assertArrayNotHasKey( $source_id, $other_results );
+	}
 }

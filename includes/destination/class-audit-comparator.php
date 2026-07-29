@@ -130,12 +130,15 @@ class AuditComparator {
 			return null;
 		}
 
-		// Built once per compare_batch() call, not cached across calls — an accepted tradeoff
-		// (see final report): re-reads every _hbm_audit_write row for this report post on every
-		// call, which is the cost of not introducing any new cross-call persistence beyond this
-		// unit's own scope. Computed exactly once here (found during code review — this used to
-		// be loaded a second time inside load_driving_post_map() with identical arguments) and
-		// passed to both load_driving_post_map() and the per-item loop below.
+		// U4 (R6, docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U4. Comparator
+		// trail-read caching"): load_latest_write_entries() itself now transient-caches this read
+		// per site_job_id+object_type across the whole self-chained comparison run — this call
+		// only actually re-reads _hbm_audit_write postmeta on the FIRST compare_batch_inner() call
+		// for this site job; every later checkpoint hits the cache instead (see that method's own
+		// docblock). Called exactly once per compare_batch_inner() invocation (found during code
+		// review — this used to be loaded a second time inside load_driving_post_map() with
+		// identical arguments) and passed to both load_driving_post_map() and the per-item loop
+		// below.
 		$write_entries = self::load_latest_write_entries( $site_job_id, 'post' );
 
 		$driving_map = self::load_driving_post_map( $site_job_id, $write_entries );
@@ -499,6 +502,12 @@ class AuditComparator {
 			$counts       = self::compute_counts( $site_job_id );
 			$post_results = self::get_post_comparison_results( $site_job_id );
 			AuditReport::render_summary( $site_job_id, $counts, $post_results );
+
+			// U4 (R6): this comparison run is now fully finished (no further compare_batch()
+			// checkpoint will ever run for this site job) — explicitly invalidate every
+			// object_type's cached write-trail read rather than relying solely on the
+			// WRITE_CACHE_TTL backstop (see clear_write_cache()'s own docblock).
+			self::clear_write_cache( $site_job_id );
 		} catch ( \Throwable $e ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			error_log( 'HB Migrator: AuditComparator::process() failed for site job ' . $site_job_id . ' at last_pk ' . $last_pk . ': ' . $e->getMessage() );
@@ -642,17 +651,54 @@ class AuditComparator {
 	}
 
 	/**
+	 * How long the U4 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U4.
+	 * Comparator trail-read caching") write-trail transient cache is allowed to live as a
+	 * defensive backstop. Not the primary invalidation mechanism — that's the explicit
+	 * clear_write_cache() call in process()'s success path — comfortably longer than any
+	 * realistic self-chained comparison run, so it only matters if that explicit cleanup is
+	 * somehow skipped (e.g. the process crashes between the last render and the cleanup call).
+	 */
+	private const WRITE_CACHE_TTL = HOUR_IN_SECONDS;
+
+	/**
 	 * Loads every _hbm_audit_write entry for $site_job_id (via AuditReport's U6 read-access
 	 * addition — see that class), filters to $object_type, and keeps only the LATEST entry per
 	 * source_id (rows are already in ascending meta_id/insertion order — see
 	 * AuditReport::get_write_entries_for_site_job()'s docblock — so a later foreach iteration
 	 * simply overwrites an earlier one for the same key). This is the single mechanism this
 	 * class uses to resolve "a resumed/retried batch produced more than one trail entry for the
-	 * same source_id" for posts, attachments, and terms alike — built once per compare_batch()/
-	 * compute_counts() call, never cached across calls (see those methods' own docblocks for why
-	 * that's an accepted tradeoff).
+	 * same source_id" for posts, attachments, and terms alike.
+	 *
+	 * U4 (R6): this is called with 'post' once per compare_batch_inner() call (the per-checkpoint
+	 * driver, which repeats up to once per BATCH_SIZE-sized chunk of a large migration) and with
+	 * 'attachment'/'term' once each from compute_object_type_counts() (only reached once total per
+	 * comparison run, after the last checkpoint). Reloading the full trail from postmeta on every
+	 * one of those calls is the O(N^2/batch) cost this cache removes: the result is now cached in
+	 * a WP transient keyed by BOTH $site_job_id AND $object_type (never by $site_job_id alone —
+	 * that would incorrectly serve compute_object_type_counts()'s 'attachment'/'term' calls the
+	 * 'post'-filtered result compare_batch_inner() cached earlier in the same run, a correctness
+	 * bug, not just a missed optimization). Safe specifically because post write-trail entries are
+	 * immutable once comparison starts (compare_batch()/process() only ever run after
+	 * SearchReplace::finalize(), by which point every import stage has already completed and no
+	 * new write-trail entries will ever be recorded for this site job again — see class docblock
+	 * and this file's accompanying plan) — the cache only needs to survive one comparison run.
+	 * Populated on first read per object_type per run; explicitly cleared by clear_write_cache()
+	 * once process() finishes rendering the final summary; a WRITE_CACHE_TTL backstop covers the
+	 * case where that explicit cleanup is somehow never reached.
 	 */
 	private static function load_latest_write_entries( int $site_job_id, string $object_type ): array {
+		$cache_key = self::write_cache_key( $site_job_id, $object_type );
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			$cached = get_transient( $cache_key );
+		} finally {
+			restore_current_blog();
+		}
+		if ( is_array( $cached ) ) {
+			return $cached;
+		}
+
 		$rows   = AuditReport::get_write_entries_for_site_job( $site_job_id );
 		$latest = [];
 		foreach ( $rows as $row ) {
@@ -665,7 +711,43 @@ class AuditComparator {
 			}
 			$latest[ $source_id ] = $row;
 		}
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			set_transient( $cache_key, $latest, self::WRITE_CACHE_TTL );
+		} finally {
+			restore_current_blog();
+		}
+
 		return $latest;
+	}
+
+	/**
+	 * The transient key U4's cache uses for one site job's one object_type — see
+	 * load_latest_write_entries()'s docblock for why BOTH components are required.
+	 */
+	private static function write_cache_key( int $site_job_id, string $object_type ): string {
+		return 'hbm_audit_write_cache_' . $site_job_id . '_' . $object_type;
+	}
+
+	/**
+	 * U4's explicit, primary cache invalidation (docs/plans/2026-07-29-001-fix-audit-report-
+	 * hardening-plan.md, "U4. Comparator trail-read caching"): deletes every object_type's cached
+	 * write-trail entry for a site job. Called by process() once it finishes rendering the final
+	 * summary (the success path) — the only three object_types this class ever caches are 'post',
+	 * 'attachment', and 'term' (see load_latest_write_entries()'s call sites), so those are the
+	 * only keys that need explicit deletion; a WRITE_CACHE_TTL backstop covers anything this
+	 * explicit call doesn't reach (e.g. process() crashing between the render and this call).
+	 */
+	private static function clear_write_cache( int $site_job_id ): void {
+		switch_to_blog( get_main_site_id() );
+		try {
+			foreach ( [ 'post', 'attachment', 'term' ] as $object_type ) {
+				delete_transient( self::write_cache_key( $site_job_id, $object_type ) );
+			}
+		} finally {
+			restore_current_blog();
+		}
 	}
 
 	/**
