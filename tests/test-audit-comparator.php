@@ -1255,4 +1255,205 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		);
 		$this->assertArrayNotHasKey( $source_id, $other_results );
 	}
+
+	// -------------------------------------------------------------------------
+	// U6 hardening (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U6.
+	// AuditComparator self-chain: bounded retry for continuation enqueue"). process()'s
+	// checkpoint-continuation branch now goes through enqueue_continuation_with_retry() instead
+	// of calling as_enqueue_async_action() directly. Every test below forces the deterministic
+	// budget-exceeded checkpoint path (batch_size=1, time_limit=-1.0, same mechanism already used
+	// by test_multibatch_process_renders_final_summary_only_once()) so process() always has a
+	// continuation to enqueue.
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Seeds one landed post with a driving-map entry, so a single compare_batch_inner() pass
+	 * processes exactly one item and returns a non-null checkpoint (forced via the batch_size=1 +
+	 * time_limit=-1.0 filters every test in this section applies).
+	 */
+	private function seed_one_continuation_item( int $source_id ): void {
+		$dest_id = $this->create_dest_post( [ 'post_title' => "Cont {$source_id}", 'post_name' => "cont-{$source_id}" ] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [ 'post_title' => "Cont {$source_id}", 'post_name' => "cont-{$source_id}" ] );
+	}
+
+	public function test_continuation_enqueue_happy_path_succeeds_on_first_attempt_without_retry(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+
+		$source_id = 4101;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' === $hook ) {
+				++$attempts;
+			}
+			return $pre;
+		}, 10, 2 );
+
+		$started = microtime( true );
+		try {
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			$elapsed = microtime( true ) - $started;
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+		}
+
+		$this->assertSame( 1, $attempts, 'The happy path must call the underlying enqueue exactly once — no retry when the first attempt already succeeds.' );
+		$this->assertLessThan( 0.2, $elapsed, 'No retry delay must occur when the first enqueue attempt succeeds — this would fail if the retry loop slept unnecessarily.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'The continuation must be enqueued exactly once.' );
+	}
+
+	public function test_continuation_enqueue_retries_and_succeeds_on_third_attempt(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+		// Keep the test fast — force the between-attempt delay to (near) zero rather than the
+		// real default, mirroring this class's own hbm_audit_compare_time_limit/batch_size
+		// filterable-constant pattern (see enqueue_continuation_with_retry()'s own constants).
+		add_filter( 'hbm_audit_compare_continuation_enqueue_retry_delay', static fn() => 0.0 );
+
+		$source_id = 4102;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' !== $hook ) {
+				return $pre;
+			}
+			++$attempts;
+			if ( $attempts < 3 ) {
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure #' . $attempts );
+			}
+			return $pre; // Third attempt: let the real enqueue proceed.
+		}, 10, 2 );
+
+		try {
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+			remove_all_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay' );
+		}
+
+		$this->assertSame( 3, $attempts, 'The first two attempts must fail and the third must be tried before giving up.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'The continuation must ultimately be enqueued exactly once, once the third attempt succeeds.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Critical, non-obvious behavior: every attempt fails. process() must still return normally
+	// (no exception propagates), hbm_site_jobs.status must be unchanged, and no action was
+	// ultimately enqueued (exhaustion must never fabricate a phantom success or reach
+	// PipelineController::handle_batch_failure()'s status-flipping behavior).
+	// -------------------------------------------------------------------------
+
+	public function test_continuation_enqueue_exhaustion_leaves_status_unchanged_and_enqueues_nothing(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+		add_filter( 'hbm_audit_compare_continuation_enqueue_retry_delay', static fn() => 0.0 );
+
+		$source_id = 4103;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' === $hook ) {
+				++$attempts;
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure #' . $attempts );
+			}
+			return $pre;
+		}, 10, 2 );
+
+		$log_file = tempnam( sys_get_temp_dir(), 'hbm_audit_continuation_retry_test_log' );
+		$prev_log = ini_set( 'error_log', $log_file );
+
+		try {
+			// The forced RuntimeException on every attempt must never propagate out of process().
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			ini_set( 'error_log', $prev_log );
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+			remove_all_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay' );
+		}
+
+		$this->assertSame( 3, $attempts, 'All 3 bounded attempts must have been tried before giving up.' );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 'complete', $job->status, "Exhausting the continuation-enqueue retry budget must never alter the site job's own status column." );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 0, $scheduled, 'No continuation should have actually been enqueued given every attempt failed — exhaustion must not fabricate a phantom success.' );
+
+		$log_contents = file_get_contents( $log_file );
+		unlink( $log_file );
+		$this->assertStringContainsString( 'giving up without altering hbm_site_jobs.status', $log_contents, 'Exhaustion must be logged via error_log(), matching this class\'s universal swallow-and-log discipline.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Integration: SearchReplace::finalize()'s own initial hbm_audit_compare enqueue (a
+	// completely different call site — see class-search-replace.php) already has its own,
+	// separate try/catch from a prior code-review fix and must remain a single, unretried
+	// attempt. This unit's bounded retry is scoped entirely to
+	// AuditComparator::process()'s continuation-enqueue branch.
+	// -------------------------------------------------------------------------
+
+	public function test_search_replace_finalize_initial_enqueue_is_not_retried_by_this_change(): void {
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'running' ] );
+		MigrationRegistry::update_migration_status( $this->mid, 'running' );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' === $hook ) {
+				++$attempts;
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure.' );
+			}
+			return $pre;
+		}, 10, 2 );
+
+		$ref    = new ReflectionClass( SearchReplace::class );
+		$method = $ref->getMethod( 'finalize' );
+		$method->setAccessible( true );
+
+		global $wpdb;
+		$suppress = $wpdb->suppress_errors( true );
+		try {
+			$method->invoke( null, $this->jid, $this->mid, get_current_blog_id() );
+		} finally {
+			$wpdb->suppress_errors( $suppress );
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+		}
+
+		$this->assertSame(
+			1,
+			$attempts,
+			"SearchReplace::finalize()'s own initial hbm_audit_compare enqueue must remain a single, unretried attempt — U6's bounded retry only wraps AuditComparator::process()'s continuation-enqueue call, not this separate call site."
+		);
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 'complete', $job->status, 'finalize() must still complete the site job even though its own audit-compare enqueue failed.' );
+	}
 }

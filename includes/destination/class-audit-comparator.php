@@ -479,11 +479,11 @@ class AuditComparator {
 
 			if ( null !== $checkpoint ) {
 				// Time budget exhausted mid-batch — dispatch a continuation from the checkpoint.
-				as_enqueue_async_action(
-					'hbm_audit_compare',
-					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
-					'hb-migrator'
-				);
+				// R8 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U6.
+				// AuditComparator self-chain: bounded retry for continuation enqueue"): the enqueue
+				// call itself gets a small bounded retry rather than being called directly here —
+				// see enqueue_continuation_with_retry()'s own docblock for why.
+				self::enqueue_continuation_with_retry( $site_job_id, $checkpoint );
 				return;
 			}
 
@@ -873,5 +873,89 @@ class AuditComparator {
 	 */
 	private static function batch_size(): int {
 		return max( 1, (int) apply_filters( 'hbm_audit_compare_batch_size', self::BATCH_SIZE ) );
+	}
+
+	/**
+	 * R8 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U6. AuditComparator
+	 * self-chain: bounded retry for continuation enqueue"): how many times
+	 * enqueue_continuation_with_retry() will attempt the `hbm_audit_compare` continuation
+	 * enqueue call before giving up. Filterable for the same testability reason as
+	 * time_limit()/batch_size() above.
+	 */
+	private const CONTINUATION_ENQUEUE_ATTEMPTS = 3;
+
+	/**
+	 * Seconds (fractional) enqueue_continuation_with_retry() sleeps between a failed attempt and
+	 * the next one. Deliberately short, small, and non-exponential — this is NOT
+	 * PipelineController::handle_batch_failure()'s minute-scale exponential backoff (that
+	 * mechanism's persisted-retry-count-via-re-enqueued-args and status-flipping-on-exhaustion
+	 * shape is exactly what this retry must NOT reuse — see this method's own docblock and the
+	 * plan's Key Technical Decisions for R8). A short pause — not zero — because this runs inside
+	 * a background job with no user waiting (so the pause costs nothing observable) and because a
+	 * transient DB/Action-Scheduler write error realistically needs a brief moment to clear, not a
+	 * sub-millisecond re-attempt that hits the same failure for the same reason. Filterable so
+	 * tests can force this to near-zero and stay fast.
+	 */
+	private const CONTINUATION_ENQUEUE_RETRY_DELAY = 0.5;
+
+	private static function continuation_enqueue_attempts(): int {
+		return max( 1, (int) apply_filters( 'hbm_audit_compare_continuation_enqueue_attempts', self::CONTINUATION_ENQUEUE_ATTEMPTS ) );
+	}
+
+	private static function continuation_enqueue_retry_delay(): float {
+		return max( 0.0, (float) apply_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay', self::CONTINUATION_ENQUEUE_RETRY_DELAY ) );
+	}
+
+	/**
+	 * R8: wraps process()'s self-chain continuation `hbm_audit_compare` enqueue call in a small
+	 * bounded-retry loop, entirely local to this single process() invocation — no persisted
+	 * retry-count state, no new parameter on process()'s own signature, no change to
+	 * Plugin::register_action_hooks()'s action registration. A transient Action Scheduler/DB
+	 * write error is exactly the kind of failure a few retries with a short pause between them can
+	 * ride out (see CONTINUATION_ENQUEUE_RETRY_DELAY's own docblock for why the pause is short but
+	 * non-zero).
+	 *
+	 * On any attempt succeeding: returns normally, action enqueued, no different from calling
+	 * as_enqueue_async_action() directly. On every attempt failing: logs via error_log() (matching
+	 * this class's universal swallow-and-log discipline — see class docblock) and returns
+	 * normally — no exception ever propagates out of this method, and `hbm_site_jobs.status` is
+	 * never touched either way. Deliberately does NOT call
+	 * PipelineController::handle_batch_failure() — that helper unconditionally flips `status` to
+	 * `'failed'` on retry exhaustion when given a site_job_id, which would violate the audit
+	 * layer's non-negotiable rule that its own failures must never regress an already-`complete`
+	 * site job (see plan's R8 Key Technical Decision).
+	 *
+	 * Cannot detect "the action was enqueued but Action Scheduler never claimed/ran it" — an
+	 * accepted, pre-existing limitation this inherits from SearchReplace's own self-chain (see
+	 * plan Risks), not addressed here.
+	 */
+	private static function enqueue_continuation_with_retry( int $site_job_id, int $checkpoint ): void {
+		$attempts = self::continuation_enqueue_attempts();
+		$delay    = self::continuation_enqueue_retry_delay();
+
+		for ( $attempt = 1; $attempt <= $attempts; $attempt++ ) {
+			try {
+				as_enqueue_async_action(
+					'hbm_audit_compare',
+					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
+					'hb-migrator'
+				);
+				return;
+			} catch ( \Throwable $e ) {
+				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+				error_log( 'HB Migrator: AuditComparator continuation enqueue attempt ' . $attempt . '/' . $attempts . ' failed for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ': ' . $e->getMessage() );
+
+				if ( $attempt < $attempts && $delay > 0.0 ) {
+					usleep( (int) round( $delay * 1000000 ) );
+				}
+			}
+		}
+
+		// Every attempt failed — swallow and log, exactly like every other method in this class
+		// (see class docblock). Never rethrow, never touch hbm_site_jobs.status: process()'s own
+		// outer try/catch would otherwise feed PipelineController::handle_batch_failure(), which
+		// is precisely the cascade this retry exists to avoid.
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( 'HB Migrator: AuditComparator failed to enqueue hbm_audit_compare continuation for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ' after ' . $attempts . ' attempts — giving up without altering hbm_site_jobs.status.' );
 	}
 }
