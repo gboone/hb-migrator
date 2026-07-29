@@ -96,8 +96,8 @@ class AdminPage {
 
 			<hr>
 
-			<!-- Section 2: Migrate from a source -->
-			<h2><?php esc_html_e( 'Migrate FROM a Source Site', 'hb-migrator' ); ?></h2>
+			<!-- Section 2: Migrate this site's sites to a destination -->
+			<h2><?php esc_html_e( 'Migrate to a New Destination', 'hb-migrator' ); ?></h2>
 
 			<?php if ( $active ) : ?>
 				<div class="notice notice-info" id="hbm-active-notice">
