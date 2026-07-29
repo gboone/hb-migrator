@@ -269,6 +269,57 @@ class AuditReport {
 	}
 
 	/**
+	 * R7 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U5. UserImporter
+	 * batched staged writes"): batched sibling of record_for_migration() — appends a whole batch
+	 * of entries to the same per-migration staging option in one get_site_option()/
+	 * update_site_option() round-trip, instead of one round-trip per entry.
+	 * UserImporter::process()'s per-user loop is the only caller today: at real production scale
+	 * that loop's previous one-call-per-user use of record_for_migration() made every user's
+	 * write re-fetch and re-store the entire (ever-growing) staged-entries array — an O(n^2)
+	 * pattern that only bites at large migrations. Batching several users' entries into one call
+	 * removes that quadratic growth.
+	 *
+	 * Stores each entry in the exact same shape record_for_migration() already uses
+	 * (['scope' => ..., 'entry' => ...] per staged item, one $scope shared by the whole batch,
+	 * matching record_for_migration()'s own single-scope-per-call signature) — so
+	 * copy_staged_migration_entries() reads this option without needing to know or care whether
+	 * a given item arrived via record_for_migration() or this batched method.
+	 *
+	 * $entries is a plain list of entry arrays (the same shape each one would have been passed as
+	 * to record_for_migration() individually) — not pre-wrapped with 'scope'/'entry' keys; this
+	 * method does that wrapping itself, once per entry, using the single $scope for the whole
+	 * batch.
+	 *
+	 * Never throws (see class docblock) — a failure here is swallowed and logged, exactly like
+	 * every other method in this class.
+	 */
+	public static function record_batch_for_migration( int $migration_id, string $scope, array $entries ): void {
+		try {
+			if ( empty( $entries ) ) {
+				return;
+			}
+
+			$option_key = self::staging_option_key( $migration_id );
+			$staged     = get_site_option( $option_key, [] );
+			if ( ! is_array( $staged ) ) {
+				$staged = [];
+			}
+
+			foreach ( $entries as $entry ) {
+				$staged[] = [
+					'scope' => $scope,
+					'entry' => $entry,
+				];
+			}
+
+			update_site_option( $option_key, $staged );
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditReport::record_batch_for_migration() failed for migration ' . $migration_id . ': ' . $e->getMessage() );
+		}
+	}
+
+	/**
 	 * Deletes the report post for a site job. Safe no-op if no report exists. The cleanup
 	 * helper U8 (a separate, already-blocked unit) wires into the three existing sync-finalize
 	 * call sites — this class does not call itself from anywhere; callers own when deletion
