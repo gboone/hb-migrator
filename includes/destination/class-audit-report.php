@@ -292,6 +292,36 @@ class AuditReport {
 	}
 
 	/**
+	 * R1 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U1. CLI report-post-id
+	 * lookup"): a public, non-creating way to look up a site job's report post ID, for
+	 * `wp hbm migration list` (Cli\MigrationCommand::list()) and any other caller that only
+	 * wants to know "does a report exist, and if so what's its post ID" without fabricating one
+	 * as a side effect. Deliberately does NOT call get_or_create_for_site_job() — that method's
+	 * wp_insert_post() call is exactly the side effect this method must avoid, since merely
+	 * listing migrations must never create an empty report post as a byproduct.
+	 *
+	 * Switches to the primary site itself — find_report_post_id() documents that it does not —
+	 * so callers don't need to know this class's storage lives on the primary/network site.
+	 * Returns null both when no report exists and on any internal failure (see class docblock);
+	 * a caller has no way to distinguish the two, matching every other AuditReport method's
+	 * failure-containment discipline.
+	 */
+	public static function get_report_post_id_for_site_job( int $site_job_id ): ?int {
+		try {
+			switch_to_blog( get_main_site_id() );
+			try {
+				return self::find_report_post_id( $site_job_id );
+			} finally {
+				restore_current_blog();
+			}
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditReport::get_report_post_id_for_site_job() failed for site job ' . $site_job_id . ': ' . $e->getMessage() );
+			return null;
+		}
+	}
+
+	/**
 	 * U6 read-access addition (see docs/plans/2026-07-28-001-feat-migration-audit-report-plan.md,
 	 * "U6. Comparator: hashing, normalization, and count comparison"). AuditReport previously had
 	 * no way to read write-action trail entries back out — AuditComparator needs the full set

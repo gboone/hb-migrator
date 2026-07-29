@@ -191,6 +191,41 @@ class Test_Audit_Report extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// get_report_post_id_for_site_job(): U1 non-creating lookup (see
+	// docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, R1).
+	// -------------------------------------------------------------------------
+
+	public function test_get_report_post_id_returns_correct_id_for_existing_report(): void {
+		$jid     = $this->make_site_job();
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+
+		$this->assertSame( $post_id, AuditReport::get_report_post_id_for_site_job( $jid ) );
+	}
+
+	public function test_get_report_post_id_returns_null_and_creates_nothing_when_no_report_exists(): void {
+		$jid = $this->make_site_job();
+
+		$count_before = self::count_report_posts();
+		$result       = AuditReport::get_report_post_id_for_site_job( $jid );
+		$count_after  = self::count_report_posts();
+
+		$this->assertNull( $result, 'A site job with no trail-worthy event must resolve to null, not fabricate a report.' );
+		$this->assertSame( $count_before, $count_after, 'get_report_post_id_for_site_job() must never create a report post as a side effect.' );
+	}
+
+	public function test_get_report_post_id_returns_null_after_report_was_deleted(): void {
+		$jid = $this->make_site_job();
+		AuditReport::get_or_create_for_site_job( $jid );
+
+		AuditReport::delete_for_site_job( $jid );
+
+		$this->assertNull(
+			AuditReport::get_report_post_id_for_site_job( $jid ),
+			'A deleted report must never resolve to a stale/wrong post ID.'
+		);
+	}
+
+	// -------------------------------------------------------------------------
 	// record_for_migration(): staging + copy-on-first-creation
 	// -------------------------------------------------------------------------
 
