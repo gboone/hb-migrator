@@ -1008,4 +1008,152 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		$this->assertSame( 'failed', $rows[0]['outcome'] );
 		$this->assertSame( 982, $rows[0]['source_id'] );
 	}
+
+	// -------------------------------------------------------------------------
+	// U3 (hardening pass, docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md):
+	// 5 of 8 record_write_trail() call sites in import_batch() had no assertion. Each test
+	// below targets exactly one previously-untested call site.
+	// -------------------------------------------------------------------------
+
+	/** Gap (b): a healthy prior import (cross-run dedup by _hbm_source_attachment_id) is reused — recorded as 'created'. */
+	public function test_import_batch_records_created_entry_for_healthy_prior_import_reuse(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$prior_att_id = wp_insert_post( [
+			'post_type'   => 'attachment',
+			'post_status' => 'inherit',
+			'post_title'  => 'Prior Healthy Attachment For Audit',
+		] );
+		update_post_meta( $prior_att_id, '_hbm_source_attachment_id', 991 );
+		wp_update_attachment_metadata( $prior_att_id, [ 'width' => 1200, 'height' => 800, 'file' => '2023/09/prior-healthy-audit.jpg' ] );
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] ); // status stays 'pending'
+
+		MediaImporter::import_batch( $jid, [ $this->make_attachment_item( 991, 'prior-healthy-audit.jpg' ) ] );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'created', $rows[0]['outcome'], 'A healthy prior-import reuse must be recorded as created, not updated.' );
+		$this->assertSame( 991, $rows[0]['source_id'] );
+
+		wp_delete_post( $prior_att_id, true );
+	}
+
+	/** Gap (c): skip_duplicates reuse of an existing attachment matched by filename — recorded as 'created'. */
+	public function test_import_batch_records_created_entry_for_skip_duplicates_filename_match_reuse(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$existing_att_id = wp_insert_post( [
+			'post_type'   => 'attachment',
+			'post_name'   => 'audit-skip-dup-image',
+			'post_status' => 'inherit',
+			'post_title'  => 'Audit Skip Dup Image',
+		] );
+
+		$mid = $this->make_migration( [ 'media_conflict_policy' => 'skip_duplicates' ] );
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$item = array_merge(
+			$this->make_attachment_item( 992, 'audit-skip-dup-image.jpg' ),
+			[ 'post_name' => 'audit-skip-dup-image' ]
+		);
+		MediaImporter::import_batch( $jid, [ $item ] );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'created', $rows[0]['outcome'], 'A skip_duplicates filename-match reuse must be recorded as created.' );
+		$this->assertSame( 992, $rows[0]['source_id'] );
+
+		wp_delete_post( $existing_att_id, true );
+	}
+
+	/** Gap (e): wp_handle_sideload() failure — recorded as 'failed'. Forced via wp_handle_sideload_prefilter, after a successful download so the pipeline actually reaches the sideload call. */
+	public function test_import_batch_records_failed_entry_for_sideload_failure(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_successful_png_download();
+		$sideload_filter = static function ( array $file ): array {
+			$file['error'] = 'Forced sideload failure for test.';
+			return $file;
+		};
+		add_filter( 'wp_handle_sideload_prefilter', $sideload_filter );
+
+		MediaImporter::import_batch( $jid, [ $this->make_attachment_item( 993, 'sideload-fail-audit.png' ) ] );
+
+		remove_filter( 'wp_handle_sideload_prefilter', $sideload_filter );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'failed', $rows[0]['outcome'] );
+		$this->assertSame( 993, $rows[0]['source_id'] );
+		$this->assertNull( IdMap::get( $jid, 'attachment', 993 ) );
+	}
+
+	/** Gap (f): wp_insert_attachment() failure — recorded as 'failed'. Forced via wp_insert_post_empty_content, the same mechanism used elsewhere in this codebase to force a falsy/error wp_insert_post() return. */
+	public function test_import_batch_records_failed_entry_for_wp_insert_attachment_failure(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_successful_png_download();
+		add_filter( 'wp_insert_post_empty_content', function ( $maybe_empty, $postarr ) {
+			if ( 'FAIL_ME' === ( $postarr['post_title'] ?? '' ) ) {
+				return true;
+			}
+			return $maybe_empty;
+		}, 10, 2 );
+
+		$item = array_merge(
+			$this->make_attachment_item( 994, 'insert-fail-audit.png' ),
+			[ 'post_title' => 'FAIL_ME' ]
+		);
+		MediaImporter::import_batch( $jid, [ $item ] );
+
+		remove_all_filters( 'wp_insert_post_empty_content' );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'failed', $rows[0]['outcome'] );
+		$this->assertSame( 994, $rows[0]['source_id'] );
+		$this->assertNull( IdMap::get( $jid, 'attachment', 994 ) );
+	}
+
+	/** Gap (g): wp_generate_attachment_metadata() failure — recorded as 'failed'. Reuses test_empty_metadata_schedules_retry()'s forcing mechanism. */
+	public function test_import_batch_records_failed_entry_for_metadata_generation_failure(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_successful_png_download();
+		add_filter( 'wp_generate_attachment_metadata', '__return_empty_array', 99 );
+
+		MediaImporter::import_batch( $jid, [ $this->make_attachment_item( 995, 'metadata-fail-audit.png' ) ] );
+
+		$rows = $this->get_write_trail_rows( $jid );
+		$this->assertCount( 1, $rows );
+		$this->assertSame( 'failed', $rows[0]['outcome'] );
+		$this->assertSame( 995, $rows[0]['source_id'] );
+		$this->assertNull( IdMap::get( $jid, 'attachment', 995 ) );
+	}
 }

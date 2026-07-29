@@ -587,6 +587,46 @@ class Test_Term_Importer extends WP_UnitTestCase {
 		wp_delete_site( $new_id );
 	}
 
+	public function test_create_subsite_records_write_trail_entry_with_suffix_path_after_one_collision(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'create_subsite() requires multisite.' );
+		}
+
+		$network = get_network();
+		// Exactly one blocker at the base path — no blocker at the -2 suffix — so the first
+		// wp_insert_site() call collides ('site_taken') and the retry succeeds on attempt 2.
+		$existing_id = wp_insert_site( [
+			'domain'     => $network->domain,
+			'path'       => '/audit-subsite-retry-success/',
+			'network_id' => $network->id,
+			'title'      => 'Existing',
+			'user_id'    => 1,
+		] );
+		$this->assertNotInstanceOf( \WP_Error::class, $existing_id );
+
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'example.com', 'https://93.184.216.34', '', '/audit-subsite-retry-success/' );
+
+		$job    = $this->make_job( [ 'id' => $jid, 'dest_path' => '/audit-subsite-retry-success/' ] );
+		$new_id = $this->call_create_subsite( $job, 'generate_new' );
+
+		$this->assertGreaterThan( 0, $new_id );
+
+		$rows         = $this->get_write_rows( $jid );
+		$subsite_rows = array_values( array_filter( $rows, fn( $r ) => 'subsite' === ( $r['object_type'] ?? null ) ) );
+		$this->assertCount( 1, $subsite_rows, 'Only the successful retry attempt is recorded — the colliding first attempt is not.' );
+		$this->assertSame( 'created', $subsite_rows[0]['outcome'] );
+		$this->assertSame( $new_id, $subsite_rows[0]['dest_id'] );
+		$this->assertSame(
+			'/audit-subsite-retry-success-2/',
+			$subsite_rows[0]['dest_path'],
+			'dest_path must be the -2 suffix candidate actually created, not the original colliding path.'
+		);
+
+		wp_delete_site( $existing_id );
+		wp_delete_site( $new_id );
+	}
+
 	public function test_create_subsite_records_write_trail_entry_on_path_collision_exhaustion(): void {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'create_subsite() requires multisite.' );
