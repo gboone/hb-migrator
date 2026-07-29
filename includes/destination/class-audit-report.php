@@ -249,23 +249,11 @@ class AuditReport {
 	 * migration.
 	 */
 	public static function record_for_migration( int $migration_id, string $scope, array $entry ): void {
-		try {
-			$option_key = self::staging_option_key( $migration_id );
-			$staged     = get_site_option( $option_key, [] );
-			if ( ! is_array( $staged ) ) {
-				$staged = [];
-			}
-
-			$staged[] = [
-				'scope' => $scope,
-				'entry' => $entry,
-			];
-
-			update_site_option( $option_key, $staged );
-		} catch ( \Throwable $e ) {
-			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			error_log( 'HB Migrator: AuditReport::record_for_migration() failed for migration ' . $migration_id . ': ' . $e->getMessage() );
-		}
+		// Found during code review: the single-entry case of record_batch_for_migration()'s own
+		// get_site_option()/append/update_site_option() sequence — delegates instead of
+		// duplicating that logic (they must stay identical, since both write to the same staging
+		// option copy_staged_migration_entries() later reads).
+		self::record_batch_for_migration( $migration_id, $scope, [ $entry ] );
 	}
 
 	/**
@@ -691,10 +679,22 @@ class AuditReport {
 	 * blogs itself (mirrors find_report_post_id()'s identical convention). Uses
 	 * add_post_meta(..., false) — unique=false, many rows per key is intentional, matching every
 	 * existing caller's own storage convention.
+	 *
+	 * Wraps its own body in try/catch (\Throwable) — found during code review: as a PUBLIC
+	 * method, this must independently satisfy the class's stated invariant that every public
+	 * method never lets an internal failure escape, rather than relying on append_entry()'s
+	 * caller (record()) already having its own try/catch. A future direct caller of this method
+	 * (bypassing append_entry()/store_result()) must get the same guarantee every other public
+	 * method in this class already provides.
 	 */
 	public static function write_meta_row( int $post_id, string $meta_key, array $data ): void {
-		add_post_meta( $post_id, $meta_key, wp_slash( $data ), false );
-		clean_post_cache( $post_id );
+		try {
+			add_post_meta( $post_id, $meta_key, wp_slash( $data ), false );
+			clean_post_cache( $post_id );
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditReport::write_meta_row() failed for post ' . $post_id . ' meta key ' . $meta_key . ': ' . $e->getMessage() );
+		}
 	}
 
 	/**

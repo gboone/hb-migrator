@@ -1358,6 +1358,56 @@ class Test_AuditComparator extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// Found during code review: ActionScheduler_ActionFactory::create() (what
+	// as_enqueue_async_action() calls into) already catches its own DB-save exception
+	// internally and returns 0 WITHOUT rethrowing — the real "transient DB/Action-Scheduler
+	// write error" this retry loop exists to ride out never reaches enqueue_continuation_with_
+	// retry() as a \Throwable at all. A retry loop that only branches on a caught exception
+	// would silently treat this 0-return as success on the very first attempt. This test
+	// simulates that exact real-world shape (a 0 return, no exception) rather than the
+	// exception-based simulation the other tests in this group use.
+	// -------------------------------------------------------------------------
+
+	public function test_continuation_enqueue_retries_when_as_enqueue_returns_zero_without_throwing(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+		add_filter( 'hbm_audit_compare_continuation_enqueue_retry_delay', static fn() => 0.0 );
+
+		$source_id = 4104;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' !== $hook ) {
+				return $pre;
+			}
+			++$attempts;
+			// Mirrors ActionScheduler_ActionFactory::create()'s own real failure return shape:
+			// 0, not a thrown exception — see this test's own docblock.
+			return $attempts < 2 ? 0 : $pre;
+		}, 10, 2 );
+
+		try {
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+			remove_all_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay' );
+		}
+
+		$this->assertSame( 2, $attempts, 'A 0 return (no exception) must still trigger a retry, not be treated as success on the first attempt.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'The continuation must ultimately be enqueued exactly once, once the second attempt succeeds.' );
+	}
+
+	// -------------------------------------------------------------------------
 	// Critical, non-obvious behavior: every attempt fails. process() must still return normally
 	// (no exception propagates), hbm_site_jobs.status must be unchanged, and no action was
 	// ultimately enqueued (exhaustion must never fabricate a phantom success or reach

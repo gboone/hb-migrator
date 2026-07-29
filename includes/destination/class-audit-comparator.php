@@ -657,8 +657,15 @@ class AuditComparator {
 	 * clear_write_cache() call in process()'s success path — comfortably longer than any
 	 * realistic self-chained comparison run, so it only matters if that explicit cleanup is
 	 * somehow skipped (e.g. the process crashes between the last render and the cleanup call).
+	 * Filterable (see write_cache_ttl()) — found during code review: every sibling constant in
+	 * this class (TIME_LIMIT, BATCH_SIZE, CONTINUATION_ENQUEUE_ATTEMPTS/RETRY_DELAY) already
+	 * follows this filterable-constant convention; this one hadn't.
 	 */
 	private const WRITE_CACHE_TTL = HOUR_IN_SECONDS;
+
+	private static function write_cache_ttl(): int {
+		return max( 0, (int) apply_filters( 'hbm_audit_compare_write_cache_ttl', self::WRITE_CACHE_TTL ) );
+	}
 
 	/**
 	 * Loads every _hbm_audit_write entry for $site_job_id (via AuditReport's U6 read-access
@@ -714,7 +721,7 @@ class AuditComparator {
 
 		switch_to_blog( get_main_site_id() );
 		try {
-			set_transient( $cache_key, $latest, self::WRITE_CACHE_TTL );
+			set_transient( $cache_key, $latest, self::write_cache_ttl() );
 		} finally {
 			restore_current_blog();
 		}
@@ -934,20 +941,36 @@ class AuditComparator {
 		$delay    = self::continuation_enqueue_retry_delay();
 
 		for ( $attempt = 1; $attempt <= $attempts; $attempt++ ) {
+			$failure_reason = null;
+
 			try {
-				as_enqueue_async_action(
+				$action_id = as_enqueue_async_action(
 					'hbm_audit_compare',
 					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
 					'hb-migrator'
 				);
-				return;
-			} catch ( \Throwable $e ) {
-				// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-				error_log( 'HB Migrator: AuditComparator continuation enqueue attempt ' . $attempt . '/' . $attempts . ' failed for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ': ' . $e->getMessage() );
 
-				if ( $attempt < $attempts && $delay > 0.0 ) {
-					usleep( (int) round( $delay * 1000000 ) );
+				// Found during code review: ActionScheduler_ActionFactory::create() (the code
+				// as_enqueue_async_action() calls into) already wraps its own DB-save call in a
+				// try/catch and returns 0 on failure WITHOUT rethrowing — the exact "transient
+				// DB/Action-Scheduler write error" this retry loop exists to ride out never
+				// actually reaches this method as a \Throwable. Treating a 0 return the same as
+				// a caught exception is what makes this loop's retry actually fire for its real
+				// target failure mode, instead of silently treating a failed enqueue as success.
+				if ( $action_id > 0 ) {
+					return;
 				}
+
+				$failure_reason = 'as_enqueue_async_action() returned 0 (no exception thrown)';
+			} catch ( \Throwable $e ) {
+				$failure_reason = $e->getMessage();
+			}
+
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditComparator continuation enqueue attempt ' . $attempt . '/' . $attempts . ' failed for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ': ' . $failure_reason );
+
+			if ( $attempt < $attempts && $delay > 0.0 ) {
+				usleep( (int) round( $delay * 1000000 ) );
 			}
 		}
 

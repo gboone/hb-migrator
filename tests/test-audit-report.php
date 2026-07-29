@@ -225,6 +225,41 @@ class Test_Audit_Report extends WP_UnitTestCase {
 		);
 	}
 
+	public function test_get_report_post_id_swallows_an_internal_failure_and_never_throws(): void {
+		// Found during code review: every other public AuditReport method has a dedicated test
+		// forcing its internal try/catch, but this one (added alongside it in the same unit)
+		// didn't. switch_to_blog() itself is what this method calls before delegating to
+		// find_report_post_id() — forcing it to throw exercises this method's own failure
+		// containment specifically, not find_report_post_id()'s.
+		$jid = $this->make_site_job();
+		AuditReport::get_or_create_for_site_job( $jid );
+
+		$log_file = tempnam( sys_get_temp_dir(), 'hbm_audit_test_log' );
+		$prev_log = ini_set( 'error_log', $log_file );
+
+		$thrower = static function () {
+			throw new \RuntimeException( 'forced switch_to_blog failure for get_report_post_id_for_site_job() containment test' );
+		};
+		add_filter( 'switch_blog', $thrower );
+
+		try {
+			$result = AuditReport::get_report_post_id_for_site_job( $jid );
+		} finally {
+			remove_filter( 'switch_blog', $thrower );
+			ini_set( 'error_log', $prev_log );
+		}
+
+		$this->assertNull( $result, 'An internal failure must resolve to null, matching this method\'s documented "null on failure or absence" contract.' );
+
+		$log_contents = file_get_contents( $log_file );
+		unlink( $log_file );
+		$this->assertStringContainsString(
+			'forced switch_to_blog failure',
+			$log_contents,
+			'The failure must be observable via the logged message even though it never propagated to the caller.'
+		);
+	}
+
 	// -------------------------------------------------------------------------
 	// record_for_migration(): staging + copy-on-first-creation
 	// -------------------------------------------------------------------------
