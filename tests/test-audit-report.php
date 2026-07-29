@@ -359,6 +359,48 @@ class Test_Audit_Report extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// write_meta_row(): U2 hardening (docs/plans/2026-07-29-001-fix-audit-report-hardening-
+	// plan.md, "U2. Shared write-trail contract", R3) — the shared postmeta-write helper
+	// append_entry() is now a thin wrapper around, and AuditComparator::store_result() also
+	// calls directly. Exercised here on its own meta key (distinct from the audit trail's own
+	// keys) so this test targets the extracted mechanics themselves, not append_entry()'s
+	// request-vs-write key-selection logic (already covered above).
+	// -------------------------------------------------------------------------
+
+	public function test_write_meta_row_appends_a_distinct_row_each_call_not_an_overwrite(): void {
+		$jid     = $this->make_site_job();
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			AuditReport::write_meta_row( $post_id, '_hbm_audit_test_meta_key', [ 'n' => 1 ] );
+			AuditReport::write_meta_row( $post_id, '_hbm_audit_test_meta_key', [ 'n' => 2 ] );
+			$rows = get_post_meta( $post_id, '_hbm_audit_test_meta_key', false );
+		} finally {
+			restore_current_blog();
+		}
+
+		$this->assertCount( 2, $rows, 'write_meta_row() must add a new row each call (add_post_meta(..., false)), never overwrite an existing one.' );
+		$this->assertSame( [ 1, 2 ], array_map( static fn( $row ) => $row['n'], $rows ) );
+	}
+
+	public function test_write_meta_row_preserves_backslashes_in_data(): void {
+		$jid     = $this->make_site_job();
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		$raw     = 'C:\Windows\Path and a \' quote';
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			AuditReport::write_meta_row( $post_id, '_hbm_audit_test_meta_key', [ 'value' => $raw ] );
+			$rows = get_post_meta( $post_id, '_hbm_audit_test_meta_key', false );
+		} finally {
+			restore_current_blog();
+		}
+
+		$this->assertSame( $raw, $rows[0]['value'], 'write_meta_row() must wp_slash() its data so backslashes survive the postmeta round-trip, matching append_entry()\'s existing guarantee.' );
+	}
+
+	// -------------------------------------------------------------------------
 	// Helpers
 	// -------------------------------------------------------------------------
 

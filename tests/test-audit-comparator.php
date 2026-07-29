@@ -13,6 +13,7 @@
 
 use HBMigrator\Destination\AuditComparator;
 use HBMigrator\Destination\AuditReport;
+use HBMigrator\Destination\PostImporter;
 use HBMigrator\Destination\SearchReplace;
 use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
@@ -979,5 +980,90 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		$log_contents = file_get_contents( $log_file );
 		unlink( $log_file );
 		$this->assertStringContainsString( 'render_summary()', $log_contents, 'The render failure must be observable via the logged message even though it never propagated.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// U2 hardening (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared
+	// write-trail contract: entry normalization and author resolution"). normalize_write_entry()
+	// is the single point of truth for the field defaults compare_post() applies to a raw
+	// cached write-trail entry — this is a pure internal refactor, so the rest of this file's
+	// existing tests (run unchanged, above) are the regression net for compare_post() itself;
+	// this test targets normalize_write_entry() directly.
+	// -------------------------------------------------------------------------
+
+	public function test_normalize_write_entry_fills_in_every_documented_default_for_a_sparse_entry(): void {
+		$ref    = new ReflectionClass( AuditComparator::class );
+		$method = $ref->getMethod( 'normalize_write_entry' );
+		$method->setAccessible( true );
+
+		$normalized = $method->invoke( null, [] );
+
+		$this->assertSame( '', $normalized['post_content'] );
+		$this->assertSame( '', $normalized['post_excerpt'] );
+		$this->assertSame( '', $normalized['post_title'] );
+		$this->assertSame( '', $normalized['post_name'] );
+		$this->assertSame( '', $normalized['source_author'] );
+		$this->assertArrayNotHasKey(
+			'meta',
+			$normalized,
+			"normalize_write_entry() must leave 'meta' untouched for an entry that never had it — no default, no type coercion — per normalize_expected_meta()'s own array-type-hint contract."
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// U2 (R4): integration proof that PostImporter::import_batch() and
+	// AuditComparator::compare_post() now share ONE author-resolution method
+	// (PostImporter::resolve_author_id()), not just similarly-shaped inline code. Drives
+	// import_batch() itself (not a hand-built write-trail entry) so a merge-resolved author only
+	// reports as matched because both call sites resolve it identically.
+	// -------------------------------------------------------------------------
+
+	public function test_authorship_resolved_by_import_batch_is_reported_matched_via_shared_resolve_author_id(): void {
+		$existing_user_id = self::factory()->user->create( [ 'user_email' => 'shared-author@old-site.example.com' ] );
+		$this->assertNotSame( 1, $existing_user_id, 'Precondition: the resolved user must not be the fallback ID 1.' );
+
+		// import_batch()'s write-trail recording is gated on the site job's status being
+		// pending/running (see PostImporter::import_batch()'s $should_audit) — make_site_job()
+		// sets 'complete', so switch to 'pending' for the import, then back to 'complete' so the
+		// comparator (which requires 'complete') will actually run.
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'pending' ] );
+
+		$source_id = 950;
+		PostImporter::import_batch( $this->jid, [ [
+			'ID'                => $source_id,
+			'post_author_email' => 'shared-author@old-site.example.com',
+			'post_date'         => '2024-01-01 00:00:00',
+			'post_date_gmt'     => '2024-01-01 00:00:00',
+			'post_content'      => 'Shared author content.',
+			'post_title'        => 'Shared Author Post',
+			'post_excerpt'      => '',
+			'post_status'       => 'publish',
+			'comment_status'    => 'open',
+			'ping_status'       => 'open',
+			'post_password'     => '',
+			'post_name'         => 'shared-author-post',
+			'post_modified'     => '2024-01-01 00:00:00',
+			'post_modified_gmt' => '2024-01-01 00:00:00',
+			'post_parent'       => 0,
+			'menu_order'        => 0,
+			'post_type'         => 'post',
+			'post_mime_type'    => '',
+			'comment_count'     => 0,
+			'meta'              => [],
+			'terms'             => [],
+		] ] );
+
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'complete' ] );
+
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+
+		$result = $this->get_result( $source_id );
+		$this->assertTrue(
+			$result['authorship_match'],
+			'An author resolved by PostImporter::import_batch() via the shared resolve_author_id() must be reported as matched by AuditComparator::compare_post() calling the SAME method.'
+		);
+		$this->assertSame( $existing_user_id, $result['expected_author_id'] );
+		$this->assertSame( $existing_user_id, $result['actual_author_id'] );
+		$this->assertFalse( $result['diverged'] );
 	}
 }

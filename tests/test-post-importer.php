@@ -513,4 +513,17 @@ class Test_PostImporter extends WP_UnitTestCase {
 		$post_row = get_post( $dest_id );
 		$this->assertNotSame( 'FAIL_ME', $post_row->post_title, 'A failed update must leave the existing destination row untouched.' );
 	}
+
+	// -------------------------------------------------------------------------
+	// U2 hardening (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared
+	// write-trail contract: entry normalization and author resolution", R4): resolve_author_id()
+	// uses the `'' !== $email` emptiness check, not `!empty()` — the two differ only for the
+	// literal string "0". Locks in that both the truly-empty string and the literal "0" string
+	// fall back to user ID 1, so the behavior pick is intentional, not accidental.
+	// -------------------------------------------------------------------------
+
+	public function test_resolve_author_id_falls_back_to_id_1_for_empty_string_and_literal_zero_string(): void {
+		$this->assertSame( 1, PostImporter::resolve_author_id( '' ) );
+		$this->assertSame( 1, PostImporter::resolve_author_id( '0' ) );
+	}
 }

@@ -253,6 +253,13 @@ class AuditComparator {
 			];
 		}
 
+		// R2 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared
+		// write-trail contract"): a single point of truth for the field defaults this method
+		// applies to the "expected" (source-derived) side of a comparison — see
+		// normalize_write_entry()'s own docblock. Read-time only: no producer call site changes,
+		// no change to what gets stored in postmeta.
+		$entry = self::normalize_write_entry( $entry );
+
 		$outcome = (string) ( $entry['outcome'] ?? '' );
 		// Gate on $dest_id, not the latest entry's outcome alone: a resumed/retried batch can
 		// record a 'failed' entry for a source_id that already landed on an EARLIER successful
@@ -272,20 +279,24 @@ class AuditComparator {
 			];
 		}
 
-		// Expected (normalized) side — pure computation, no destination read yet.
-		$expected_content   = SearchReplace::safe_replace( (string) ( $entry['post_content'] ?? '' ), $replacements );
-		$expected_excerpt   = SearchReplace::safe_replace( (string) ( $entry['post_excerpt'] ?? '' ), $replacements );
-		$expected_title     = (string) ( $entry['post_title'] ?? '' );
-		$expected_slug      = (string) ( $entry['post_name'] ?? '' );
+		// Expected (normalized) side — pure computation, no destination read yet. Every field
+		// below except 'meta' was already defaulted by normalize_write_entry() above.
+		$expected_content   = SearchReplace::safe_replace( $entry['post_content'], $replacements );
+		$expected_excerpt   = SearchReplace::safe_replace( $entry['post_excerpt'], $replacements );
+		$expected_title     = $entry['post_title'];
+		$expected_slug      = $entry['post_name'];
 		// $entry['meta'] is intentionally NOT cast to array here — normalize_expected_meta()'s
 		// `array $meta` type hint is the deliberate guard that turns a malformed cached entry
 		// (e.g. 'meta' corrupted to a non-array) into a real \Throwable (TypeError), which
 		// compare_batch()'s outer try/catch is exactly built to contain (see that method's own
-		// docblock and this unit's "forced internal failure" test scenario).
+		// docblock and this unit's "forced internal failure" test scenario). normalize_write_
+		// entry() deliberately leaves 'meta' untouched (see that method's docblock) so this
+		// ?? [] default (for an entirely absent key) and the type-hint guard below behave
+		// identically to before this refactor.
 		$expected_meta_list    = self::normalize_expected_meta( $entry['meta'] ?? [], $replacements, $attachment_map );
 		$expected_content_hash = self::hash_content( (string) $expected_content, (string) $expected_excerpt );
 		$expected_meta_hash    = self::hash_meta_list( $expected_meta_list );
-		$source_author_email  = (string) ( $entry['source_author'] ?? '' );
+		$source_author_email  = $entry['source_author'];
 
 		switch_to_blog( (int) $job->dest_blog_id );
 		try {
@@ -311,19 +322,16 @@ class AuditComparator {
 			$actual_meta_hash = self::hash_meta_list( self::to_actual_meta_list( $rows ) );
 
 			// Authorship: re-derive the SAME resolution PostImporter::import_batch() itself
-			// performs at write time (get_user_by('email', ...), fallback to user ID 1) rather
-			// than a literal identity comparison. This correctly treats a user_conflict_policy:
-			// merge resolution to a pre-existing destination user as a match — the resolution
-			// is a pure function of the same inputs (source email + destination's current user
-			// table), so re-running it here reproduces exactly what import_batch() decided,
-			// without needing any new stored state (see plan grounding + final report).
-			$expected_author_id = 1;
-			if ( '' !== $source_author_email ) {
-				$user = get_user_by( 'email', $source_author_email );
-				if ( $user ) {
-					$expected_author_id = (int) $user->ID;
-				}
-			}
+			// performs at write time — R4, see PostImporter::resolve_author_id()'s own
+			// docblock — rather than a literal identity comparison. This correctly treats a
+			// user_conflict_policy: merge resolution to a pre-existing destination user as a
+			// match — the resolution is a pure function of the same inputs (source email +
+			// destination's current user table), so re-running it here reproduces exactly what
+			// import_batch() decided, without needing any new stored state (see plan grounding +
+			// final report). Already switched to $job->dest_blog_id above, satisfying
+			// resolve_author_id()'s "caller must already be switched to the destination blog"
+			// contract.
+			$expected_author_id = PostImporter::resolve_author_id( $source_author_email );
 		} finally {
 			restore_current_blog();
 		}
@@ -381,21 +389,14 @@ class AuditComparator {
 			return;
 		}
 
+		// R3 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared
+		// write-trail contract"): shares AuditReport::append_entry()'s exact wp_slash()/
+		// add_post_meta()/clean_post_cache() sequence via write_meta_row() rather than
+		// duplicating that mechanics here — see that method's docblock for the full rationale
+		// (backslash preservation, cache-invalidation-suspension caller safety).
 		switch_to_blog( get_main_site_id() );
 		try {
-			// add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
-			// wp_unslash()'s $meta_value before storing, silently stripping any backslash a
-			// source-derived field (expected_title/expected_slug, etc.) might legitimately
-			// contain — wp_slash() here cancels that out, mirroring the identical fix in
-			// AuditReport::append_entry().
-			add_post_meta( $post_id, self::META_RESULT, wp_slash( $result ), false );
-			// Same rationale as AuditReport::append_entry(): a caller mid-loop (PostImporter's
-			// own import_batch()) may have set wp_suspend_cache_invalidation( true ) earlier in
-			// the same request — though by the time the comparator runs (after SearchReplace::
-			// finalize()) that flag has long been restored, clean_post_cache() here costs
-			// nothing and keeps this method consistent with the rest of the audit layer's
-			// caching discipline.
-			clean_post_cache( $post_id );
+			AuditReport::write_meta_row( $post_id, self::META_RESULT, $result );
 		} finally {
 			restore_current_blog();
 		}
@@ -665,6 +666,32 @@ class AuditComparator {
 			$latest[ $source_id ] = $row;
 		}
 		return $latest;
+	}
+
+	/**
+	 * R2 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared write-trail
+	 * contract: entry normalization and author resolution"): a single, read-time point of truth
+	 * for the field defaults compare_post() applies to a raw cached write-trail entry's
+	 * "expected" (source-derived) side — previously scattered across ~10 separate `?? ''`/`?? 0`
+	 * inline call sites. Deliberately a read-time normalizer, not a write-time contract: none of
+	 * the 8 existing producer call sites (PostImporter::record_write_trail() and this file's own
+	 * test helpers) change, and neither does what gets stored in postmeta — see this class's own
+	 * "Key Technical Decisions" reference in the accompanying plan.
+	 *
+	 * `meta` is deliberately left untouched here — no default, no type coercion. Defaulting or
+	 * casting it here would defeat normalize_expected_meta()'s own `array $meta` type-hint
+	 * contract, which is the deliberate trigger for this class's "malformed cached entry"
+	 * failure-containment test (see that method's docblock). Callers still apply their own
+	 * `$entry['meta'] ?? []` default for an entirely absent key, exactly as before this
+	 * extraction.
+	 */
+	private static function normalize_write_entry( array $entry ): array {
+		$entry['post_content']  = (string) ( $entry['post_content'] ?? '' );
+		$entry['post_excerpt']  = (string) ( $entry['post_excerpt'] ?? '' );
+		$entry['post_title']    = (string) ( $entry['post_title'] ?? '' );
+		$entry['post_name']     = (string) ( $entry['post_name'] ?? '' );
+		$entry['source_author'] = (string) ( $entry['source_author'] ?? '' );
+		return $entry;
 	}
 
 	/**

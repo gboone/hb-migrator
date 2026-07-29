@@ -608,7 +608,7 @@ class AuditReport {
 
 	/**
 	 * Shared by record() and copy_staged_migration_entries() so both append trail entries via
-	 * the exact same meta-key-selection and cache-cleaning logic — record() for a fresh entry,
+	 * the exact same meta-key-selection logic — record() for a fresh entry,
 	 * copy_staged_migration_entries() for entries staged earlier via record_for_migration().
 	 * Must be called while already switched to the primary site.
 	 */
@@ -616,13 +616,32 @@ class AuditReport {
 		$meta_key = ( isset( $entry['type'] ) && 'request' === $entry['type'] ) ? self::META_REQUEST : self::META_WRITE;
 		$data     = array_merge( $entry, [ 'scope' => $scope ] );
 
-		// add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
-		// wp_unslash()'s $meta_value before storing — even for a value that was never slashed in
-		// the first place — silently stripping any backslash a cached source field (post
-		// content, a Windows-style file path, etc.) might legitimately contain. wp_slash() here
-		// cancels that internal unslash out, the same convention wp_insert_post()/wp_update_post()
-		// require for plain-array input (see PostImporter::import_batch()/AuditReport's own
-		// render_summary()).
+		self::write_meta_row( $post_id, $meta_key, $data );
+	}
+
+	/**
+	 * R3 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared write-trail
+	 * contract: entry normalization and author resolution"): the shared postmeta-write mechanics
+	 * append_entry() already performed inline, extracted so AuditComparator::store_result() can
+	 * reuse the exact same sequence for its own `_hbm_audit_compare_result` rows instead of
+	 * duplicating wp_slash()/add_post_meta()/clean_post_cache() itself.
+	 *
+	 * add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
+	 * wp_unslash()'s $meta_value before storing — even for a value that was never slashed in the
+	 * first place — silently stripping any backslash a cached source field (post content, a
+	 * Windows-style file path, etc.) might legitimately contain. wp_slash() here cancels that
+	 * internal unslash out, the same convention wp_insert_post()/wp_update_post() require for
+	 * plain-array input (see PostImporter::import_batch()/AuditReport's own render_summary()).
+	 * clean_post_cache() afterward matches this class's other methods' caching discipline — a
+	 * caller mid-loop (e.g. PostImporter::import_batch()) may be running under
+	 * wp_suspend_cache_invalidation( true ), which would otherwise leave this post's cache stale.
+	 *
+	 * Must be called while already switched to the primary site — this method does not switch
+	 * blogs itself (mirrors find_report_post_id()'s identical convention). Uses
+	 * add_post_meta(..., false) — unique=false, many rows per key is intentional, matching every
+	 * existing caller's own storage convention.
+	 */
+	public static function write_meta_row( int $post_id, string $meta_key, array $data ): void {
 		add_post_meta( $post_id, $meta_key, wp_slash( $data ), false );
 		clean_post_cache( $post_id );
 	}

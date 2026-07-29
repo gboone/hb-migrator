@@ -138,14 +138,9 @@ class PostImporter {
 
 				$source_id = (int) $p['ID'];
 
-				// Resolve author.
-				$author_id = 1;
-				if ( ! empty( $p['post_author_email'] ) ) {
-					$user = get_user_by( 'email', $p['post_author_email'] );
-					if ( $user ) {
-						$author_id = $user->ID;
-					}
-				}
+				// Resolve author (R4, see resolve_author_id()'s own docblock — shared with
+				// AuditComparator::compare_post()'s re-derivation of this same resolution).
+				$author_id = self::resolve_author_id( (string) ( $p['post_author_email'] ?? '' ) );
 
 				// Resolve post_parent.
 				$post_parent = 0;
@@ -285,6 +280,33 @@ class PostImporter {
 		}
 
 		return [ 'max_id' => $max_id, 'failed_ids' => $failed_ids ];
+	}
+
+	/**
+	 * R4 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared write-trail
+	 * contract: entry normalization and author resolution"): the single point of truth for the
+	 * source-email-to-destination-user-ID resolution algorithm, previously duplicated (as two
+	 * near-identical inline copies) here and in AuditComparator::compare_post() — the latter
+	 * re-derives this SAME resolution at comparison time, rather than a literal identity
+	 * comparison, so a user_conflict_policy: merge resolution to a pre-existing destination user
+	 * is correctly treated as a match (see that method's own docblock).
+	 *
+	 * Uses the `'' !== $email` emptiness check — NOT `!empty()` — matching AuditComparator's own
+	 * (newer) reading of this same logic; the two differ only for the literal string "0", and
+	 * this extraction picks `'' !== $email` deliberately (see plan's "Key Technical Decisions").
+	 *
+	 * Caller must already be switched to the destination blog — this method does not switch
+	 * blogs itself (mirrors AuditReport::find_report_post_id()'s identical convention).
+	 */
+	public static function resolve_author_id( string $email ): int {
+		$author_id = 1;
+		if ( '' !== $email ) {
+			$user = get_user_by( 'email', $email );
+			if ( $user ) {
+				$author_id = (int) $user->ID;
+			}
+		}
+		return $author_id;
 	}
 
 	/**
