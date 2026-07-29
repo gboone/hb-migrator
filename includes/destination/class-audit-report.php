@@ -249,22 +249,61 @@ class AuditReport {
 	 * migration.
 	 */
 	public static function record_for_migration( int $migration_id, string $scope, array $entry ): void {
+		// Found during code review: the single-entry case of record_batch_for_migration()'s own
+		// get_site_option()/append/update_site_option() sequence — delegates instead of
+		// duplicating that logic (they must stay identical, since both write to the same staging
+		// option copy_staged_migration_entries() later reads).
+		self::record_batch_for_migration( $migration_id, $scope, [ $entry ] );
+	}
+
+	/**
+	 * R7 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U5. UserImporter
+	 * batched staged writes"): batched sibling of record_for_migration() — appends a whole batch
+	 * of entries to the same per-migration staging option in one get_site_option()/
+	 * update_site_option() round-trip, instead of one round-trip per entry.
+	 * UserImporter::process()'s per-user loop is the only caller today: at real production scale
+	 * that loop's previous one-call-per-user use of record_for_migration() made every user's
+	 * write re-fetch and re-store the entire (ever-growing) staged-entries array — an O(n^2)
+	 * pattern that only bites at large migrations. Batching several users' entries into one call
+	 * removes that quadratic growth.
+	 *
+	 * Stores each entry in the exact same shape record_for_migration() already uses
+	 * (['scope' => ..., 'entry' => ...] per staged item, one $scope shared by the whole batch,
+	 * matching record_for_migration()'s own single-scope-per-call signature) — so
+	 * copy_staged_migration_entries() reads this option without needing to know or care whether
+	 * a given item arrived via record_for_migration() or this batched method.
+	 *
+	 * $entries is a plain list of entry arrays (the same shape each one would have been passed as
+	 * to record_for_migration() individually) — not pre-wrapped with 'scope'/'entry' keys; this
+	 * method does that wrapping itself, once per entry, using the single $scope for the whole
+	 * batch.
+	 *
+	 * Never throws (see class docblock) — a failure here is swallowed and logged, exactly like
+	 * every other method in this class.
+	 */
+	public static function record_batch_for_migration( int $migration_id, string $scope, array $entries ): void {
 		try {
+			if ( empty( $entries ) ) {
+				return;
+			}
+
 			$option_key = self::staging_option_key( $migration_id );
 			$staged     = get_site_option( $option_key, [] );
 			if ( ! is_array( $staged ) ) {
 				$staged = [];
 			}
 
-			$staged[] = [
-				'scope' => $scope,
-				'entry' => $entry,
-			];
+			foreach ( $entries as $entry ) {
+				$staged[] = [
+					'scope' => $scope,
+					'entry' => $entry,
+				];
+			}
 
 			update_site_option( $option_key, $staged );
 		} catch ( \Throwable $e ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			error_log( 'HB Migrator: AuditReport::record_for_migration() failed for migration ' . $migration_id . ': ' . $e->getMessage() );
+			error_log( 'HB Migrator: AuditReport::record_batch_for_migration() failed for migration ' . $migration_id . ': ' . $e->getMessage() );
 		}
 	}
 
@@ -288,6 +327,36 @@ class AuditReport {
 		} catch ( \Throwable $e ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			error_log( 'HB Migrator: AuditReport::delete_for_site_job() failed for site job ' . $site_job_id . ': ' . $e->getMessage() );
+		}
+	}
+
+	/**
+	 * R1 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U1. CLI report-post-id
+	 * lookup"): a public, non-creating way to look up a site job's report post ID, for
+	 * `wp hbm migration list` (Cli\MigrationCommand::list()) and any other caller that only
+	 * wants to know "does a report exist, and if so what's its post ID" without fabricating one
+	 * as a side effect. Deliberately does NOT call get_or_create_for_site_job() — that method's
+	 * wp_insert_post() call is exactly the side effect this method must avoid, since merely
+	 * listing migrations must never create an empty report post as a byproduct.
+	 *
+	 * Switches to the primary site itself — find_report_post_id() documents that it does not —
+	 * so callers don't need to know this class's storage lives on the primary/network site.
+	 * Returns null both when no report exists and on any internal failure (see class docblock);
+	 * a caller has no way to distinguish the two, matching every other AuditReport method's
+	 * failure-containment discipline.
+	 */
+	public static function get_report_post_id_for_site_job( int $site_job_id ): ?int {
+		try {
+			switch_to_blog( get_main_site_id() );
+			try {
+				return self::find_report_post_id( $site_job_id );
+			} finally {
+				restore_current_blog();
+			}
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditReport::get_report_post_id_for_site_job() failed for site job ' . $site_job_id . ': ' . $e->getMessage() );
+			return null;
 		}
 	}
 
@@ -578,7 +647,7 @@ class AuditReport {
 
 	/**
 	 * Shared by record() and copy_staged_migration_entries() so both append trail entries via
-	 * the exact same meta-key-selection and cache-cleaning logic — record() for a fresh entry,
+	 * the exact same meta-key-selection logic — record() for a fresh entry,
 	 * copy_staged_migration_entries() for entries staged earlier via record_for_migration().
 	 * Must be called while already switched to the primary site.
 	 */
@@ -586,15 +655,46 @@ class AuditReport {
 		$meta_key = ( isset( $entry['type'] ) && 'request' === $entry['type'] ) ? self::META_REQUEST : self::META_WRITE;
 		$data     = array_merge( $entry, [ 'scope' => $scope ] );
 
-		// add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
-		// wp_unslash()'s $meta_value before storing — even for a value that was never slashed in
-		// the first place — silently stripping any backslash a cached source field (post
-		// content, a Windows-style file path, etc.) might legitimately contain. wp_slash() here
-		// cancels that internal unslash out, the same convention wp_insert_post()/wp_update_post()
-		// require for plain-array input (see PostImporter::import_batch()/AuditReport's own
-		// render_summary()).
-		add_post_meta( $post_id, $meta_key, wp_slash( $data ), false );
-		clean_post_cache( $post_id );
+		self::write_meta_row( $post_id, $meta_key, $data );
+	}
+
+	/**
+	 * R3 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared write-trail
+	 * contract: entry normalization and author resolution"): the shared postmeta-write mechanics
+	 * append_entry() already performed inline, extracted so AuditComparator::store_result() can
+	 * reuse the exact same sequence for its own `_hbm_audit_compare_result` rows instead of
+	 * duplicating wp_slash()/add_post_meta()/clean_post_cache() itself.
+	 *
+	 * add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
+	 * wp_unslash()'s $meta_value before storing — even for a value that was never slashed in the
+	 * first place — silently stripping any backslash a cached source field (post content, a
+	 * Windows-style file path, etc.) might legitimately contain. wp_slash() here cancels that
+	 * internal unslash out, the same convention wp_insert_post()/wp_update_post() require for
+	 * plain-array input (see PostImporter::import_batch()/AuditReport's own render_summary()).
+	 * clean_post_cache() afterward matches this class's other methods' caching discipline — a
+	 * caller mid-loop (e.g. PostImporter::import_batch()) may be running under
+	 * wp_suspend_cache_invalidation( true ), which would otherwise leave this post's cache stale.
+	 *
+	 * Must be called while already switched to the primary site — this method does not switch
+	 * blogs itself (mirrors find_report_post_id()'s identical convention). Uses
+	 * add_post_meta(..., false) — unique=false, many rows per key is intentional, matching every
+	 * existing caller's own storage convention.
+	 *
+	 * Wraps its own body in try/catch (\Throwable) — found during code review: as a PUBLIC
+	 * method, this must independently satisfy the class's stated invariant that every public
+	 * method never lets an internal failure escape, rather than relying on append_entry()'s
+	 * caller (record()) already having its own try/catch. A future direct caller of this method
+	 * (bypassing append_entry()/store_result()) must get the same guarantee every other public
+	 * method in this class already provides.
+	 */
+	public static function write_meta_row( int $post_id, string $meta_key, array $data ): void {
+		try {
+			add_post_meta( $post_id, $meta_key, wp_slash( $data ), false );
+			clean_post_cache( $post_id );
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditReport::write_meta_row() failed for post ' . $post_id . ' meta key ' . $meta_key . ': ' . $e->getMessage() );
+		}
 	}
 
 	/**

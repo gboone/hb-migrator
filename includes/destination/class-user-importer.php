@@ -11,7 +11,26 @@ use HBMigrator\UserSiteRoles;
 
 class UserImporter {
 
+	/**
+	 * R7 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U5. UserImporter
+	 * batched staged writes"): the per-user loop below accumulates staged write-trail entries
+	 * and flushes them via AuditReport::record_batch_for_migration() every this-many users,
+	 * instead of one AuditReport::record_for_migration() round-trip per user (which produced an
+	 * O(n^2) read-modify-write pattern at real migration scale — each call re-fetched and
+	 * re-stored the entire, ever-growing staged-entries option). A modest value balances the
+	 * round-trip reduction against failure blast radius: batching trades "1 entry lost per
+	 * failure" for "up to this many entries lost per failure" in the pure round-trip-failure
+	 * case (the mid-batch-exception case is separately protected by the unconditional flush in
+	 * the catch block below).
+	 */
+	private const STAGED_ENTRY_FLUSH_THRESHOLD = 25;
+
 	public static function process( int $migration_id, int $offset, int $attempt ): void {
+		// Declared before the try block — and before anything inside it that could itself throw
+		// — so the catch block's exception-path flush below never operates on an undefined
+		// variable, no matter how early a failure occurs.
+		$staged_entries = [];
+
 		try {
 			$migration = MigrationRegistry::get_migration( $migration_id );
 			if ( ! $migration ) {
@@ -105,13 +124,14 @@ class UserImporter {
 					}
 
 					if ( is_wp_error( $new_id ) ) {
-						AuditReport::record_for_migration( $migration_id, 'migration', [
+						$staged_entries[] = [
 							'type'        => 'write',
 							'object_type' => 'user',
 							'source_id'   => (int) $u['source_user_id'],
 							'outcome'     => 'failed',
 							'error'       => $new_id->get_error_message(),
-						] );
+						];
+						self::maybe_flush_staged_entries( $migration_id, $staged_entries );
 						continue;
 					}
 
@@ -125,23 +145,31 @@ class UserImporter {
 
 				IdMap::set( IdMap::NETWORK, 'user', (int) $u['source_user_id'], $dest_user_id );
 
-				AuditReport::record_for_migration( $migration_id, 'migration', [
+				$staged_entries[] = [
 					'type'        => 'write',
 					'object_type' => 'user',
 					'source_id'   => (int) $u['source_user_id'],
 					'dest_id'     => $dest_user_id,
 					'outcome'     => $outcome,
-				] );
+				];
 
 				// Store per-site roles so TermImporter can assign them after subsite creation
 				// without making additional HTTP requests.
 				foreach ( $u['site_roles'] as $sr ) {
 					UserSiteRoles::store( $migration_id, (int) $u['source_user_id'], (int) $sr['blog_id'], $sr['role'] );
 				}
+
+				self::maybe_flush_staged_entries( $migration_id, $staged_entries );
 			}
 
 			remove_filter( 'pre_wp_mail', $suppress_mail );
 			wp_suspend_cache_invalidation( false );
+
+			// R7 unconditional flush (see docs/plans/2026-07-29-001-fix-audit-report-hardening-
+			// plan.md, "U5"): whatever remains in the accumulator below the periodic threshold
+			// must not be silently dropped just because the loop ended before reaching it. Placed
+			// once here, before either of the two success exits below, so both are covered.
+			self::flush_staged_entries( $migration_id, $staged_entries );
 
 			// Circuit breaker: cap at 100k users to prevent a looping source from
 			// holding the pipeline open indefinitely.
@@ -171,6 +199,14 @@ class UserImporter {
 			}
 			wp_suspend_cache_invalidation( false );
 
+			// R7 exception-path flush (docs/plans/2026-07-29-001-fix-audit-report-hardening-
+			// plan.md, "U5"): the one genuinely new failure mode this refactor introduces — with
+			// per-user-immediate writes, each already-processed user's entry was already durable
+			// by the time a later user's processing could throw, so no equivalent loss risk
+			// existed before. Flush best-effort, before the retry-or-fail decision below, so
+			// whatever was accumulated so far survives the exception.
+			self::flush_staged_entries( $migration_id, $staged_entries );
+
 			// UserImporter is network-level; on retry exhaustion, fail the whole migration.
 			$max = (int) apply_filters( 'hbm_max_retries', 3 );
 			if ( $attempt < $max ) {
@@ -184,6 +220,33 @@ class UserImporter {
 			} else {
 				MigrationRegistry::fail_migration( $migration_id, $e->getMessage() );
 			}
+		}
+	}
+
+	/**
+	 * Flushes $staged_entries (if non-empty) to AuditReport::record_batch_for_migration() and
+	 * clears the accumulator by reference — called at every flush point in process() (periodic,
+	 * both success exits, and the exception path) so each call site doesn't repeat the
+	 * empty-check/clear dance itself.
+	 */
+	private static function flush_staged_entries( int $migration_id, array &$staged_entries ): void {
+		if ( empty( $staged_entries ) ) {
+			return;
+		}
+
+		AuditReport::record_batch_for_migration( $migration_id, 'migration', $staged_entries );
+		$staged_entries = [];
+	}
+
+	/**
+	 * R7 periodic flush: called once per loop iteration, after that iteration's entry has been
+	 * accumulated. Flushes only once the accumulator reaches STAGED_ENTRY_FLUSH_THRESHOLD — the
+	 * two unconditional flush call sites in process() (both success exits, and the exception
+	 * path) cover whatever remains below this threshold when the loop ends early.
+	 */
+	private static function maybe_flush_staged_entries( int $migration_id, array &$staged_entries ): void {
+		if ( count( $staged_entries ) >= self::STAGED_ENTRY_FLUSH_THRESHOLD ) {
+			self::flush_staged_entries( $migration_id, $staged_entries );
 		}
 	}
 

@@ -13,6 +13,7 @@
 
 use HBMigrator\Destination\AuditComparator;
 use HBMigrator\Destination\AuditReport;
+use HBMigrator\Destination\PostImporter;
 use HBMigrator\Destination\SearchReplace;
 use HBMigrator\IdMap;
 use HBMigrator\MigrationRegistry;
@@ -979,5 +980,530 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		$log_contents = file_get_contents( $log_file );
 		unlink( $log_file );
 		$this->assertStringContainsString( 'render_summary()', $log_contents, 'The render failure must be observable via the logged message even though it never propagated.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// U2 hardening (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared
+	// write-trail contract: entry normalization and author resolution"). normalize_write_entry()
+	// is the single point of truth for the field defaults compare_post() applies to a raw
+	// cached write-trail entry — this is a pure internal refactor, so the rest of this file's
+	// existing tests (run unchanged, above) are the regression net for compare_post() itself;
+	// this test targets normalize_write_entry() directly.
+	// -------------------------------------------------------------------------
+
+	public function test_normalize_write_entry_fills_in_every_documented_default_for_a_sparse_entry(): void {
+		$ref    = new ReflectionClass( AuditComparator::class );
+		$method = $ref->getMethod( 'normalize_write_entry' );
+		$method->setAccessible( true );
+
+		$normalized = $method->invoke( null, [] );
+
+		$this->assertSame( '', $normalized['post_content'] );
+		$this->assertSame( '', $normalized['post_excerpt'] );
+		$this->assertSame( '', $normalized['post_title'] );
+		$this->assertSame( '', $normalized['post_name'] );
+		$this->assertSame( '', $normalized['source_author'] );
+		$this->assertArrayNotHasKey(
+			'meta',
+			$normalized,
+			"normalize_write_entry() must leave 'meta' untouched for an entry that never had it — no default, no type coercion — per normalize_expected_meta()'s own array-type-hint contract."
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// U2 (R4): integration proof that PostImporter::import_batch() and
+	// AuditComparator::compare_post() now share ONE author-resolution method
+	// (PostImporter::resolve_author_id()), not just similarly-shaped inline code. Drives
+	// import_batch() itself (not a hand-built write-trail entry) so a merge-resolved author only
+	// reports as matched because both call sites resolve it identically.
+	// -------------------------------------------------------------------------
+
+	public function test_authorship_resolved_by_import_batch_is_reported_matched_via_shared_resolve_author_id(): void {
+		$existing_user_id = self::factory()->user->create( [ 'user_email' => 'shared-author@old-site.example.com' ] );
+		$this->assertNotSame( 1, $existing_user_id, 'Precondition: the resolved user must not be the fallback ID 1.' );
+
+		// import_batch()'s write-trail recording is gated on the site job's status being
+		// pending/running (see PostImporter::import_batch()'s $should_audit) — make_site_job()
+		// sets 'complete', so switch to 'pending' for the import, then back to 'complete' so the
+		// comparator (which requires 'complete') will actually run.
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'pending' ] );
+
+		$source_id = 950;
+		PostImporter::import_batch( $this->jid, [ [
+			'ID'                => $source_id,
+			'post_author_email' => 'shared-author@old-site.example.com',
+			'post_date'         => '2024-01-01 00:00:00',
+			'post_date_gmt'     => '2024-01-01 00:00:00',
+			'post_content'      => 'Shared author content.',
+			'post_title'        => 'Shared Author Post',
+			'post_excerpt'      => '',
+			'post_status'       => 'publish',
+			'comment_status'    => 'open',
+			'ping_status'       => 'open',
+			'post_password'     => '',
+			'post_name'         => 'shared-author-post',
+			'post_modified'     => '2024-01-01 00:00:00',
+			'post_modified_gmt' => '2024-01-01 00:00:00',
+			'post_parent'       => 0,
+			'menu_order'        => 0,
+			'post_type'         => 'post',
+			'post_mime_type'    => '',
+			'comment_count'     => 0,
+			'meta'              => [],
+			'terms'             => [],
+		] ] );
+
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'complete' ] );
+
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+
+		$result = $this->get_result( $source_id );
+		$this->assertTrue(
+			$result['authorship_match'],
+			'An author resolved by PostImporter::import_batch() via the shared resolve_author_id() must be reported as matched by AuditComparator::compare_post() calling the SAME method.'
+		);
+		$this->assertSame( $existing_user_id, $result['expected_author_id'] );
+		$this->assertSame( $existing_user_id, $result['actual_author_id'] );
+		$this->assertFalse( $result['diverged'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U4 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U4. Comparator
+	// trail-read caching"): load_latest_write_entries()'s per-site-job/per-object-type transient
+	// cache. Integration: across a full, multi-batch comparison run (compare_batch() checkpointed
+	// via the batch_size/time_limit filters, then compute_counts()), the underlying get_post_meta()
+	// call AuditReport::get_write_entries_for_site_job() makes for the write trail must be invoked
+	// exactly once per object_type actually read ('post', 'attachment', 'term') — not zero, not
+	// once per checkpoint. Spied via the get_post_metadata filter (applied on every get_post_meta()
+	// call regardless of the object cache, see WP core's get_metadata()), scoped to the exact
+	// meta_key/$single shape AuditReport::get_write_entries_for_site_job() uses.
+	// -------------------------------------------------------------------------
+
+	public function test_write_trail_read_is_cached_and_get_post_meta_invoked_once_per_object_type(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+
+		$ids = [ 3001, 3002, 3003 ];
+		foreach ( $ids as $sid ) {
+			$dest_id = $this->create_dest_post( [ 'post_title' => "Cache {$sid}", 'post_name' => "cache-{$sid}" ] );
+			IdMap::set( $this->jid, 'post', $sid, $dest_id );
+			$this->record_post_entry( $sid, 'created', [ 'post_title' => "Cache {$sid}", 'post_name' => "cache-{$sid}" ] );
+		}
+
+		IdMap::set( $this->jid, 'attachment', 3101, $this->create_dest_attachment() );
+		$this->record_attachment_entry( 3101, 'created' );
+
+		$term = wp_insert_term( 'Cache Term ' . wp_generate_password( 6, false ), 'category' );
+		IdMap::set( $this->jid, 'term', 3201, (int) $term['term_id'] );
+		$this->record_term_entry( 3201, 'created', (int) $term['term_id'] );
+
+		$calls = 0;
+		$spy   = function ( $value, $post_id, $meta_key, $single ) use ( &$calls ) {
+			if ( '_hbm_audit_write' === $meta_key && false === $single ) {
+				++$calls;
+			}
+			return $value;
+		};
+		add_filter( 'get_post_metadata', $spy, 10, 4 );
+
+		$checkpoint = 0;
+		$iterations = 0;
+		do {
+			$checkpoint = AuditComparator::compare_batch( $this->jid, $checkpoint );
+			++$iterations;
+		} while ( null !== $checkpoint && $iterations < 10 );
+		$this->assertGreaterThan( 1, $iterations, 'batch_size=1 with an always-exceeded budget must take more than one call to drain 3 posts — the scenario this cache is meant to help.' );
+
+		$counts = AuditComparator::compute_counts( $this->jid );
+
+		remove_filter( 'get_post_metadata', $spy, 10 );
+		remove_all_filters( 'hbm_audit_compare_batch_size' );
+		remove_all_filters( 'hbm_audit_compare_time_limit' );
+
+		$this->assertSame(
+			3,
+			$calls,
+			'get_post_meta() for the write trail must be invoked exactly once per object_type read (post, attachment, term) across the whole run, not once per compare_batch() checkpoint and not skipped for any object_type.'
+		);
+
+		// Sanity: the run actually produced correct data through the cache, not just the right
+		// call count.
+		$this->assertCount( 3, AuditComparator::get_post_comparison_results( $this->jid ) );
+		$this->assertSame( 1, $counts['attachment']['attempted'] );
+		$this->assertSame( 1, $counts['term']['attempted'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U4 edge case — the specific regression this fix targets: compute_counts()'s 'attachment'/
+	// 'term' reads must NOT be served the 'post'-object-type cache entry compare_batch_inner()
+	// populates earlier in the same run. A cache keyed on site_job_id alone would leak the
+	// 'post'-filtered map into these calls; keying on site_job_id + object_type (as implemented)
+	// keeps them isolated. Uses deliberately distinguishable counts (3 post entries vs. 1
+	// attachment vs. 1 failed-only term entry) so a cache-key leak would be impossible to miss.
+	// -------------------------------------------------------------------------
+
+	public function test_compute_counts_after_compare_batch_is_not_served_the_post_cache_entry(): void {
+		$post_ids = [ 3301, 3302, 3303 ];
+		foreach ( $post_ids as $sid ) {
+			$dest_id = $this->create_dest_post( [ 'post_title' => "Iso {$sid}", 'post_name' => "iso-{$sid}" ] );
+			IdMap::set( $this->jid, 'post', $sid, $dest_id );
+			$this->record_post_entry( $sid, 'created', [ 'post_title' => "Iso {$sid}", 'post_name' => "iso-{$sid}" ] );
+		}
+
+		IdMap::set( $this->jid, 'attachment', 3401, $this->create_dest_attachment() );
+		$this->record_attachment_entry( 3401, 'created' );
+
+		// A failed-only term entry (no IdMap entry, outcome 'failed') — attempted=1, landed=0,
+		// failed=1, deliberately distinct from the 3-post cache's shape.
+		$this->record_term_entry( 3501, 'failed' );
+
+		// Warms the 'post'-keyed cache entry first — exactly what a real run does via
+		// compare_batch_inner() before compute_counts_inner() ever runs.
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+
+		$counts = AuditComparator::compute_counts( $this->jid );
+
+		$this->assertSame(
+			1,
+			$counts['attachment']['attempted'],
+			"compute_counts()'s attachment read must not be served the 'post'-object-type cache entry populated by the earlier compare_batch() call (which would leak the 3-post-entry count here)."
+		);
+		$this->assertSame( 1, $counts['attachment']['landed'] );
+		$this->assertSame( 0, $counts['attachment']['failed'] );
+
+		$this->assertSame(
+			1,
+			$counts['term']['attempted'],
+			"compute_counts()'s term read must not be served the 'post'-object-type cache entry populated by the earlier compare_batch() call."
+		);
+		$this->assertSame( 0, $counts['term']['landed'] );
+		$this->assertSame( 1, $counts['term']['failed'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// U4 edge case: the transient cache is explicitly deleted once process() finishes rendering
+	// the final summary — a later comparison run for the same site job (simulated here by
+	// recording a new write-trail entry and re-running compare_batch() after process() has
+	// already cleaned up) must see fresh data, not whatever was cached during the prior run.
+	// -------------------------------------------------------------------------
+
+	public function test_write_cache_is_cleared_after_process_renders_and_a_later_run_sees_fresh_data(): void {
+		$first_source_id = 3601;
+		$first_dest_id    = $this->create_dest_post( [ 'post_title' => 'First', 'post_name' => 'clear-first' ] );
+		IdMap::set( $this->jid, 'post', $first_source_id, $first_dest_id );
+		$this->record_post_entry( $first_source_id, 'created', [ 'post_title' => 'First', 'post_name' => 'clear-first' ] );
+
+		AuditComparator::process( $this->jid, 0 );
+		$this->assertArrayHasKey( $first_source_id, AuditComparator::get_post_comparison_results( $this->jid ) );
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			foreach ( [ 'post', 'attachment', 'term' ] as $object_type ) {
+				$this->assertFalse(
+					get_transient( 'hbm_audit_write_cache_' . $this->jid . '_' . $object_type ),
+					"The '{$object_type}' write-trail cache must be deleted once process() finishes rendering the final summary."
+				);
+			}
+		} finally {
+			restore_current_blog();
+		}
+
+		// A later comparison for this same site job (only hypothetical in production, since
+		// write-trail entries are immutable once comparison starts — but exercised here to prove
+		// the deleted cache isn't stuck serving stale data) must see a newly recorded entry.
+		$second_source_id = 3602;
+		$second_dest_id    = $this->create_dest_post( [ 'post_title' => 'Second', 'post_name' => 'clear-second' ] );
+		IdMap::set( $this->jid, 'post', $second_source_id, $second_dest_id );
+		$this->record_post_entry( $second_source_id, 'created', [ 'post_title' => 'Second', 'post_name' => 'clear-second' ] );
+
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+		$results = AuditComparator::get_post_comparison_results( $this->jid );
+		$this->assertArrayHasKey(
+			$second_source_id,
+			$results,
+			'A later comparison run must see a newly recorded write-trail entry, not stale cached data from the prior (already-cleaned-up) run.'
+		);
+	}
+
+	// -------------------------------------------------------------------------
+	// U4 edge case: a fresh comparison run for a DIFFERENT site job never sees the other job's
+	// cached write-trail data — proves the cache key is scoped per site_job_id, not global.
+	// -------------------------------------------------------------------------
+
+	public function test_write_cache_does_not_leak_between_different_site_jobs(): void {
+		$source_id = 3701;
+		$dest_id   = $this->create_dest_post( [ 'post_title' => 'Job One', 'post_name' => 'job-one' ] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [ 'post_title' => 'Job One', 'post_name' => 'job-one' ] );
+
+		// Warms this->jid's 'post' cache entry.
+		$this->assertNull( AuditComparator::compare_batch( $this->jid, 0 ) );
+
+		$other_jid        = $this->make_site_job();
+		$other_source_id  = 3801;
+		$other_dest_id    = $this->create_dest_post( [ 'post_title' => 'Job Two', 'post_name' => 'job-two' ] );
+		IdMap::set( $other_jid, 'post', $other_source_id, $other_dest_id );
+		$this->record_post_entry( $other_source_id, 'created', [ 'post_title' => 'Job Two', 'post_name' => 'job-two' ], $other_jid );
+
+		$this->assertNull( AuditComparator::compare_batch( $other_jid, 0 ) );
+
+		$other_results = AuditComparator::get_post_comparison_results( $other_jid );
+		$this->assertArrayHasKey(
+			$other_source_id,
+			$other_results,
+			"A different site job's comparison must not be served the first job's cached write-trail entries."
+		);
+		$this->assertArrayNotHasKey( $source_id, $other_results );
+	}
+
+	// -------------------------------------------------------------------------
+	// U6 hardening (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U6.
+	// AuditComparator self-chain: bounded retry for continuation enqueue"). process()'s
+	// checkpoint-continuation branch now goes through enqueue_continuation_with_retry() instead
+	// of calling as_enqueue_async_action() directly. Every test below forces the deterministic
+	// budget-exceeded checkpoint path (batch_size=1, time_limit=-1.0, same mechanism already used
+	// by test_multibatch_process_renders_final_summary_only_once()) so process() always has a
+	// continuation to enqueue.
+	// -------------------------------------------------------------------------
+
+	/**
+	 * Seeds one landed post with a driving-map entry, so a single compare_batch_inner() pass
+	 * processes exactly one item and returns a non-null checkpoint (forced via the batch_size=1 +
+	 * time_limit=-1.0 filters every test in this section applies).
+	 */
+	private function seed_one_continuation_item( int $source_id ): void {
+		$dest_id = $this->create_dest_post( [ 'post_title' => "Cont {$source_id}", 'post_name' => "cont-{$source_id}" ] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [ 'post_title' => "Cont {$source_id}", 'post_name' => "cont-{$source_id}" ] );
+	}
+
+	public function test_continuation_enqueue_happy_path_succeeds_on_first_attempt_without_retry(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+
+		$source_id = 4101;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' === $hook ) {
+				++$attempts;
+			}
+			return $pre;
+		}, 10, 2 );
+
+		$started = microtime( true );
+		try {
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			$elapsed = microtime( true ) - $started;
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+		}
+
+		$this->assertSame( 1, $attempts, 'The happy path must call the underlying enqueue exactly once — no retry when the first attempt already succeeds.' );
+		$this->assertLessThan( 0.2, $elapsed, 'No retry delay must occur when the first enqueue attempt succeeds — this would fail if the retry loop slept unnecessarily.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'The continuation must be enqueued exactly once.' );
+	}
+
+	public function test_continuation_enqueue_retries_and_succeeds_on_third_attempt(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+		// Keep the test fast — force the between-attempt delay to (near) zero rather than the
+		// real default, mirroring this class's own hbm_audit_compare_time_limit/batch_size
+		// filterable-constant pattern (see enqueue_continuation_with_retry()'s own constants).
+		add_filter( 'hbm_audit_compare_continuation_enqueue_retry_delay', static fn() => 0.0 );
+
+		$source_id = 4102;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' !== $hook ) {
+				return $pre;
+			}
+			++$attempts;
+			if ( $attempts < 3 ) {
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure #' . $attempts );
+			}
+			return $pre; // Third attempt: let the real enqueue proceed.
+		}, 10, 2 );
+
+		try {
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+			remove_all_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay' );
+		}
+
+		$this->assertSame( 3, $attempts, 'The first two attempts must fail and the third must be tried before giving up.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'The continuation must ultimately be enqueued exactly once, once the third attempt succeeds.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Found during code review: ActionScheduler_ActionFactory::create() (what
+	// as_enqueue_async_action() calls into) already catches its own DB-save exception
+	// internally and returns 0 WITHOUT rethrowing — the real "transient DB/Action-Scheduler
+	// write error" this retry loop exists to ride out never reaches enqueue_continuation_with_
+	// retry() as a \Throwable at all. A retry loop that only branches on a caught exception
+	// would silently treat this 0-return as success on the very first attempt. This test
+	// simulates that exact real-world shape (a 0 return, no exception) rather than the
+	// exception-based simulation the other tests in this group use.
+	// -------------------------------------------------------------------------
+
+	public function test_continuation_enqueue_retries_when_as_enqueue_returns_zero_without_throwing(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+		add_filter( 'hbm_audit_compare_continuation_enqueue_retry_delay', static fn() => 0.0 );
+
+		$source_id = 4104;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' !== $hook ) {
+				return $pre;
+			}
+			++$attempts;
+			// Mirrors ActionScheduler_ActionFactory::create()'s own real failure return shape:
+			// 0, not a thrown exception — see this test's own docblock.
+			return $attempts < 2 ? 0 : $pre;
+		}, 10, 2 );
+
+		try {
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+			remove_all_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay' );
+		}
+
+		$this->assertSame( 2, $attempts, 'A 0 return (no exception) must still trigger a retry, not be treated as success on the first attempt.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'The continuation must ultimately be enqueued exactly once, once the second attempt succeeds.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Critical, non-obvious behavior: every attempt fails. process() must still return normally
+	// (no exception propagates), hbm_site_jobs.status must be unchanged, and no action was
+	// ultimately enqueued (exhaustion must never fabricate a phantom success or reach
+	// PipelineController::handle_batch_failure()'s status-flipping behavior).
+	// -------------------------------------------------------------------------
+
+	public function test_continuation_enqueue_exhaustion_leaves_status_unchanged_and_enqueues_nothing(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+		add_filter( 'hbm_audit_compare_continuation_enqueue_retry_delay', static fn() => 0.0 );
+
+		$source_id = 4103;
+		$this->seed_one_continuation_item( $source_id );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' === $hook ) {
+				++$attempts;
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure #' . $attempts );
+			}
+			return $pre;
+		}, 10, 2 );
+
+		$log_file = tempnam( sys_get_temp_dir(), 'hbm_audit_continuation_retry_test_log' );
+		$prev_log = ini_set( 'error_log', $log_file );
+
+		try {
+			// The forced RuntimeException on every attempt must never propagate out of process().
+			AuditComparator::process( $this->jid, 0 );
+		} finally {
+			ini_set( 'error_log', $prev_log );
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+			remove_all_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay' );
+		}
+
+		$this->assertSame( 3, $attempts, 'All 3 bounded attempts must have been tried before giving up.' );
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 'complete', $job->status, "Exhausting the continuation-enqueue retry budget must never alter the site job's own status column." );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $source_id ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 0, $scheduled, 'No continuation should have actually been enqueued given every attempt failed — exhaustion must not fabricate a phantom success.' );
+
+		$log_contents = file_get_contents( $log_file );
+		unlink( $log_file );
+		$this->assertStringContainsString( 'giving up without altering hbm_site_jobs.status', $log_contents, 'Exhaustion must be logged via error_log(), matching this class\'s universal swallow-and-log discipline.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Integration: SearchReplace::finalize()'s own initial hbm_audit_compare enqueue (a
+	// completely different call site — see class-search-replace.php) already has its own,
+	// separate try/catch from a prior code-review fix and must remain a single, unretried
+	// attempt. This unit's bounded retry is scoped entirely to
+	// AuditComparator::process()'s continuation-enqueue branch.
+	// -------------------------------------------------------------------------
+
+	public function test_search_replace_finalize_initial_enqueue_is_not_retried_by_this_change(): void {
+		MigrationRegistry::update_site_job( $this->jid, [ 'status' => 'running' ] );
+		MigrationRegistry::update_migration_status( $this->mid, 'running' );
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare' === $hook ) {
+				++$attempts;
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure.' );
+			}
+			return $pre;
+		}, 10, 2 );
+
+		$ref    = new ReflectionClass( SearchReplace::class );
+		$method = $ref->getMethod( 'finalize' );
+		$method->setAccessible( true );
+
+		global $wpdb;
+		$suppress = $wpdb->suppress_errors( true );
+		try {
+			$method->invoke( null, $this->jid, $this->mid, get_current_blog_id() );
+		} finally {
+			$wpdb->suppress_errors( $suppress );
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+		}
+
+		$this->assertSame(
+			1,
+			$attempts,
+			"SearchReplace::finalize()'s own initial hbm_audit_compare enqueue must remain a single, unretried attempt — U6's bounded retry only wraps AuditComparator::process()'s continuation-enqueue call, not this separate call site."
+		);
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 'complete', $job->status, 'finalize() must still complete the site job even though its own audit-compare enqueue failed.' );
 	}
 }

@@ -191,6 +191,76 @@ class Test_Audit_Report extends WP_UnitTestCase {
 	}
 
 	// -------------------------------------------------------------------------
+	// get_report_post_id_for_site_job(): U1 non-creating lookup (see
+	// docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, R1).
+	// -------------------------------------------------------------------------
+
+	public function test_get_report_post_id_returns_correct_id_for_existing_report(): void {
+		$jid     = $this->make_site_job();
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+
+		$this->assertSame( $post_id, AuditReport::get_report_post_id_for_site_job( $jid ) );
+	}
+
+	public function test_get_report_post_id_returns_null_and_creates_nothing_when_no_report_exists(): void {
+		$jid = $this->make_site_job();
+
+		$count_before = self::count_report_posts();
+		$result       = AuditReport::get_report_post_id_for_site_job( $jid );
+		$count_after  = self::count_report_posts();
+
+		$this->assertNull( $result, 'A site job with no trail-worthy event must resolve to null, not fabricate a report.' );
+		$this->assertSame( $count_before, $count_after, 'get_report_post_id_for_site_job() must never create a report post as a side effect.' );
+	}
+
+	public function test_get_report_post_id_returns_null_after_report_was_deleted(): void {
+		$jid = $this->make_site_job();
+		AuditReport::get_or_create_for_site_job( $jid );
+
+		AuditReport::delete_for_site_job( $jid );
+
+		$this->assertNull(
+			AuditReport::get_report_post_id_for_site_job( $jid ),
+			'A deleted report must never resolve to a stale/wrong post ID.'
+		);
+	}
+
+	public function test_get_report_post_id_swallows_an_internal_failure_and_never_throws(): void {
+		// Found during code review: every other public AuditReport method has a dedicated test
+		// forcing its internal try/catch, but this one (added alongside it in the same unit)
+		// didn't. switch_to_blog() itself is what this method calls before delegating to
+		// find_report_post_id() — forcing it to throw exercises this method's own failure
+		// containment specifically, not find_report_post_id()'s.
+		$jid = $this->make_site_job();
+		AuditReport::get_or_create_for_site_job( $jid );
+
+		$log_file = tempnam( sys_get_temp_dir(), 'hbm_audit_test_log' );
+		$prev_log = ini_set( 'error_log', $log_file );
+
+		$thrower = static function () {
+			throw new \RuntimeException( 'forced switch_to_blog failure for get_report_post_id_for_site_job() containment test' );
+		};
+		add_filter( 'switch_blog', $thrower );
+
+		try {
+			$result = AuditReport::get_report_post_id_for_site_job( $jid );
+		} finally {
+			remove_filter( 'switch_blog', $thrower );
+			ini_set( 'error_log', $prev_log );
+		}
+
+		$this->assertNull( $result, 'An internal failure must resolve to null, matching this method\'s documented "null on failure or absence" contract.' );
+
+		$log_contents = file_get_contents( $log_file );
+		unlink( $log_file );
+		$this->assertStringContainsString(
+			'forced switch_to_blog failure',
+			$log_contents,
+			'The failure must be observable via the logged message even though it never propagated to the caller.'
+		);
+	}
+
+	// -------------------------------------------------------------------------
 	// record_for_migration(): staging + copy-on-first-creation
 	// -------------------------------------------------------------------------
 
@@ -218,6 +288,120 @@ class Test_Audit_Report extends WP_UnitTestCase {
 
 		$this->assertCount( 1, $rows_2, 'Staged migration-level entry must be copied into every sibling site job report, not just the first.' );
 		$this->assertSame( 'migration', $rows_2[0]['scope'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// record_batch_for_migration(): R7 (docs/plans/2026-07-29-001-fix-audit-report-hardening-
+	// plan.md, "U5. UserImporter batched staged writes") — batched sibling of
+	// record_for_migration(), one get_site_option()/update_site_option() round-trip for a whole
+	// batch of entries. UserImporter's own end-to-end batching behavior is covered by
+	// tests/test-user-importer.php; these tests target record_batch_for_migration() directly.
+	// -------------------------------------------------------------------------
+
+	public function test_record_batch_for_migration_stores_same_shape_as_record_for_migration(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'a.example.com', 'https://93.184.216.34', '', '/a/' );
+
+		AuditReport::record_batch_for_migration( $mid, 'migration', [
+			[ 'type' => 'write', 'object_type' => 'user', 'source_id' => 1, 'outcome' => 'created' ],
+			[ 'type' => 'write', 'object_type' => 'user', 'source_id' => 2, 'outcome' => 'merged' ],
+		] );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+
+		$this->assertCount( 2, $rows, 'Both batched entries must be copied into the report, matching record_for_migration()\'s one-entry-per-call shape.' );
+		$this->assertSame( 'migration', $rows[0]['scope'] );
+		$this->assertSame( 1, $rows[0]['source_id'] );
+		$this->assertSame( 'migration', $rows[1]['scope'] );
+		$this->assertSame( 2, $rows[1]['source_id'] );
+	}
+
+	public function test_record_batch_for_migration_appends_to_entries_already_staged_individually(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'a.example.com', 'https://93.184.216.34', '', '/a/' );
+
+		AuditReport::record_for_migration( $mid, 'migration', [ 'type' => 'write', 'source_id' => 100 ] );
+		AuditReport::record_batch_for_migration( $mid, 'migration', [
+			[ 'type' => 'write', 'source_id' => 101 ],
+			[ 'type' => 'write', 'source_id' => 102 ],
+		] );
+
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		switch_to_blog( get_main_site_id() );
+		$rows = get_post_meta( $post_id, '_hbm_audit_write', false );
+		restore_current_blog();
+
+		$source_ids = array_map( static fn( $row ) => $row['source_id'], $rows );
+		$this->assertSame( [ 100, 101, 102 ], $source_ids, 'A batched call must append to (not overwrite) entries already staged individually via record_for_migration().' );
+	}
+
+	public function test_record_batch_for_migration_with_empty_entries_is_a_safe_noop(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$jid = MigrationRegistry::create_site_job( $mid, 1, 'a.example.com', 'https://93.184.216.34', '', '/a/' );
+
+		AuditReport::record_batch_for_migration( $mid, 'migration', [] );
+
+		$this->assertSame( 0, self::count_report_posts_for_site_job( $jid ) );
+		$this->assertNull( AuditReport::get_report_post_id_for_site_job( $jid ) );
+	}
+
+	public function test_record_batch_for_migration_produces_exactly_one_update_site_option_call(): void {
+		$mid        = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+		$option_key = 'hbm_audit_staged_' . $mid;
+
+		$calls = 0;
+		$spy   = function ( $value, $old_value, $option ) use ( $option_key, &$calls ) {
+			if ( $option === $option_key ) {
+				$calls++;
+			}
+			return $value;
+		};
+		add_filter( 'pre_update_site_option_' . $option_key, $spy, 10, 3 );
+
+		try {
+			AuditReport::record_batch_for_migration( $mid, 'migration', [
+				[ 'type' => 'write', 'source_id' => 1 ],
+				[ 'type' => 'write', 'source_id' => 2 ],
+				[ 'type' => 'write', 'source_id' => 3 ],
+			] );
+		} finally {
+			remove_filter( 'pre_update_site_option_' . $option_key, $spy, 10 );
+		}
+
+		$this->assertSame( 1, $calls, 'A whole batch of entries must produce exactly one update_site_option() round-trip, not one per entry.' );
+	}
+
+	public function test_record_batch_for_migration_swallows_an_internal_failure_and_never_throws(): void {
+		$mid = MigrationRegistry::create_migration( 'https://93.184.216.34', 'key', null );
+
+		$log_file  = tempnam( sys_get_temp_dir(), 'hbm_audit_test_log' );
+		$prev_log  = ini_set( 'error_log', $log_file );
+		$exception_message = 'forced failure for record_batch_for_migration containment test';
+
+		$option_key = 'hbm_audit_staged_' . $mid;
+		$thrower    = static function () use ( $exception_message ) {
+			throw new \RuntimeException( $exception_message );
+		};
+		add_filter( 'pre_update_site_option_' . $option_key, $thrower );
+
+		try {
+			AuditReport::record_batch_for_migration( $mid, 'migration', [ [ 'type' => 'write', 'source_id' => 1 ] ] );
+		} finally {
+			remove_filter( 'pre_update_site_option_' . $option_key, $thrower );
+			ini_set( 'error_log', $prev_log );
+		}
+
+		$log_contents = file_get_contents( $log_file );
+		unlink( $log_file );
+
+		$this->assertStringContainsString(
+			$exception_message,
+			$log_contents,
+			'The failure must be observable via the logged message even though it never propagated to the caller.'
+		);
 	}
 
 	// -------------------------------------------------------------------------
@@ -321,6 +505,48 @@ class Test_Audit_Report extends WP_UnitTestCase {
 			$log_contents,
 			'The failure must be observable via the logged message even though it never propagated to the caller.'
 		);
+	}
+
+	// -------------------------------------------------------------------------
+	// write_meta_row(): U2 hardening (docs/plans/2026-07-29-001-fix-audit-report-hardening-
+	// plan.md, "U2. Shared write-trail contract", R3) — the shared postmeta-write helper
+	// append_entry() is now a thin wrapper around, and AuditComparator::store_result() also
+	// calls directly. Exercised here on its own meta key (distinct from the audit trail's own
+	// keys) so this test targets the extracted mechanics themselves, not append_entry()'s
+	// request-vs-write key-selection logic (already covered above).
+	// -------------------------------------------------------------------------
+
+	public function test_write_meta_row_appends_a_distinct_row_each_call_not_an_overwrite(): void {
+		$jid     = $this->make_site_job();
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			AuditReport::write_meta_row( $post_id, '_hbm_audit_test_meta_key', [ 'n' => 1 ] );
+			AuditReport::write_meta_row( $post_id, '_hbm_audit_test_meta_key', [ 'n' => 2 ] );
+			$rows = get_post_meta( $post_id, '_hbm_audit_test_meta_key', false );
+		} finally {
+			restore_current_blog();
+		}
+
+		$this->assertCount( 2, $rows, 'write_meta_row() must add a new row each call (add_post_meta(..., false)), never overwrite an existing one.' );
+		$this->assertSame( [ 1, 2 ], array_map( static fn( $row ) => $row['n'], $rows ) );
+	}
+
+	public function test_write_meta_row_preserves_backslashes_in_data(): void {
+		$jid     = $this->make_site_job();
+		$post_id = AuditReport::get_or_create_for_site_job( $jid );
+		$raw     = 'C:\Windows\Path and a \' quote';
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			AuditReport::write_meta_row( $post_id, '_hbm_audit_test_meta_key', [ 'value' => $raw ] );
+			$rows = get_post_meta( $post_id, '_hbm_audit_test_meta_key', false );
+		} finally {
+			restore_current_blog();
+		}
+
+		$this->assertSame( $raw, $rows[0]['value'], 'write_meta_row() must wp_slash() its data so backslashes survive the postmeta round-trip, matching append_entry()\'s existing guarantee.' );
 	}
 
 	// -------------------------------------------------------------------------

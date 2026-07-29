@@ -130,12 +130,15 @@ class AuditComparator {
 			return null;
 		}
 
-		// Built once per compare_batch() call, not cached across calls — an accepted tradeoff
-		// (see final report): re-reads every _hbm_audit_write row for this report post on every
-		// call, which is the cost of not introducing any new cross-call persistence beyond this
-		// unit's own scope. Computed exactly once here (found during code review — this used to
-		// be loaded a second time inside load_driving_post_map() with identical arguments) and
-		// passed to both load_driving_post_map() and the per-item loop below.
+		// U4 (R6, docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U4. Comparator
+		// trail-read caching"): load_latest_write_entries() itself now transient-caches this read
+		// per site_job_id+object_type across the whole self-chained comparison run — this call
+		// only actually re-reads _hbm_audit_write postmeta on the FIRST compare_batch_inner() call
+		// for this site job; every later checkpoint hits the cache instead (see that method's own
+		// docblock). Called exactly once per compare_batch_inner() invocation (found during code
+		// review — this used to be loaded a second time inside load_driving_post_map() with
+		// identical arguments) and passed to both load_driving_post_map() and the per-item loop
+		// below.
 		$write_entries = self::load_latest_write_entries( $site_job_id, 'post' );
 
 		$driving_map = self::load_driving_post_map( $site_job_id, $write_entries );
@@ -253,6 +256,13 @@ class AuditComparator {
 			];
 		}
 
+		// R2 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared
+		// write-trail contract"): a single point of truth for the field defaults this method
+		// applies to the "expected" (source-derived) side of a comparison — see
+		// normalize_write_entry()'s own docblock. Read-time only: no producer call site changes,
+		// no change to what gets stored in postmeta.
+		$entry = self::normalize_write_entry( $entry );
+
 		$outcome = (string) ( $entry['outcome'] ?? '' );
 		// Gate on $dest_id, not the latest entry's outcome alone: a resumed/retried batch can
 		// record a 'failed' entry for a source_id that already landed on an EARLIER successful
@@ -272,20 +282,24 @@ class AuditComparator {
 			];
 		}
 
-		// Expected (normalized) side — pure computation, no destination read yet.
-		$expected_content   = SearchReplace::safe_replace( (string) ( $entry['post_content'] ?? '' ), $replacements );
-		$expected_excerpt   = SearchReplace::safe_replace( (string) ( $entry['post_excerpt'] ?? '' ), $replacements );
-		$expected_title     = (string) ( $entry['post_title'] ?? '' );
-		$expected_slug      = (string) ( $entry['post_name'] ?? '' );
+		// Expected (normalized) side — pure computation, no destination read yet. Every field
+		// below except 'meta' was already defaulted by normalize_write_entry() above.
+		$expected_content   = SearchReplace::safe_replace( $entry['post_content'], $replacements );
+		$expected_excerpt   = SearchReplace::safe_replace( $entry['post_excerpt'], $replacements );
+		$expected_title     = $entry['post_title'];
+		$expected_slug      = $entry['post_name'];
 		// $entry['meta'] is intentionally NOT cast to array here — normalize_expected_meta()'s
 		// `array $meta` type hint is the deliberate guard that turns a malformed cached entry
 		// (e.g. 'meta' corrupted to a non-array) into a real \Throwable (TypeError), which
 		// compare_batch()'s outer try/catch is exactly built to contain (see that method's own
-		// docblock and this unit's "forced internal failure" test scenario).
+		// docblock and this unit's "forced internal failure" test scenario). normalize_write_
+		// entry() deliberately leaves 'meta' untouched (see that method's docblock) so this
+		// ?? [] default (for an entirely absent key) and the type-hint guard below behave
+		// identically to before this refactor.
 		$expected_meta_list    = self::normalize_expected_meta( $entry['meta'] ?? [], $replacements, $attachment_map );
 		$expected_content_hash = self::hash_content( (string) $expected_content, (string) $expected_excerpt );
 		$expected_meta_hash    = self::hash_meta_list( $expected_meta_list );
-		$source_author_email  = (string) ( $entry['source_author'] ?? '' );
+		$source_author_email  = $entry['source_author'];
 
 		switch_to_blog( (int) $job->dest_blog_id );
 		try {
@@ -311,19 +325,16 @@ class AuditComparator {
 			$actual_meta_hash = self::hash_meta_list( self::to_actual_meta_list( $rows ) );
 
 			// Authorship: re-derive the SAME resolution PostImporter::import_batch() itself
-			// performs at write time (get_user_by('email', ...), fallback to user ID 1) rather
-			// than a literal identity comparison. This correctly treats a user_conflict_policy:
-			// merge resolution to a pre-existing destination user as a match — the resolution
-			// is a pure function of the same inputs (source email + destination's current user
-			// table), so re-running it here reproduces exactly what import_batch() decided,
-			// without needing any new stored state (see plan grounding + final report).
-			$expected_author_id = 1;
-			if ( '' !== $source_author_email ) {
-				$user = get_user_by( 'email', $source_author_email );
-				if ( $user ) {
-					$expected_author_id = (int) $user->ID;
-				}
-			}
+			// performs at write time — R4, see PostImporter::resolve_author_id()'s own
+			// docblock — rather than a literal identity comparison. This correctly treats a
+			// user_conflict_policy: merge resolution to a pre-existing destination user as a
+			// match — the resolution is a pure function of the same inputs (source email +
+			// destination's current user table), so re-running it here reproduces exactly what
+			// import_batch() decided, without needing any new stored state (see plan grounding +
+			// final report). Already switched to $job->dest_blog_id above, satisfying
+			// resolve_author_id()'s "caller must already be switched to the destination blog"
+			// contract.
+			$expected_author_id = PostImporter::resolve_author_id( $source_author_email );
 		} finally {
 			restore_current_blog();
 		}
@@ -381,21 +392,14 @@ class AuditComparator {
 			return;
 		}
 
+		// R3 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared
+		// write-trail contract"): shares AuditReport::append_entry()'s exact wp_slash()/
+		// add_post_meta()/clean_post_cache() sequence via write_meta_row() rather than
+		// duplicating that mechanics here — see that method's docblock for the full rationale
+		// (backslash preservation, cache-invalidation-suspension caller safety).
 		switch_to_blog( get_main_site_id() );
 		try {
-			// add_metadata() (wp-includes/meta.php, called by add_post_meta()) unconditionally
-			// wp_unslash()'s $meta_value before storing, silently stripping any backslash a
-			// source-derived field (expected_title/expected_slug, etc.) might legitimately
-			// contain — wp_slash() here cancels that out, mirroring the identical fix in
-			// AuditReport::append_entry().
-			add_post_meta( $post_id, self::META_RESULT, wp_slash( $result ), false );
-			// Same rationale as AuditReport::append_entry(): a caller mid-loop (PostImporter's
-			// own import_batch()) may have set wp_suspend_cache_invalidation( true ) earlier in
-			// the same request — though by the time the comparator runs (after SearchReplace::
-			// finalize()) that flag has long been restored, clean_post_cache() here costs
-			// nothing and keeps this method consistent with the rest of the audit layer's
-			// caching discipline.
-			clean_post_cache( $post_id );
+			AuditReport::write_meta_row( $post_id, self::META_RESULT, $result );
 		} finally {
 			restore_current_blog();
 		}
@@ -475,11 +479,11 @@ class AuditComparator {
 
 			if ( null !== $checkpoint ) {
 				// Time budget exhausted mid-batch — dispatch a continuation from the checkpoint.
-				as_enqueue_async_action(
-					'hbm_audit_compare',
-					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
-					'hb-migrator'
-				);
+				// R8 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U6.
+				// AuditComparator self-chain: bounded retry for continuation enqueue"): the enqueue
+				// call itself gets a small bounded retry rather than being called directly here —
+				// see enqueue_continuation_with_retry()'s own docblock for why.
+				self::enqueue_continuation_with_retry( $site_job_id, $checkpoint );
 				return;
 			}
 
@@ -498,6 +502,12 @@ class AuditComparator {
 			$counts       = self::compute_counts( $site_job_id );
 			$post_results = self::get_post_comparison_results( $site_job_id );
 			AuditReport::render_summary( $site_job_id, $counts, $post_results );
+
+			// U4 (R6): this comparison run is now fully finished (no further compare_batch()
+			// checkpoint will ever run for this site job) — explicitly invalidate every
+			// object_type's cached write-trail read rather than relying solely on the
+			// WRITE_CACHE_TTL backstop (see clear_write_cache()'s own docblock).
+			self::clear_write_cache( $site_job_id );
 		} catch ( \Throwable $e ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			error_log( 'HB Migrator: AuditComparator::process() failed for site job ' . $site_job_id . ' at last_pk ' . $last_pk . ': ' . $e->getMessage() );
@@ -641,17 +651,61 @@ class AuditComparator {
 	}
 
 	/**
+	 * How long the U4 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U4.
+	 * Comparator trail-read caching") write-trail transient cache is allowed to live as a
+	 * defensive backstop. Not the primary invalidation mechanism — that's the explicit
+	 * clear_write_cache() call in process()'s success path — comfortably longer than any
+	 * realistic self-chained comparison run, so it only matters if that explicit cleanup is
+	 * somehow skipped (e.g. the process crashes between the last render and the cleanup call).
+	 * Filterable (see write_cache_ttl()) — found during code review: every sibling constant in
+	 * this class (TIME_LIMIT, BATCH_SIZE, CONTINUATION_ENQUEUE_ATTEMPTS/RETRY_DELAY) already
+	 * follows this filterable-constant convention; this one hadn't.
+	 */
+	private const WRITE_CACHE_TTL = HOUR_IN_SECONDS;
+
+	private static function write_cache_ttl(): int {
+		return max( 0, (int) apply_filters( 'hbm_audit_compare_write_cache_ttl', self::WRITE_CACHE_TTL ) );
+	}
+
+	/**
 	 * Loads every _hbm_audit_write entry for $site_job_id (via AuditReport's U6 read-access
 	 * addition — see that class), filters to $object_type, and keeps only the LATEST entry per
 	 * source_id (rows are already in ascending meta_id/insertion order — see
 	 * AuditReport::get_write_entries_for_site_job()'s docblock — so a later foreach iteration
 	 * simply overwrites an earlier one for the same key). This is the single mechanism this
 	 * class uses to resolve "a resumed/retried batch produced more than one trail entry for the
-	 * same source_id" for posts, attachments, and terms alike — built once per compare_batch()/
-	 * compute_counts() call, never cached across calls (see those methods' own docblocks for why
-	 * that's an accepted tradeoff).
+	 * same source_id" for posts, attachments, and terms alike.
+	 *
+	 * U4 (R6): this is called with 'post' once per compare_batch_inner() call (the per-checkpoint
+	 * driver, which repeats up to once per BATCH_SIZE-sized chunk of a large migration) and with
+	 * 'attachment'/'term' once each from compute_object_type_counts() (only reached once total per
+	 * comparison run, after the last checkpoint). Reloading the full trail from postmeta on every
+	 * one of those calls is the O(N^2/batch) cost this cache removes: the result is now cached in
+	 * a WP transient keyed by BOTH $site_job_id AND $object_type (never by $site_job_id alone —
+	 * that would incorrectly serve compute_object_type_counts()'s 'attachment'/'term' calls the
+	 * 'post'-filtered result compare_batch_inner() cached earlier in the same run, a correctness
+	 * bug, not just a missed optimization). Safe specifically because post write-trail entries are
+	 * immutable once comparison starts (compare_batch()/process() only ever run after
+	 * SearchReplace::finalize(), by which point every import stage has already completed and no
+	 * new write-trail entries will ever be recorded for this site job again — see class docblock
+	 * and this file's accompanying plan) — the cache only needs to survive one comparison run.
+	 * Populated on first read per object_type per run; explicitly cleared by clear_write_cache()
+	 * once process() finishes rendering the final summary; a WRITE_CACHE_TTL backstop covers the
+	 * case where that explicit cleanup is somehow never reached.
 	 */
 	private static function load_latest_write_entries( int $site_job_id, string $object_type ): array {
+		$cache_key = self::write_cache_key( $site_job_id, $object_type );
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			$cached = get_transient( $cache_key );
+		} finally {
+			restore_current_blog();
+		}
+		if ( is_array( $cached ) ) {
+			return $cached;
+		}
+
 		$rows   = AuditReport::get_write_entries_for_site_job( $site_job_id );
 		$latest = [];
 		foreach ( $rows as $row ) {
@@ -664,7 +718,69 @@ class AuditComparator {
 			}
 			$latest[ $source_id ] = $row;
 		}
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			set_transient( $cache_key, $latest, self::write_cache_ttl() );
+		} finally {
+			restore_current_blog();
+		}
+
 		return $latest;
+	}
+
+	/**
+	 * The transient key U4's cache uses for one site job's one object_type — see
+	 * load_latest_write_entries()'s docblock for why BOTH components are required.
+	 */
+	private static function write_cache_key( int $site_job_id, string $object_type ): string {
+		return 'hbm_audit_write_cache_' . $site_job_id . '_' . $object_type;
+	}
+
+	/**
+	 * U4's explicit, primary cache invalidation (docs/plans/2026-07-29-001-fix-audit-report-
+	 * hardening-plan.md, "U4. Comparator trail-read caching"): deletes every object_type's cached
+	 * write-trail entry for a site job. Called by process() once it finishes rendering the final
+	 * summary (the success path) — the only three object_types this class ever caches are 'post',
+	 * 'attachment', and 'term' (see load_latest_write_entries()'s call sites), so those are the
+	 * only keys that need explicit deletion; a WRITE_CACHE_TTL backstop covers anything this
+	 * explicit call doesn't reach (e.g. process() crashing between the render and this call).
+	 */
+	private static function clear_write_cache( int $site_job_id ): void {
+		switch_to_blog( get_main_site_id() );
+		try {
+			foreach ( [ 'post', 'attachment', 'term' ] as $object_type ) {
+				delete_transient( self::write_cache_key( $site_job_id, $object_type ) );
+			}
+		} finally {
+			restore_current_blog();
+		}
+	}
+
+	/**
+	 * R2 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U2. Shared write-trail
+	 * contract: entry normalization and author resolution"): a single, read-time point of truth
+	 * for the field defaults compare_post() applies to a raw cached write-trail entry's
+	 * "expected" (source-derived) side — previously scattered across ~10 separate `?? ''`/`?? 0`
+	 * inline call sites. Deliberately a read-time normalizer, not a write-time contract: none of
+	 * the 8 existing producer call sites (PostImporter::record_write_trail() and this file's own
+	 * test helpers) change, and neither does what gets stored in postmeta — see this class's own
+	 * "Key Technical Decisions" reference in the accompanying plan.
+	 *
+	 * `meta` is deliberately left untouched here — no default, no type coercion. Defaulting or
+	 * casting it here would defeat normalize_expected_meta()'s own `array $meta` type-hint
+	 * contract, which is the deliberate trigger for this class's "malformed cached entry"
+	 * failure-containment test (see that method's docblock). Callers still apply their own
+	 * `$entry['meta'] ?? []` default for an entirely absent key, exactly as before this
+	 * extraction.
+	 */
+	private static function normalize_write_entry( array $entry ): array {
+		$entry['post_content']  = (string) ( $entry['post_content'] ?? '' );
+		$entry['post_excerpt']  = (string) ( $entry['post_excerpt'] ?? '' );
+		$entry['post_title']    = (string) ( $entry['post_title'] ?? '' );
+		$entry['post_name']     = (string) ( $entry['post_name'] ?? '' );
+		$entry['source_author'] = (string) ( $entry['source_author'] ?? '' );
+		return $entry;
 	}
 
 	/**
@@ -764,5 +880,105 @@ class AuditComparator {
 	 */
 	private static function batch_size(): int {
 		return max( 1, (int) apply_filters( 'hbm_audit_compare_batch_size', self::BATCH_SIZE ) );
+	}
+
+	/**
+	 * R8 (docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md, "U6. AuditComparator
+	 * self-chain: bounded retry for continuation enqueue"): how many times
+	 * enqueue_continuation_with_retry() will attempt the `hbm_audit_compare` continuation
+	 * enqueue call before giving up. Filterable for the same testability reason as
+	 * time_limit()/batch_size() above.
+	 */
+	private const CONTINUATION_ENQUEUE_ATTEMPTS = 3;
+
+	/**
+	 * Seconds (fractional) enqueue_continuation_with_retry() sleeps between a failed attempt and
+	 * the next one. Deliberately short, small, and non-exponential — this is NOT
+	 * PipelineController::handle_batch_failure()'s minute-scale exponential backoff (that
+	 * mechanism's persisted-retry-count-via-re-enqueued-args and status-flipping-on-exhaustion
+	 * shape is exactly what this retry must NOT reuse — see this method's own docblock and the
+	 * plan's Key Technical Decisions for R8). A short pause — not zero — because this runs inside
+	 * a background job with no user waiting (so the pause costs nothing observable) and because a
+	 * transient DB/Action-Scheduler write error realistically needs a brief moment to clear, not a
+	 * sub-millisecond re-attempt that hits the same failure for the same reason. Filterable so
+	 * tests can force this to near-zero and stay fast.
+	 */
+	private const CONTINUATION_ENQUEUE_RETRY_DELAY = 0.5;
+
+	private static function continuation_enqueue_attempts(): int {
+		return max( 1, (int) apply_filters( 'hbm_audit_compare_continuation_enqueue_attempts', self::CONTINUATION_ENQUEUE_ATTEMPTS ) );
+	}
+
+	private static function continuation_enqueue_retry_delay(): float {
+		return max( 0.0, (float) apply_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay', self::CONTINUATION_ENQUEUE_RETRY_DELAY ) );
+	}
+
+	/**
+	 * R8: wraps process()'s self-chain continuation `hbm_audit_compare` enqueue call in a small
+	 * bounded-retry loop, entirely local to this single process() invocation — no persisted
+	 * retry-count state, no new parameter on process()'s own signature, no change to
+	 * Plugin::register_action_hooks()'s action registration. A transient Action Scheduler/DB
+	 * write error is exactly the kind of failure a few retries with a short pause between them can
+	 * ride out (see CONTINUATION_ENQUEUE_RETRY_DELAY's own docblock for why the pause is short but
+	 * non-zero).
+	 *
+	 * On any attempt succeeding: returns normally, action enqueued, no different from calling
+	 * as_enqueue_async_action() directly. On every attempt failing: logs via error_log() (matching
+	 * this class's universal swallow-and-log discipline — see class docblock) and returns
+	 * normally — no exception ever propagates out of this method, and `hbm_site_jobs.status` is
+	 * never touched either way. Deliberately does NOT call
+	 * PipelineController::handle_batch_failure() — that helper unconditionally flips `status` to
+	 * `'failed'` on retry exhaustion when given a site_job_id, which would violate the audit
+	 * layer's non-negotiable rule that its own failures must never regress an already-`complete`
+	 * site job (see plan's R8 Key Technical Decision).
+	 *
+	 * Cannot detect "the action was enqueued but Action Scheduler never claimed/ran it" — an
+	 * accepted, pre-existing limitation this inherits from SearchReplace's own self-chain (see
+	 * plan Risks), not addressed here.
+	 */
+	private static function enqueue_continuation_with_retry( int $site_job_id, int $checkpoint ): void {
+		$attempts = self::continuation_enqueue_attempts();
+		$delay    = self::continuation_enqueue_retry_delay();
+
+		for ( $attempt = 1; $attempt <= $attempts; $attempt++ ) {
+			$failure_reason = null;
+
+			try {
+				$action_id = as_enqueue_async_action(
+					'hbm_audit_compare',
+					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
+					'hb-migrator'
+				);
+
+				// Found during code review: ActionScheduler_ActionFactory::create() (the code
+				// as_enqueue_async_action() calls into) already wraps its own DB-save call in a
+				// try/catch and returns 0 on failure WITHOUT rethrowing — the exact "transient
+				// DB/Action-Scheduler write error" this retry loop exists to ride out never
+				// actually reaches this method as a \Throwable. Treating a 0 return the same as
+				// a caught exception is what makes this loop's retry actually fire for its real
+				// target failure mode, instead of silently treating a failed enqueue as success.
+				if ( $action_id > 0 ) {
+					return;
+				}
+
+				$failure_reason = 'as_enqueue_async_action() returned 0 (no exception thrown)';
+			} catch ( \Throwable $e ) {
+				$failure_reason = $e->getMessage();
+			}
+
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditComparator continuation enqueue attempt ' . $attempt . '/' . $attempts . ' failed for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ': ' . $failure_reason );
+
+			if ( $attempt < $attempts && $delay > 0.0 ) {
+				usleep( (int) round( $delay * 1000000 ) );
+			}
+		}
+
+		// Every attempt failed — swallow and log, exactly like every other method in this class
+		// (see class docblock). Never rethrow, never touch hbm_site_jobs.status: process()'s own
+		// outer try/catch would otherwise feed PipelineController::handle_batch_failure(), which
+		// is precisely the cascade this retry exists to avoid.
+		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+		error_log( 'HB Migrator: AuditComparator failed to enqueue hbm_audit_compare continuation for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ' after ' . $attempts . ' attempts — giving up without altering hbm_site_jobs.status.' );
 	}
 }
