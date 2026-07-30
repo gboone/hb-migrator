@@ -319,7 +319,20 @@ class MediaImporter {
 					update_post_meta( $dest_att_id, '_hbm_source_attachment_id', $source_att_id );
 				}
 
+				// WordPress core's "big image" auto-scaling (5.3+, big_image_size_threshold,
+				// default 2560px) would otherwise silently rename the file to
+				// "{name}-scaled.{ext}" whenever either dimension exceeds the threshold — fine
+				// for a normal upload with nothing else referencing the file yet, but a real
+				// problem for a migrated attachment: source content (post_content, other
+				// postmeta) may already reference this exact file by its original name, and a
+				// silent rename breaks that reference on the destination even though the
+				// migration otherwise succeeded. Migrated media should keep the exact filename
+				// (and dimensions) it had on the source, not get reprocessed under the
+				// destination's own upload policy. Disabled only for the duration of this call —
+				// never affects any other attachment metadata generation on the destination.
+				add_filter( 'big_image_size_threshold', '__return_false' );
 				$meta = wp_generate_attachment_metadata( $dest_att_id, $sideload['file'] );
+				remove_filter( 'big_image_size_threshold', '__return_false' );
 				if ( empty( $meta ) ) {
 					wp_delete_attachment( $dest_att_id, true );
 					if ( $source_att_id ) {
