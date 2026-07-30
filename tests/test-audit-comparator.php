@@ -105,9 +105,9 @@ class Test_AuditComparator extends WP_UnitTestCase {
 		], $overrides ) );
 	}
 
-	private function record_attachment_entry( int $source_id, string $outcome, ?int $jid = null ): void {
+	private function record_attachment_entry( int $source_id, string $outcome, array $overrides = [], ?int $jid = null ): void {
 		$jid = $jid ?? $this->jid;
-		AuditReport::record( $jid, 'site_job', [
+		AuditReport::record( $jid, 'site_job', array_merge( [
 			'type'           => 'write',
 			'object_type'    => 'attachment',
 			'source_id'      => $source_id,
@@ -118,7 +118,22 @@ class Test_AuditComparator extends WP_UnitTestCase {
 			'caption'        => '',
 			'alt_text'       => '',
 			'post_mime_type' => '',
-		] );
+		], $overrides ) );
+	}
+
+	private function create_dest_attachment_with( array $overrides = [] ): int {
+		return (int) wp_insert_post( array_merge( [
+			'post_type'      => 'attachment',
+			'post_status'    => 'inherit',
+			'post_title'     => 'Attachment',
+			'post_mime_type' => 'image/jpeg',
+		], $overrides ) );
+	}
+
+	private function get_attachment_result( int $source_id, ?int $jid = null ): array {
+		$results = AuditComparator::get_attachment_comparison_results( $jid ?? $this->jid );
+		$this->assertArrayHasKey( $source_id, $results, "No attachment comparison result recorded for source_id {$source_id}." );
+		return $results[ $source_id ];
 	}
 
 	private function record_term_entry( int $source_id, string $outcome, ?int $dest_id = null, ?int $jid = null ): void {
@@ -705,10 +720,10 @@ class Test_AuditComparator extends WP_UnitTestCase {
 
 		AuditComparator::process( $this->jid, 0 );
 
-		$content        = $this->get_report_content();
-		$flagged_start  = strpos( $content, '=== Flagged Posts ===' );
-		$detail_start   = strpos( $content, '=== Full Detail ===' );
-		$flagged_section = substr( $content, $flagged_start, $detail_start - $flagged_start );
+		$content         = $this->get_report_content();
+		$flagged_start   = strpos( $content, '=== Flagged Posts ===' );
+		$media_start     = strpos( $content, '=== Flagged Media ===' );
+		$flagged_section = substr( $content, $flagged_start, $media_start - $flagged_start );
 
 		$this->assertStringContainsString( "source_id={$sid_title}", $flagged_section );
 		$this->assertStringContainsString( 'diverged_fields=[title]', $flagged_section );
@@ -1505,5 +1520,321 @@ class Test_AuditComparator extends WP_UnitTestCase {
 
 		$job = MigrationRegistry::get_site_job( $this->jid );
 		$this->assertSame( 'complete', $job->status, 'finalize() must still complete the site job even though its own audit-compare enqueue failed.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Per-attachment comparison (compare_media_batch()/compare_attachment()) and its own
+	// self-chained rendering path (process_media()) — added so migrated media gets the same
+	// itemized report detail posts already had (previously attachments only ever appeared as an
+	// aggregate count — see docs/plans/2026-07-29-001-fix-audit-report-hardening-plan.md's
+	// follow-up finding on this gap).
+	// -------------------------------------------------------------------------
+
+	public function test_compare_media_batch_matches_when_everything_aligns(): void {
+		$source_id = 5001;
+		$dest_id   = $this->create_dest_attachment_with( [
+			'post_title'   => 'Clean Photo',
+			'post_content' => 'A description.',
+			'post_excerpt' => 'A caption.',
+		] );
+		update_post_meta( $dest_id, '_wp_attachment_image_alt', 'Alt text' );
+		IdMap::set( $this->jid, 'attachment', $source_id, $dest_id );
+		$this->record_attachment_entry( $source_id, 'created', [
+			'post_title'  => 'Clean Photo',
+			'description' => 'A description.',
+			'caption'     => 'A caption.',
+			'alt_text'    => 'Alt text',
+			'file_url'    => $this->source_siteurl . '/wp-content/uploads/photo.jpg',
+		] );
+
+		$checkpoint = AuditComparator::compare_media_batch( $this->jid, 0 );
+		$this->assertNull( $checkpoint );
+
+		$result = $this->get_attachment_result( $source_id );
+		$this->assertTrue( $result['comparable'] );
+		$this->assertFalse( $result['diverged'] );
+		$this->assertTrue( $result['title_match'] );
+		$this->assertTrue( $result['content_hash_match'] );
+		$this->assertTrue( $result['alt_text_match'] );
+	}
+
+	public function test_compare_media_batch_flags_title_and_alt_text_mismatch(): void {
+		$source_id = 5002;
+		$dest_id   = $this->create_dest_attachment_with( [ 'post_title' => 'Dest Title' ] );
+		update_post_meta( $dest_id, '_wp_attachment_image_alt', 'Dest Alt' );
+		IdMap::set( $this->jid, 'attachment', $source_id, $dest_id );
+		$this->record_attachment_entry( $source_id, 'created', [
+			'post_title' => 'Source Title',
+			'alt_text'   => 'Source Alt',
+		] );
+
+		AuditComparator::compare_media_batch( $this->jid, 0 );
+		$result = $this->get_attachment_result( $source_id );
+
+		$this->assertTrue( $result['diverged'] );
+		$this->assertContains( 'title', $result['diverged_fields'] );
+		$this->assertContains( 'alt_text', $result['diverged_fields'] );
+	}
+
+	public function test_compare_media_batch_flags_destination_attachment_missing(): void {
+		$source_id = 5003;
+		IdMap::set( $this->jid, 'attachment', $source_id, 9999999 ); // No such destination post.
+		$this->record_attachment_entry( $source_id, 'created', [ 'post_title' => 'Ghost' ] );
+
+		AuditComparator::compare_media_batch( $this->jid, 0 );
+		$result = $this->get_attachment_result( $source_id );
+
+		$this->assertFalse( $result['comparable'] );
+		$this->assertTrue( $result['diverged'] );
+		$this->assertSame( 'destination_attachment_missing', $result['reason'] );
+	}
+
+	public function test_failed_attachment_write_is_surfaced_as_not_comparable(): void {
+		$source_id = 5004;
+		$this->record_attachment_entry( $source_id, 'failed' ); // No IdMap entry — never landed.
+
+		AuditComparator::compare_media_batch( $this->jid, 0 );
+		$result = $this->get_attachment_result( $source_id );
+
+		$this->assertFalse( $result['comparable'] );
+		$this->assertFalse( $result['diverged'], 'A source-side write failure with nothing to compare must not itself be flagged as drift.' );
+		$this->assertSame( 'source_write_failed', $result['reason'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// Found during code review: MediaImporter::import_batch() falls back to the sanitized
+	// source filename (derived from file_url) when the source post_title is empty — a common
+	// real case (media is frequently never manually titled). Without re-deriving that same
+	// fallback, this comparator would compare an empty expected title against the destination's
+	// non-empty filename-derived title and always flag it as diverged, even on a perfectly
+	// correct migration.
+	// -------------------------------------------------------------------------
+
+	public function test_compare_media_batch_reproduces_media_importer_title_fallback_for_empty_source_title(): void {
+		$source_id = 5006;
+		// sanitize_file_name() does not strip the extension — matches MediaImporter's own
+		// fallback exactly (sanitize_file_name( $file_array['name'] ), never a basename-only or
+		// extension-stripped variant).
+		$dest_id = $this->create_dest_attachment_with( [ 'post_title' => 'Photo.jpg' ] );
+		IdMap::set( $this->jid, 'attachment', $source_id, $dest_id );
+		$this->record_attachment_entry( $source_id, 'created', [
+			'post_title' => '',
+			'file_url'   => $this->source_siteurl . '/wp-content/uploads/2020/04/Photo.jpg',
+		] );
+
+		AuditComparator::compare_media_batch( $this->jid, 0 );
+		$result = $this->get_attachment_result( $source_id );
+
+		$this->assertSame( 'Photo.jpg', $result['expected_title'], 'An empty source title must fall back to the sanitized filename, matching MediaImporter::import_batch()\'s own fallback exactly.' );
+		$this->assertTrue( $result['title_match'] );
+		$this->assertFalse( $result['diverged'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// Edge cases mirroring compare_post()'s own coverage: no cached write entry at all, and a
+	// dest_id that resolves to a real post of the WRONG post_type (not just no post at all).
+	// -------------------------------------------------------------------------
+
+	public function test_compare_media_batch_surfaces_missing_cached_entry_as_not_comparable(): void {
+		$source_id = 5007;
+		$dest_id   = $this->create_dest_attachment_with();
+		IdMap::set( $this->jid, 'attachment', $source_id, $dest_id );
+		// Deliberately no record_attachment_entry() call — IdMap landed but no write-trail
+		// entry was ever recorded, an audit-layer gap distinct from a pipeline failure.
+
+		AuditComparator::compare_media_batch( $this->jid, 0 );
+		$result = $this->get_attachment_result( $source_id );
+
+		$this->assertFalse( $result['comparable'] );
+		$this->assertFalse( $result['diverged'] );
+		$this->assertSame( 'no_cached_write_entry', $result['reason'] );
+	}
+
+	public function test_compare_media_batch_flags_dest_id_that_resolves_to_wrong_post_type(): void {
+		$source_id = 5008;
+		$dest_id   = $this->create_dest_post( [ 'post_title' => 'Not An Attachment' ] );
+		IdMap::set( $this->jid, 'attachment', $source_id, $dest_id );
+		$this->record_attachment_entry( $source_id, 'created', [ 'post_title' => 'Not An Attachment' ] );
+
+		AuditComparator::compare_media_batch( $this->jid, 0 );
+		$result = $this->get_attachment_result( $source_id );
+
+		$this->assertFalse( $result['comparable'], 'A dest_id resolving to a real post of the wrong post_type must not be treated as a valid comparison target.' );
+		$this->assertTrue( $result['diverged'] );
+		$this->assertSame( 'destination_attachment_missing', $result['reason'] );
+	}
+
+	// -------------------------------------------------------------------------
+	// Critical, non-obvious behavior mirroring test_forced_render_failure_does_not_throw_and_
+	// does_not_alter_site_job_status: a forced internal failure during the media stage's own
+	// compare/render step must not throw and must not alter the site job's status.
+	// -------------------------------------------------------------------------
+
+	public function test_forced_media_compare_failure_does_not_throw_and_does_not_alter_site_job_status(): void {
+		$source_id = 5009;
+		$dest_id   = $this->create_dest_attachment_with( [ 'post_title' => 'Fine' ] );
+		IdMap::set( $this->jid, 'attachment', $source_id, $dest_id );
+		$this->record_attachment_entry( $source_id, 'created', [ 'post_title' => 'Fine' ] );
+
+		add_filter( 'switch_blog', function () {
+			throw new \RuntimeException( 'Simulated failure inside compare_media_batch().' );
+		} );
+
+		try {
+			// The forced RuntimeException must never propagate out of process_media().
+			AuditComparator::process_media( $this->jid, 0 );
+		} finally {
+			remove_all_filters( 'switch_blog' );
+		}
+
+		$job = MigrationRegistry::get_site_job( $this->jid );
+		$this->assertSame( 'complete', $job->status, 'A forced internal failure in the media stage must never alter the site job\'s own status column.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Found during code review: enqueue_continuation_with_retry() was generalized to take a
+	// $hook parameter so the media self-chain reuses it, but none of the existing retry/
+	// exhaustion tests target the 'hbm_audit_compare_media' hook specifically — only code
+	// symmetry with the posts-hook tests implied it worked. This proves the media hook's own
+	// retry-then-succeed path independently.
+	// -------------------------------------------------------------------------
+
+	public function test_media_continuation_enqueue_retries_and_succeeds_for_the_media_hook(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+		add_filter( 'hbm_audit_compare_continuation_enqueue_retry_delay', static fn() => 0.0 );
+
+		$ids = [ 5301, 5302 ];
+		foreach ( $ids as $sid ) {
+			$dest_id = $this->create_dest_attachment_with( [ 'post_title' => "Retry {$sid}" ] );
+			IdMap::set( $this->jid, 'attachment', $sid, $dest_id );
+			$this->record_attachment_entry( $sid, 'created', [ 'post_title' => "Retry {$sid}" ] );
+		}
+
+		$attempts = 0;
+		add_filter( 'pre_as_enqueue_async_action', function ( $pre, $hook ) use ( &$attempts ) {
+			if ( 'hbm_audit_compare_media' !== $hook ) {
+				return $pre;
+			}
+			++$attempts;
+			if ( $attempts < 2 ) {
+				throw new \RuntimeException( 'Simulated Action Scheduler enqueue failure #' . $attempts );
+			}
+			return $pre;
+		}, 10, 2 );
+
+		try {
+			AuditComparator::process_media( $this->jid, 0 );
+		} finally {
+			remove_all_filters( 'pre_as_enqueue_async_action' );
+			remove_all_filters( 'hbm_audit_compare_batch_size' );
+			remove_all_filters( 'hbm_audit_compare_time_limit' );
+			remove_all_filters( 'hbm_audit_compare_continuation_enqueue_retry_delay' );
+		}
+
+		$this->assertSame( 2, $attempts, 'The first attempt must fail and the second must succeed before giving up.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare_media',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => $ids[0] ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'The media continuation must ultimately be enqueued exactly once, once the second attempt succeeds.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// Integration: process() hands off to the media stage only when there is attachment
+	// write-trail work to compare; a site job with none renders directly, same as before this
+	// addition (every pre-existing render test in this file relies on exactly this path).
+	// -------------------------------------------------------------------------
+
+	public function test_process_renders_directly_when_no_attachment_write_trail_exists(): void {
+		$source_id = 5101;
+		$dest_id   = $this->create_dest_post( [ 'post_title' => 'Solo', 'post_name' => 'media-solo' ] );
+		IdMap::set( $this->jid, 'post', $source_id, $dest_id );
+		$this->record_post_entry( $source_id, 'created', [ 'post_title' => 'Solo', 'post_name' => 'media-solo' ] );
+
+		AuditComparator::process( $this->jid, 0 );
+
+		$content = $this->get_report_content();
+		$this->assertStringContainsString( '=== Counts ===', $content, 'No attachment write-trail work must still render the final summary directly from process().' );
+		$this->assertStringContainsString( '=== Media Detail ===', $content );
+		$this->assertStringContainsString( '(no media compared)', $content );
+	}
+
+	public function test_process_hands_off_to_media_stage_when_attachment_write_trail_exists(): void {
+		$source_id = 5102;
+		$dest_id   = $this->create_dest_attachment_with( [ 'post_title' => 'Handoff Photo' ] );
+		IdMap::set( $this->jid, 'attachment', $source_id, $dest_id );
+		$this->record_attachment_entry( $source_id, 'created', [ 'post_title' => 'Handoff Photo' ] );
+
+		// The posts stage alone must not render — media comparison hasn't run yet.
+		AuditComparator::process( $this->jid, 0 );
+		$this->assertSame( '', $this->get_report_content(), 'process() must hand off to the media stage instead of rendering when attachment write-trail work exists.' );
+
+		$scheduled = as_get_scheduled_actions( [
+			'hook'     => 'hbm_audit_compare_media',
+			'args'     => [ 'site_job_id' => $this->jid, 'last_pk' => 0 ],
+			'status'   => \ActionScheduler_Store::STATUS_PENDING,
+			'per_page' => 5,
+		] );
+		$this->assertCount( 1, $scheduled, 'process() must enqueue exactly one hbm_audit_compare_media continuation.' );
+
+		// Running the media stage to completion must now render the final summary, including
+		// the media sections, in the documented order.
+		AuditComparator::process_media( $this->jid, 0 );
+
+		$content          = $this->get_report_content();
+		$flagged_media_pos = strpos( $content, '=== Flagged Media ===' );
+		$full_detail_pos   = strpos( $content, '=== Full Detail ===' );
+		$media_detail_pos  = strpos( $content, '=== Media Detail ===' );
+
+		$this->assertNotFalse( $flagged_media_pos );
+		$this->assertNotFalse( $media_detail_pos );
+		$this->assertLessThan( $full_detail_pos, $flagged_media_pos, 'Flagged Media must render after Flagged Posts but before Full Detail (R6 order).' );
+		$this->assertLessThan( $media_detail_pos, $full_detail_pos, 'Media Detail must render last, after Full Detail.' );
+		$this->assertStringContainsString( "source_id={$source_id}", substr( $content, $media_detail_pos ) );
+
+		$results = AuditComparator::get_attachment_comparison_results( $this->jid );
+		$this->assertArrayHasKey( $source_id, $results );
+	}
+
+	// -------------------------------------------------------------------------
+	// The media stage's own checkpointing must behave exactly like the post stage's: a batch
+	// that exceeds the time budget self-enqueues a continuation rather than rendering, and the
+	// final render happens only once, on the call that finds nothing left to compare.
+	// -------------------------------------------------------------------------
+
+	public function test_media_multibatch_process_renders_final_summary_only_once(): void {
+		add_filter( 'hbm_audit_compare_batch_size', static fn() => 1 );
+		add_filter( 'hbm_audit_compare_time_limit', static fn() => -1.0 );
+
+		$ids = [ 5201, 5202 ];
+		foreach ( $ids as $sid ) {
+			$dest_id = $this->create_dest_attachment_with( [ 'post_title' => "Media {$sid}" ] );
+			IdMap::set( $this->jid, 'attachment', $sid, $dest_id );
+			$this->record_attachment_entry( $sid, 'created', [ 'post_title' => "Media {$sid}" ] );
+		}
+
+		AuditComparator::process( $this->jid, 0 ); // Hands off to the media stage.
+		$this->assertSame( '', $this->get_report_content() );
+
+		AuditComparator::process_media( $this->jid, 0 );
+		$this->assertSame( '', $this->get_report_content(), 'post_content must remain unset after a non-final media batch.' );
+
+		// compare_media_batch_inner()'s own time-budget check runs unconditionally after every
+		// processed batch — even the one that processes the last remaining item — so, just like
+		// this file's own test_multibatch_process_renders_final_summary_only_once for posts, an
+		// N-item run takes N+1 calls before remaining_ids is genuinely empty and it renders.
+		AuditComparator::process_media( $this->jid, $ids[0] );
+		$this->assertSame( '', $this->get_report_content(), 'post_content must remain unset after the batch that processed the last item, since compare_media_batch() still returned a non-null checkpoint.' );
+
+		AuditComparator::process_media( $this->jid, $ids[1] );
+		$content = $this->get_report_content();
+		$this->assertStringContainsString( '=== Counts ===', $content, 'Final summary must be rendered exactly once, after the last media batch.' );
+
+		remove_all_filters( 'hbm_audit_compare_batch_size' );
+		remove_all_filters( 'hbm_audit_compare_time_limit' );
 	}
 }

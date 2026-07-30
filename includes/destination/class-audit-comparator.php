@@ -67,6 +67,14 @@ class AuditComparator {
 	private const META_RESULT = '_hbm_audit_compare_result';
 
 	/**
+	 * Same storage convention as META_RESULT, but for compare_media_batch()'s per-attachment
+	 * results — a separate key so reading either result set back (get_post_comparison_results()/
+	 * get_attachment_comparison_results()) never has to filter the other object type out of the
+	 * same postmeta rows.
+	 */
+	private const META_ATTACHMENT_RESULT = '_hbm_audit_compare_attachment_result';
+
+	/**
 	 * WordPress core itself writes these two postmeta keys as a side effect of wp_insert_post()
 	 * on any newly-published post with ping_status 'open' (see _publish_post_hook() in
 	 * wp-includes/post.php) — not something the migration pipeline controls, and not reliably
@@ -84,7 +92,7 @@ class AuditComparator {
 	/**
 	 * Compares every post the initial migration landed for this site job (per IdMap's
 	 * authoritative source_id => dest_id map, plus any permanently-failed source_ids the write
-	 * trail recorded — see load_driving_post_map()) against the destination's current actual
+	 * trail recorded — see load_driving_map()) against the destination's current actual
 	 * row, hashing content/postmeta after re-applying the same URL-rewrite and `_thumbnail_id`
 	 * remap SearchReplace itself already used. Bounded to TIME_LIMIT seconds per call; resumes
 	 * from $last_pk (a source_id keyset cursor) on the next call.
@@ -136,12 +144,12 @@ class AuditComparator {
 		// only actually re-reads _hbm_audit_write postmeta on the FIRST compare_batch_inner() call
 		// for this site job; every later checkpoint hits the cache instead (see that method's own
 		// docblock). Called exactly once per compare_batch_inner() invocation (found during code
-		// review — this used to be loaded a second time inside load_driving_post_map() with
-		// identical arguments) and passed to both load_driving_post_map() and the per-item loop
+		// review — this used to be loaded a second time inside load_driving_map() with
+		// identical arguments) and passed to both load_driving_map() and the per-item loop
 		// below.
 		$write_entries = self::load_latest_write_entries( $site_job_id, 'post' );
 
-		$driving_map = self::load_driving_post_map( $site_job_id, $write_entries );
+		$driving_map = self::load_driving_map( $site_job_id, 'post', $write_entries );
 		if ( empty( $driving_map ) ) {
 			return null;
 		}
@@ -187,6 +195,88 @@ class AuditComparator {
 	}
 
 	/**
+	 * The attachment counterpart to compare_batch() — same bounded/checkpointed/resumable
+	 * contract, same failure-containment (never throws, never returns $last_pk on internal
+	 * failure), scanning the 'attachment' write trail + IdMap instead of 'post'. See
+	 * process()/process_media() for why this needed its own pass rather than being folded into
+	 * compute_counts()'s existing aggregate-only attachment counting: per-item comparison here
+	 * does a switch_to_blog()+get_post()+hash per attachment, the same per-item cost that made
+	 * compare_batch() itself need checkpointing.
+	 *
+	 * @param int $site_job_id
+	 * @param int $last_pk      Resume cursor — only source_ids greater than this are considered.
+	 * @return int|null  null = every attachment already IdMap-landed for this job has been
+	 *                    compared (or there was nothing to compare, or an internal failure
+	 *                    occurred); int = last source_id processed, budget exceeded mid-pass.
+	 */
+	public static function compare_media_batch( int $site_job_id, int $last_pk ): ?int {
+		try {
+			return self::compare_media_batch_inner( $site_job_id, $last_pk );
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditComparator::compare_media_batch() failed for site job ' . $site_job_id . ' at last_pk ' . $last_pk . ': ' . $e->getMessage() );
+			return null;
+		}
+	}
+
+	private static function compare_media_batch_inner( int $site_job_id, int $last_pk ): ?int {
+		$job = MigrationRegistry::get_site_job( $site_job_id );
+		if ( ! $job || ! $job->dest_blog_id ) {
+			return null;
+		}
+
+		// Same race guards as compare_batch_inner() — see that method's docblock.
+		if ( 'complete' !== $job->status ) {
+			return null;
+		}
+
+		$write_entries = self::load_latest_write_entries( $site_job_id, 'attachment' );
+
+		$driving_map = self::load_driving_map( $site_job_id, 'attachment', $write_entries );
+		if ( empty( $driving_map ) ) {
+			return null;
+		}
+
+		$remaining_ids = array_values( array_filter(
+			array_keys( $driving_map ),
+			static fn( $sid ) => $sid > $last_pk
+		) );
+		if ( empty( $remaining_ids ) ) {
+			return null;
+		}
+
+		$replacements = self::build_replacements( $job );
+
+		$started        = microtime( true );
+		$time_limit     = self::time_limit();
+		$batch_size     = self::batch_size();
+		$last_processed = $last_pk;
+		$cursor         = 0;
+		$total          = count( $remaining_ids );
+
+		while ( $cursor < $total ) {
+			$batch_ids = array_slice( $remaining_ids, $cursor, $batch_size );
+			$cursor   += count( $batch_ids );
+
+			foreach ( $batch_ids as $source_id ) {
+				$dest_id = $driving_map[ $source_id ];
+				$entry   = $write_entries[ $source_id ] ?? null;
+
+				$result = self::compare_attachment( $job, $source_id, $dest_id, $entry, $replacements );
+				self::store_attachment_result( $site_job_id, $result );
+
+				$last_processed = $source_id;
+			}
+
+			if ( ( microtime( true ) - $started ) > $time_limit ) {
+				return $last_processed; // Budget exceeded — checkpoint here.
+			}
+		}
+
+		return null; // Every id in the driving map has now been compared.
+	}
+
+	/**
 	 * The keyset-paginated "table" compare_batch() scans, sorted ascending for a stable cursor.
 	 * IdMap::get_all_for_job() is the authoritative, deduplicated "what actually landed" list
 	 * (a source_id only appears here once it has a real destination row — see plan's IdMap
@@ -208,13 +298,17 @@ class AuditComparator {
 	 * land" purely from the latest outcome string once a real dest_id is in hand (found during
 	 * code review — see that method's $dest_id <= 0 gate).
 	 *
-	 * @param array $write_entries Pre-loaded via load_latest_write_entries($site_job_id, 'post')
-	 *                             — passed in rather than reloaded here (found during code
-	 *                             review: this method used to re-fetch the exact same data
-	 *                             compare_batch_inner() had already loaded moments earlier).
+	 * @param string $object_type   'post' (compare_batch_inner()) or 'attachment'
+	 *                              (compare_media_batch_inner()) — the only two object types
+	 *                              this class runs a per-item (not just aggregate-count)
+	 *                              comparison for.
+	 * @param array  $write_entries Pre-loaded via load_latest_write_entries($site_job_id,
+	 *                              $object_type) — passed in rather than reloaded here (found
+	 *                              during code review: this method used to re-fetch the exact
+	 *                              same data its caller had already loaded moments earlier).
 	 */
-	private static function load_driving_post_map( int $site_job_id, array $write_entries ): array {
-		$landed = IdMap::get_all_for_job( $site_job_id, 'post' );
+	private static function load_driving_map( int $site_job_id, string $object_type, array $write_entries ): array {
+		$landed = IdMap::get_all_for_job( $site_job_id, $object_type );
 
 		$failed = [];
 		foreach ( $write_entries as $source_id => $entry ) {
@@ -268,7 +362,7 @@ class AuditComparator {
 		// record a 'failed' entry for a source_id that already landed on an EARLIER successful
 		// attempt (PostImporter::import_batch()'s update branch records 'failed' on a
 		// wp_update_post() failure without ever clearing that item's IdMap entry from its prior
-		// successful insert). load_driving_post_map() already resolves the correct non-zero
+		// successful insert). load_driving_map() already resolves the correct non-zero
 		// $dest_id for this case from IdMap — trusting the latest entry's outcome instead would
 		// mischaracterize a genuinely-landed post as "not comparable", hiding real drift on
 		// exactly the posts most likely to have it (found during code review).
@@ -381,6 +475,138 @@ class AuditComparator {
 	}
 
 	/**
+	 * Compares one attachment: source_id's cached write-trail entry (recorded by
+	 * MediaImporter::record_write_trail() — file_url/post_title/description/caption/alt_text)
+	 * against dest_id's current actual destination row. Deliberately narrower than
+	 * compare_post(): binary file bytes aren't hashed (the write trail never cached them), and
+	 * there's no full postmeta-hash comparison — only the one field the migration itself sets
+	 * (`_wp_attachment_image_alt`).
+	 *
+	 * Does NOT independently re-verify the destination attachment's own URL/guid against the
+	 * source's — considered and deliberately dropped (code review): `_wp_attached_file` (what
+	 * wp_get_attachment_url() actually derives from) is set directly by
+	 * MediaImporter::import_batch() via wp_insert_attachment()/wp_generate_attachment_metadata()
+	 * under its own switch_to_blog( dest_blog_id ), entirely independent of SearchReplace's
+	 * string-replacement passes — so it is already structurally guaranteed correct and a check
+	 * against it would never catch a real SearchReplace regression, only risk a false positive
+	 * on a domain-preserving migration whose source/destination blog IDs happen to share a
+	 * numeric prefix (e.g. source blog 3 into destination blog 30). Like compare_post(), this
+	 * method's content/excerpt comparison instead re-applies the exact same
+	 * SearchReplace::safe_replace() call the real migration used — this catches drift from
+	 * anything ELSE touching the destination row after migration, but (also like compare_post())
+	 * cannot catch a bug in safe_replace() itself, since the "expected" side would inherit the
+	 * identical bug. That class of regression needs its own dedicated test coverage in
+	 * SearchReplace's own test suite (see test-search-replace.php), not an audit-time check here.
+	 *
+	 * @param object     $job          The site job row (MigrationRegistry::get_site_job()).
+	 * @param int        $source_id
+	 * @param int        $dest_id      0 if this source_id never landed (failed import).
+	 * @param array|null $entry        The latest cached _hbm_audit_write entry for this
+	 *                                 source_id, or null if none was ever recorded.
+	 * @param array      $replacements SearchReplace-equivalent URL replacement map.
+	 */
+	private static function compare_attachment( object $job, int $source_id, int $dest_id, ?array $entry, array $replacements ): array {
+		$base = [ 'source_id' => $source_id, 'dest_id' => $dest_id ];
+
+		if ( null === $entry ) {
+			return $base + [
+				'comparable' => false,
+				'diverged'   => false,
+				'reason'     => 'no_cached_write_entry',
+			];
+		}
+
+		$entry = self::normalize_attachment_write_entry( $entry );
+
+		$outcome = (string) ( $entry['outcome'] ?? '' );
+		// Same $dest_id gate as compare_post() — see that method's docblock for why the latest
+		// entry's outcome alone isn't trusted (a retried batch can record a later 'failed' entry
+		// for a source_id that already landed on an earlier successful attempt).
+		if ( 'failed' === $outcome && $dest_id <= 0 ) {
+			return $base + [
+				'comparable' => false,
+				'diverged'   => false,
+				'reason'     => 'source_write_failed',
+			];
+		}
+
+		// MediaImporter::import_batch() falls back to the sanitized source filename when the
+		// source post_title is empty ('post_title' => $att['post_title'] ?: sanitize_file_name(
+		// $file_array['name'] ), where $file_array['name'] is basename() of file_url's path — see
+		// class-media-importer.php) — re-derived here identically (found during code review: an
+		// attachment with no source title, a common case, was otherwise always flagged as a
+		// 'title' divergence purely because this comparator compared the empty source title
+		// literally instead of the same fallback the migration itself applies).
+		$expected_title = $entry['post_title'];
+		if ( '' === $expected_title ) {
+			$expected_title = sanitize_file_name( basename( (string) wp_parse_url( $entry['file_url'], PHP_URL_PATH ) ) );
+		}
+		$expected_alt_text     = $entry['alt_text'];
+		$expected_content      = SearchReplace::safe_replace( $entry['description'], $replacements );
+		$expected_excerpt      = SearchReplace::safe_replace( $entry['caption'], $replacements );
+		$expected_content_hash = self::hash_content( (string) $expected_content, (string) $expected_excerpt );
+
+		switch_to_blog( (int) $job->dest_blog_id );
+		try {
+			$post = get_post( $dest_id );
+			if ( ! $post || 'attachment' !== $post->post_type ) {
+				return $base + [
+					'comparable' => false,
+					'diverged'   => true,
+					'reason'     => 'destination_attachment_missing',
+				];
+			}
+
+			$actual_title        = (string) $post->post_title;
+			$actual_content_hash = self::hash_content( (string) $post->post_content, (string) $post->post_excerpt );
+			$actual_alt_text     = (string) get_post_meta( $dest_id, '_wp_attachment_image_alt', true );
+		} finally {
+			restore_current_blog();
+		}
+
+		$title_match    = $expected_title === $actual_title;
+		$content_match  = $expected_content_hash === $actual_content_hash;
+		$alt_text_match = $expected_alt_text === $actual_alt_text;
+
+		$diverged_fields = [];
+		if ( ! $title_match ) {
+			$diverged_fields[] = 'title';
+		}
+		if ( ! $content_match ) {
+			$diverged_fields[] = 'content_hash';
+		}
+		if ( ! $alt_text_match ) {
+			$diverged_fields[] = 'alt_text';
+		}
+
+		return $base + [
+			'comparable'         => true,
+			'diverged'           => ! empty( $diverged_fields ),
+			'diverged_fields'    => $diverged_fields,
+			'title_match'        => $title_match,
+			'expected_title'     => $expected_title,
+			'actual_title'       => $actual_title,
+			'content_hash_match' => $content_match,
+			'alt_text_match'     => $alt_text_match,
+			'expected_alt_text'  => $expected_alt_text,
+			'actual_alt_text'    => $actual_alt_text,
+		];
+	}
+
+	/**
+	 * Read-time field defaulting for a cached attachment write-trail entry's "expected" side —
+	 * the attachment counterpart to normalize_write_entry(). Mirrors MediaImporter::
+	 * record_write_trail()'s exact field set.
+	 */
+	private static function normalize_attachment_write_entry( array $entry ): array {
+		$entry['post_title']  = (string) ( $entry['post_title'] ?? '' );
+		$entry['description'] = (string) ( $entry['description'] ?? '' );
+		$entry['caption']     = (string) ( $entry['caption'] ?? '' );
+		$entry['alt_text']    = (string) ( $entry['alt_text'] ?? '' );
+		return $entry;
+	}
+
+	/**
 	 * Persists one post's comparison result onto the report post, in AuditReport's own
 	 * primary-site-switching convention (see that class's record()) — but as this unit's own
 	 * storage (META_RESULT), not routed through AuditReport, since this is the comparator's own
@@ -442,6 +668,56 @@ class AuditComparator {
 	}
 
 	/**
+	 * The attachment counterpart to store_result() — same mechanics, META_ATTACHMENT_RESULT key.
+	 */
+	private static function store_attachment_result( int $site_job_id, array $result ): void {
+		$post_id = AuditReport::get_or_create_for_site_job( $site_job_id );
+		if ( ! $post_id ) {
+			return;
+		}
+
+		switch_to_blog( get_main_site_id() );
+		try {
+			AuditReport::write_meta_row( $post_id, self::META_ATTACHMENT_RESULT, $result );
+		} finally {
+			restore_current_blog();
+		}
+	}
+
+	/**
+	 * The attachment counterpart to get_post_comparison_results() — same mechanics,
+	 * META_ATTACHMENT_RESULT key.
+	 */
+	public static function get_attachment_comparison_results( int $site_job_id ): array {
+		try {
+			$post_id = AuditReport::get_or_create_for_site_job( $site_job_id );
+			if ( ! $post_id ) {
+				return [];
+			}
+
+			switch_to_blog( get_main_site_id() );
+			try {
+				$rows = get_post_meta( $post_id, self::META_ATTACHMENT_RESULT, false ) ?: [];
+			} finally {
+				restore_current_blog();
+			}
+
+			$latest = [];
+			foreach ( $rows as $row ) {
+				if ( ! is_array( $row ) || ! isset( $row['source_id'] ) ) {
+					continue;
+				}
+				$latest[ (int) $row['source_id'] ] = $row;
+			}
+			return $latest;
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditComparator::get_attachment_comparison_results() failed for site job ' . $site_job_id . ': ' . $e->getMessage() );
+			return [];
+		}
+	}
+
+	/**
 	 * U7: the self-chaining entry point the `hbm_audit_compare` Action Scheduler action calls
 	 * directly (registered in Plugin::register_action_hooks() — see class-plugin.php).
 	 * SearchReplace::finalize() enqueues this action once, immediately after a site job flips to
@@ -453,11 +729,14 @@ class AuditComparator {
 	 * picks up where this one left off. Once compare_batch() returns null (every cached post
 	 * compared, or nothing to compare, or an internal failure inside compare_batch() already
 	 * logged and swallowed there — this method's perspective can't distinguish those cases, which
-	 * is fine, that's compare_batch()'s own documented contract), this method computes the
-	 * media/taxonomy/taxonomy-term counts and the per-post comparison results, then renders the
-	 * final summary into the report post via AuditReport::render_summary() — exactly once, after
-	 * the LAST batch, never after an intermediate one (a self-enqueue above always `return`s
-	 * before reaching this step).
+	 * is fine, that's compare_batch()'s own documented contract), posts are done for this site job.
+	 *
+	 * Attachments get their own bounded, checkpointed comparison pass (compare_media_batch(),
+	 * self-chained via a separate `hbm_audit_compare_media` action/process_media()) for exactly
+	 * the same reason posts needed one — per-item switch_to_blog()+get_post() cost that an
+	 * unbounded loop over a large media library could overrun TIME_LIMIT on. That hop is only
+	 * taken when there is actual attachment write-trail work to compare; a site job with no media
+	 * renders the final summary directly here, same as before this addition.
 	 *
 	 * Wraps its ENTIRE body in try/catch (\Throwable), matching every other method in this class
 	 * (see class docblock): this is now the thing an Action Scheduler action calls directly, so an
@@ -483,7 +762,7 @@ class AuditComparator {
 				// AuditComparator self-chain: bounded retry for continuation enqueue"): the enqueue
 				// call itself gets a small bounded retry rather than being called directly here —
 				// see enqueue_continuation_with_retry()'s own docblock for why.
-				self::enqueue_continuation_with_retry( $site_job_id, $checkpoint );
+				self::enqueue_continuation_with_retry( 'hbm_audit_compare', $site_job_id, $checkpoint );
 				return;
 			}
 
@@ -496,22 +775,78 @@ class AuditComparator {
 				return;
 			}
 
-			// Every cached post has now been compared (or compare_batch() already swallowed an
-			// internal failure) — render the final summary exactly once, now that no further
-			// batches will run for this site job.
-			$counts       = self::compute_counts( $site_job_id );
-			$post_results = self::get_post_comparison_results( $site_job_id );
-			AuditReport::render_summary( $site_job_id, $counts, $post_results );
+			// This check's correctness relies on media import having fully completed (and
+			// therefore every attachment write-trail entry already recorded) by the time
+			// `hbm_audit_compare` first runs — true today only because SearchReplace::finalize()
+			// enqueues this hook after the full pipeline (terms -> posts -> media -> options ->
+			// search_replace) reaches `complete` (see class-search-replace.php). Found during
+			// code review: this is an implicit cross-file invariant, not something asserted here
+			// — a future change to stage sequencing (e.g. running media import concurrently with
+			// another stage) could silently make this check see an empty write trail for a site
+			// job that actually has media still in flight, skipping the media comparison stage
+			// entirely rather than merely delaying it.
+			if ( ! empty( self::load_latest_write_entries( $site_job_id, 'attachment' ) ) ) {
+				self::enqueue_continuation_with_retry( 'hbm_audit_compare_media', $site_job_id, 0 );
+				return;
+			}
 
-			// U4 (R6): this comparison run is now fully finished (no further compare_batch()
-			// checkpoint will ever run for this site job) — explicitly invalidate every
-			// object_type's cached write-trail read rather than relying solely on the
-			// WRITE_CACHE_TTL backstop (see clear_write_cache()'s own docblock).
-			self::clear_write_cache( $site_job_id );
+			self::render_final_summary( $site_job_id );
 		} catch ( \Throwable $e ) {
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			error_log( 'HB Migrator: AuditComparator::process() failed for site job ' . $site_job_id . ' at last_pk ' . $last_pk . ': ' . $e->getMessage() );
 		}
+	}
+
+	/**
+	 * The media-comparison counterpart to process() — self-chaining entry point for the
+	 * `hbm_audit_compare_media` Action Scheduler action, only ever reached from process() once
+	 * posts are fully compared AND there is attachment write-trail work to compare (see that
+	 * method). Same contract as process(): calls compare_media_batch() once; a non-null
+	 * checkpoint self-enqueues a continuation and returns, a null checkpoint means every
+	 * attachment has been compared and this is the call that renders the final summary.
+	 *
+	 * @param int $site_job_id
+	 * @param int $last_pk  Resume cursor, forwarded to compare_media_batch() as-is.
+	 */
+	public static function process_media( int $site_job_id, int $last_pk = 0 ): void {
+		try {
+			$checkpoint = self::compare_media_batch( $site_job_id, $last_pk );
+
+			if ( null !== $checkpoint ) {
+				self::enqueue_continuation_with_retry( 'hbm_audit_compare_media', $site_job_id, $checkpoint );
+				return;
+			}
+
+			$job = MigrationRegistry::get_site_job( $site_job_id );
+			if ( ! $job || 'complete' !== $job->status ) {
+				return;
+			}
+
+			self::render_final_summary( $site_job_id );
+		} catch ( \Throwable $e ) {
+			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
+			error_log( 'HB Migrator: AuditComparator::process_media() failed for site job ' . $site_job_id . ' at last_pk ' . $last_pk . ': ' . $e->getMessage() );
+		}
+	}
+
+	/**
+	 * Shared by process() (no attachment work to compare) and process_media() (attachment
+	 * comparison just finished) — the actual "no further batches will ever run for this site job"
+	 * render step, extracted so both entry points render exactly once, in exactly the same way.
+	 */
+	private static function render_final_summary( int $site_job_id ): void {
+		// Every cached post (and, if any exist, attachment) has now been compared — render the
+		// final summary exactly once, now that no further batches will run for this site job.
+		$counts             = self::compute_counts( $site_job_id );
+		$post_results       = self::get_post_comparison_results( $site_job_id );
+		$attachment_results = self::get_attachment_comparison_results( $site_job_id );
+		AuditReport::render_summary( $site_job_id, $counts, $post_results, $attachment_results );
+
+		// U4 (R6): this comparison run is now fully finished (no further compare_batch()/
+		// compare_media_batch() checkpoint will ever run for this site job) — explicitly
+		// invalidate every object_type's cached write-trail read rather than relying solely on
+		// the WRITE_CACHE_TTL backstop (see clear_write_cache()'s own docblock).
+		self::clear_write_cache( $site_job_id );
 	}
 
 	/**
@@ -565,7 +900,7 @@ class AuditComparator {
 	/**
 	 * Shared by compute_counts_inner() for both 'attachment' and 'term' — attempted/landed/
 	 * failed tallies come from the write trail (deduped to each source_id's LATEST entry, same
-	 * convention as load_driving_post_map()/compare_post() — a retried batch's duplicate entries
+	 * convention as load_driving_map()/compare_post() — a retried batch's duplicate entries
 	 * must not double-count); 'id_map_count' is IdMap's own authoritative landed count (should
 	 * agree with 'landed' in the normal case, kept separate as a cross-check since they are
 	 * derived from two independently-written tables); 'destination_actual' is a fresh count of
@@ -914,13 +1249,16 @@ class AuditComparator {
 	}
 
 	/**
-	 * R8: wraps process()'s self-chain continuation `hbm_audit_compare` enqueue call in a small
-	 * bounded-retry loop, entirely local to this single process() invocation — no persisted
-	 * retry-count state, no new parameter on process()'s own signature, no change to
-	 * Plugin::register_action_hooks()'s action registration. A transient Action Scheduler/DB
-	 * write error is exactly the kind of failure a few retries with a short pause between them can
-	 * ride out (see CONTINUATION_ENQUEUE_RETRY_DELAY's own docblock for why the pause is short but
-	 * non-zero).
+	 * R8: wraps process()'s (and process_media()'s) self-chain continuation enqueue call in a
+	 * small bounded-retry loop, entirely local to a single process()/process_media() invocation —
+	 * no persisted retry-count state, no new parameter on either method's own signature. A
+	 * transient Action Scheduler/DB write error is exactly the kind of failure a few retries with
+	 * a short pause between them can ride out (see CONTINUATION_ENQUEUE_RETRY_DELAY's own
+	 * docblock for why the pause is short but non-zero).
+	 *
+	 * Parameterized by $hook rather than hardcoding 'hbm_audit_compare' so process_media()'s
+	 * `hbm_audit_compare_media` self-chain (see that method) reuses the exact same retry
+	 * mechanics instead of a second, near-duplicate implementation.
 	 *
 	 * On any attempt succeeding: returns normally, action enqueued, no different from calling
 	 * as_enqueue_async_action() directly. On every attempt failing: logs via error_log() (matching
@@ -936,7 +1274,7 @@ class AuditComparator {
 	 * accepted, pre-existing limitation this inherits from SearchReplace's own self-chain (see
 	 * plan Risks), not addressed here.
 	 */
-	private static function enqueue_continuation_with_retry( int $site_job_id, int $checkpoint ): void {
+	private static function enqueue_continuation_with_retry( string $hook, int $site_job_id, int $checkpoint ): void {
 		$attempts = self::continuation_enqueue_attempts();
 		$delay    = self::continuation_enqueue_retry_delay();
 
@@ -945,7 +1283,7 @@ class AuditComparator {
 
 			try {
 				$action_id = as_enqueue_async_action(
-					'hbm_audit_compare',
+					$hook,
 					[ 'site_job_id' => $site_job_id, 'last_pk' => $checkpoint ],
 					'hb-migrator'
 				);
@@ -967,7 +1305,7 @@ class AuditComparator {
 			}
 
 			// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-			error_log( 'HB Migrator: AuditComparator continuation enqueue attempt ' . $attempt . '/' . $attempts . ' failed for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ': ' . $failure_reason );
+			error_log( 'HB Migrator: AuditComparator ' . $hook . ' continuation enqueue attempt ' . $attempt . '/' . $attempts . ' failed for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ': ' . $failure_reason );
 
 			if ( $attempt < $attempts && $delay > 0.0 ) {
 				usleep( (int) round( $delay * 1000000 ) );
@@ -979,6 +1317,6 @@ class AuditComparator {
 		// outer try/catch would otherwise feed PipelineController::handle_batch_failure(), which
 		// is precisely the cascade this retry exists to avoid.
 		// phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
-		error_log( 'HB Migrator: AuditComparator failed to enqueue hbm_audit_compare continuation for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ' after ' . $attempts . ' attempts — giving up without altering hbm_site_jobs.status.' );
+		error_log( 'HB Migrator: AuditComparator failed to enqueue ' . $hook . ' continuation for site job ' . $site_job_id . ' at checkpoint ' . $checkpoint . ' after ' . $attempts . ' attempts — giving up without altering hbm_site_jobs.status.' );
 	}
 }

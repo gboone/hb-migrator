@@ -397,11 +397,14 @@ class AuditReport {
 
 	/**
 	 * U7: renders AuditComparator's computed comparison results (compute_counts()'s aggregate
-	 * counts and get_post_comparison_results()'s per-post detail) into the report post's
+	 * counts, get_post_comparison_results()'s per-post detail, and
+	 * get_attachment_comparison_results()'s per-attachment detail) into the report post's
 	 * post_content, in the order R6 requires: high-level counts first, then every flagged
-	 * (diverged) post, then full per-post detail. Called exactly once, by
-	 * AuditComparator::process(), after the LAST self-chained `hbm_audit_compare` batch completes
-	 * — never after an intermediate batch (see that method's own docblock).
+	 * (diverged) post, then every flagged (diverged) media item, then full per-post detail, then
+	 * full per-attachment detail. Called exactly once, by AuditComparator::render_final_summary()
+	 * — from process() directly when there's no attachment work to compare, or from
+	 * process_media() once the LAST self-chained `hbm_audit_compare_media` batch completes —
+	 * never after an intermediate batch (see those methods' own docblocks).
 	 *
 	 * Gets (creating if necessary — unlikely this is the first write for a site job at this point
 	 * in the pipeline, but keeps this method's contract consistent with every other AuditReport
@@ -423,12 +426,18 @@ class AuditReport {
 	 * discipline. Wraps its entire body in try/catch (\Throwable).
 	 *
 	 * @param int   $site_job_id
-	 * @param array $counts       AuditComparator::compute_counts()'s return shape (possibly an
-	 *                            empty array on internal failure — see that method's contract).
-	 * @param array $post_results AuditComparator::get_post_comparison_results()'s return shape
-	 *                            (source_id => result), possibly empty.
+	 * @param array $counts             AuditComparator::compute_counts()'s return shape (possibly
+	 *                                  an empty array on internal failure — see that method's
+	 *                                  contract).
+	 * @param array $post_results       AuditComparator::get_post_comparison_results()'s return
+	 *                                  shape (source_id => result), possibly empty.
+	 * @param array $attachment_results AuditComparator::get_attachment_comparison_results()'s
+	 *                                  return shape (source_id => result), possibly empty —
+	 *                                  defaults to empty so any external caller pre-dating this
+	 *                                  parameter still renders (with an empty media section)
+	 *                                  rather than erroring.
 	 */
-	public static function render_summary( int $site_job_id, array $counts, array $post_results ): void {
+	public static function render_summary( int $site_job_id, array $counts, array $post_results, array $attachment_results = [] ): void {
 		try {
 			$post_id = self::get_or_create_for_site_job( $site_job_id );
 			if ( ! $post_id ) {
@@ -437,7 +446,9 @@ class AuditReport {
 
 			$rendered = self::render_counts_section( $counts )
 				. "\n\n" . self::render_flagged_section( $post_results )
-				. "\n\n" . self::render_full_detail_section( $post_results, $post_id );
+				. "\n\n" . self::render_flagged_media_section( $attachment_results )
+				. "\n\n" . self::render_full_detail_section( $post_results, $post_id )
+				. "\n\n" . self::render_media_detail_section( $attachment_results, $post_id );
 
 			switch_to_blog( get_main_site_id() );
 			try {
@@ -544,6 +555,41 @@ class AuditReport {
 	}
 
 	/**
+	 * The attachment counterpart to render_flagged_section() — every $attachment_results entry
+	 * flagged as diverged (comparable-and-diverged, or not-comparable-but-diverged, e.g.
+	 * destination_attachment_missing). Zero flagged media renders "No divergence found." just
+	 * like the posts section, rather than an empty/missing section.
+	 */
+	private static function render_flagged_media_section( array $attachment_results ): string {
+		$lines   = [ '=== Flagged Media ===' ];
+		$flagged = array_filter( $attachment_results, static fn( $r ) => ! empty( $r['diverged'] ) );
+
+		if ( empty( $flagged ) ) {
+			$lines[] = 'No divergence found.';
+			return implode( "\n", $lines );
+		}
+
+		foreach ( $flagged as $result ) {
+			$lines[] = self::render_flagged_media_line( (array) $result );
+		}
+
+		return implode( "\n", $lines );
+	}
+
+	private static function render_flagged_media_line( array $result ): string {
+		$source_id = (int) ( $result['source_id'] ?? 0 );
+		$dest_id   = (int) ( $result['dest_id'] ?? 0 );
+
+		if ( empty( $result['comparable'] ) ) {
+			$reason = esc_html( (string) ( $result['reason'] ?? 'unknown' ) );
+			return "- source_id={$source_id} dest_id={$dest_id}: {$reason}";
+		}
+
+		$fields = implode( ', ', array_map( 'esc_html', array_map( 'strval', (array) ( $result['diverged_fields'] ?? [] ) ) ) );
+		return "- source_id={$source_id} dest_id={$dest_id}: diverged_fields=[{$fields}]";
+	}
+
+	/**
 	 * R6 section 3: full per-post detail — every entry in $post_results, comparable and not —
 	 * capped at full_detail_cap() entries for very large migrations, with a trailing note when
 	 * truncated pointing at `wp post meta list <report_post_id>` as the complete, uncapped source
@@ -615,6 +661,70 @@ class AuditReport {
 			! empty( $result['authorship_match'] ) ? 'yes' : 'no',
 			(int) ( $result['expected_author_id'] ?? 0 ),
 			(int) ( $result['actual_author_id'] ?? 0 )
+		);
+	}
+
+	/**
+	 * The attachment counterpart to render_full_detail_section() — full per-attachment detail,
+	 * capped at full_detail_cap() the same as posts (a separate cap application against the same
+	 * filter, so a large media library truncates independently of how many posts there are).
+	 */
+	private static function render_media_detail_section( array $attachment_results, int $post_id ): string {
+		$lines = [ '=== Media Detail ===' ];
+		$cap   = self::full_detail_cap();
+		$total = count( $attachment_results );
+
+		if ( 0 === $total ) {
+			$lines[] = '(no media compared)';
+			return implode( "\n", $lines );
+		}
+
+		$shown = 0;
+		foreach ( $attachment_results as $result ) {
+			if ( $shown >= $cap ) {
+				break;
+			}
+			$lines[] = self::render_media_detail_line( (array) $result );
+			++$shown;
+		}
+
+		if ( $total > $cap ) {
+			$lines[] = sprintf(
+				'(showing %d of %d media items — the complete set remains available via `wp post meta list %d` regardless of this cap)',
+				$shown,
+				$total,
+				$post_id
+			);
+		}
+
+		return implode( "\n", $lines );
+	}
+
+	private static function render_media_detail_line( array $result ): string {
+		$source_id = (int) ( $result['source_id'] ?? 0 );
+		$dest_id   = (int) ( $result['dest_id'] ?? 0 );
+
+		if ( empty( $result['comparable'] ) ) {
+			$reason = esc_html( (string) ( $result['reason'] ?? 'unknown' ) );
+			return "- source_id={$source_id} dest_id={$dest_id} comparable=no reason={$reason}";
+		}
+
+		$diverged       = ! empty( $result['diverged'] ) ? 'yes' : 'no';
+		$expected_title = esc_html( (string) ( $result['expected_title'] ?? '' ) );
+		$actual_title   = esc_html( (string) ( $result['actual_title'] ?? '' ) );
+
+		return sprintf(
+			"- source_id=%d dest_id=%d comparable=yes diverged=%s\n" .
+			"    title: expected=\"%s\" actual=\"%s\" match=%s\n" .
+			'    content_hash_match=%s alt_text_match=%s',
+			$source_id,
+			$dest_id,
+			$diverged,
+			$expected_title,
+			$actual_title,
+			! empty( $result['title_match'] ) ? 'yes' : 'no',
+			! empty( $result['content_hash_match'] ) ? 'yes' : 'no',
+			! empty( $result['alt_text_match'] ) ? 'yes' : 'no'
 		);
 	}
 
