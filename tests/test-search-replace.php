@@ -111,6 +111,36 @@ class Test_SearchReplace extends WP_UnitTestCase {
 		$this->assertStringContainsString( 'https://new.example.com', $result );
 		$this->assertIsArray( $decoded );
 	}
+
+	/**
+	 * Reproduces a real migration bug: the upload URL is always the siteurl plus a suffix
+	 * (e.g. '/wp-content/uploads/sites/3'), so the siteurl replacement pair's key is always a
+	 * literal prefix of the upload-url pair's key. safe_replace() applies replacements
+	 * sequentially via a foreach + str_replace() that reassigns $value each pass (see
+	 * class-search-replace.php) — if the siteurl pair runs first, it rewrites the domain
+	 * portion of every occurrence, including inside what would have matched the longer
+	 * upload-url key, so that second replacement then finds nothing left to match. The
+	 * symptom in production: media URLs rewrite the domain correctly but keep the SOURCE
+	 * site's blog-ID path segment (e.g. '/sites/3/') instead of the destination's
+	 * ('/sites/30/'), even though the underlying file was placed correctly on the
+	 * destination.
+	 */
+	public function test_upload_url_replacement_is_not_blocked_by_a_siteurl_prefix_match(): void {
+		$replacements = [
+			'https://old.example.com'                          => 'https://new.example.com/site',
+			'https://old.example.com/wp-content/uploads/sites/3' => 'https://new.example.com/site/wp-content/uploads/sites/30',
+		];
+
+		$result = SearchReplace::safe_replace(
+			'<img src="https://old.example.com/wp-content/uploads/sites/3/2020/04/photo.jpg">',
+			$replacements
+		);
+
+		$this->assertSame(
+			'<img src="https://new.example.com/site/wp-content/uploads/sites/30/2020/04/photo.jpg">',
+			$result
+		);
+	}
 }
 
 /**
