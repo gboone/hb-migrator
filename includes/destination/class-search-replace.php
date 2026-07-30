@@ -316,6 +316,19 @@ class SearchReplace {
 	 * @return mixed
 	 */
 	public static function safe_replace( $value, array $replacements ) {
+		// Longest key first: an upload URL is always the siteurl plus a suffix (e.g.
+		// '/wp-content/uploads/sites/3'), so the siteurl replacement's key is always a
+		// literal prefix of the upload-url replacement's key. Applying replacements in
+		// insertion order via sequential str_replace() below would let the siteurl pass
+		// rewrite the domain inside every upload-url occurrence first, leaving nothing
+		// for the upload-url pass to match — silently keeping the source's blog-ID path
+		// segment (e.g. '/sites/3/') in place of the destination's ('/sites/30/'), even
+		// though the file itself was placed correctly (see MediaImporter, which resolves
+		// its own destination path independently of this string replacement). Sorting
+		// longest-key-first guarantees the more specific pattern is consumed before a
+		// shorter prefix pattern can eat the substring it depends on.
+		uksort( $replacements, static fn( $a, $b ) => strlen( (string) $b ) - strlen( (string) $a ) );
+
 		if ( is_array( $value ) ) {
 			$result = [];
 			foreach ( $value as $k => $v ) {
