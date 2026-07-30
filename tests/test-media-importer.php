@@ -21,6 +21,7 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		remove_all_filters( 'pre_http_request' );
 		remove_all_filters( 'upload_dir' );
 		remove_all_filters( 'wp_generate_attachment_metadata' );
+		remove_all_filters( 'big_image_size_threshold' );
 	}
 
 	// -------------------------------------------------------------------------
@@ -479,6 +480,78 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		MediaImporter::process( $jid, 0, 0 );
 
 		$this->assertNull( IdMap::get( $jid, 'attachment', 802 ), 'False metadata must not produce an IdMap entry.' );
+	}
+
+	// -------------------------------------------------------------------------
+	// WordPress core's "big image" auto-scaling (5.3+, big_image_size_threshold, default
+	// 2560px) would otherwise silently rename a migrated file to "{name}-scaled.{ext}" —
+	// breaking any source content that already references the file by its original name. See
+	// import_batch()'s own big_image_size_threshold override.
+	// -------------------------------------------------------------------------
+
+	/**
+	 * A 1x1 fixture can never exercise WP core's real big-image scaling path — the constrained
+	 * target size always ends up identical to the original, so WP skips creating a redundant
+	 * scaled copy regardless of threshold (confirmed empirically: forcing the threshold below 1
+	 * against the 1x1 fixture used elsewhere in this file never produces a "-scaled" file or an
+	 * "original_image" metadata key, with or without import_batch()'s override). A real,
+	 * non-trivial image is required to genuinely trigger it.
+	 */
+	private function mock_successful_sized_png_download( int $width, int $height ): void {
+		$png_bytes = static function () use ( $width, $height ): string {
+			$image = imagecreatetruecolor( $width, $height );
+			ob_start();
+			imagepng( $image );
+			$bytes = ob_get_clean();
+			imagedestroy( $image );
+			return $bytes;
+		};
+
+		add_filter( 'pre_http_request', function ( $preempt, $args, $url ) use ( $png_bytes ) {
+			if ( false !== strpos( $url, '/wp-content/uploads/' ) ) {
+				if ( ! empty( $args['filename'] ) ) {
+					file_put_contents( $args['filename'], $png_bytes() );
+				}
+				return [
+					'response' => [ 'code' => 200, 'message' => 'OK' ],
+					'body'     => '',
+					'headers'  => new WpOrg\Requests\Utility\CaseInsensitiveDictionary(),
+					'cookies'  => [],
+					'filename' => $args['filename'] ?? null,
+				];
+			}
+			return $preempt;
+		}, 20, 3 );
+	}
+
+	public function test_big_image_scaling_is_disabled_so_original_filename_is_preserved(): void {
+		if ( ! is_multisite() ) {
+			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
+		}
+
+		$mid = $this->make_migration();
+		$jid = $this->make_site_job( $mid );
+		MigrationRegistry::update_site_job( $jid, [ 'dest_blog_id' => get_current_blog_id() ] );
+
+		$this->mock_media( [ $this->make_attachment_item( 1001, 'no-scale.png' ) ] );
+		$this->mock_successful_sized_png_download( 50, 50 );
+		// A real, non-trivial (50x50) fixture, with the threshold forced below its actual size —
+		// proving import_batch()'s override genuinely disables WP core's scaling path for an
+		// image that would otherwise, verifiably, trigger it (see this method's own docblock on
+		// why a 1x1 fixture can't exercise this).
+		add_filter( 'big_image_size_threshold', static fn() => 10 );
+
+		MediaImporter::process( $jid, 0, 0 );
+
+		$dest_id = IdMap::get( $jid, 'attachment', 1001 );
+		$this->assertNotNull( $dest_id, 'The attachment must still import successfully.' );
+
+		$meta = wp_get_attachment_metadata( $dest_id );
+		$this->assertArrayNotHasKey( 'original_image', $meta, 'An "original_image" metadata key only ever exists when WP core\'s big-image scaling actually ran — its absence proves scaling was disabled, not merely skipped for some other reason.' );
+
+		$attached_file = get_post_meta( $dest_id, '_wp_attached_file', true );
+		$this->assertStringNotContainsString( '-scaled', $attached_file, 'The migrated file must keep its original filename, not get renamed with a "-scaled" suffix.' );
+		$this->assertStringContainsString( 'no-scale.png', $attached_file, 'The migrated file must retain its exact original filename.' );
 	}
 
 	public function test_metadata_failure_reason_in_permanent_error_message(): void {
