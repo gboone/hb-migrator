@@ -484,9 +484,10 @@ class Test_Media_Importer extends WP_UnitTestCase {
 
 	// -------------------------------------------------------------------------
 	// WordPress core's "big image" auto-scaling (5.3+, big_image_size_threshold, default
-	// 2560px) would otherwise silently rename a migrated file to "{name}-scaled.{ext}" —
-	// breaking any source content that already references the file by its original name. See
-	// import_batch()'s own big_image_size_threshold override.
+	// 2560px) resizes the file but repoints the primary attached file at a new
+	// "{name}-scaled.{ext}" derivative — breaking any source content that already references
+	// the file by its original name. See restore_original_filename_after_core_processing(),
+	// which keeps the resize but renames the derivative back to the original name.
 	// -------------------------------------------------------------------------
 
 	/**
@@ -524,7 +525,7 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		}, 20, 3 );
 	}
 
-	public function test_big_image_scaling_is_disabled_so_original_filename_is_preserved(): void {
+	public function test_big_image_scaling_still_resizes_but_original_filename_is_restored(): void {
 		if ( ! is_multisite() ) {
 			$this->markTestSkipped( 'MediaImporter requires a destination blog_id.' );
 		}
@@ -536,9 +537,8 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		$this->mock_media( [ $this->make_attachment_item( 1001, 'no-scale.png' ) ] );
 		$this->mock_successful_sized_png_download( 50, 50 );
 		// A real, non-trivial (50x50) fixture, with the threshold forced below its actual size —
-		// proving import_batch()'s override genuinely disables WP core's scaling path for an
-		// image that would otherwise, verifiably, trigger it (see this method's own docblock on
-		// why a 1x1 fixture can't exercise this).
+		// proving the resize genuinely happens (see mock_successful_sized_png_download()'s own
+		// docblock on why a 1x1 fixture can't exercise this at all).
 		add_filter( 'big_image_size_threshold', static fn() => 10 );
 
 		MediaImporter::process( $jid, 0, 0 );
@@ -547,11 +547,19 @@ class Test_Media_Importer extends WP_UnitTestCase {
 		$this->assertNotNull( $dest_id, 'The attachment must still import successfully.' );
 
 		$meta = wp_get_attachment_metadata( $dest_id );
-		$this->assertArrayNotHasKey( 'original_image', $meta, 'An "original_image" metadata key only ever exists when WP core\'s big-image scaling actually ran — its absence proves scaling was disabled, not merely skipped for some other reason.' );
+		$this->assertLessThanOrEqual( 10, $meta['width'], 'The resize itself must still happen — width must reflect the scaled-down size, not the original 50px.' );
+		$this->assertArrayNotHasKey( 'original_image', $meta, 'No dangling "original_image" reference must remain once the true original has been discarded in favor of the (renamed) resized copy.' );
 
 		$attached_file = get_post_meta( $dest_id, '_wp_attached_file', true );
-		$this->assertStringNotContainsString( '-scaled', $attached_file, 'The migrated file must keep its original filename, not get renamed with a "-scaled" suffix.' );
-		$this->assertStringContainsString( 'no-scale.png', $attached_file, 'The migrated file must retain its exact original filename.' );
+		$this->assertStringNotContainsString( '-scaled', $attached_file, 'The resized file must be renamed back to the original filename, not keep the "-scaled" suffix.' );
+		$this->assertStringContainsString( 'no-scale.png', $attached_file, 'The migrated file must be served under its exact original filename.' );
+
+		$this->assertStringEndsWith( 'no-scale.png', get_attached_file( $dest_id ), 'get_attached_file() must resolve to the renamed (original-named) file.' );
+		$this->assertStringNotContainsString( '-scaled', $meta['file'], "\$meta['file'] must also reflect the renamed original name, not the discarded \"-scaled\" path." );
+
+		// No orphaned "-scaled" copy left behind alongside the renamed file.
+		$dir = dirname( get_attached_file( $dest_id ) );
+		$this->assertFileDoesNotExist( $dir . '/no-scale-scaled.png' );
 	}
 
 	public function test_metadata_failure_reason_in_permanent_error_message(): void {

@@ -319,20 +319,7 @@ class MediaImporter {
 					update_post_meta( $dest_att_id, '_hbm_source_attachment_id', $source_att_id );
 				}
 
-				// WordPress core's "big image" auto-scaling (5.3+, big_image_size_threshold,
-				// default 2560px) would otherwise silently rename the file to
-				// "{name}-scaled.{ext}" whenever either dimension exceeds the threshold — fine
-				// for a normal upload with nothing else referencing the file yet, but a real
-				// problem for a migrated attachment: source content (post_content, other
-				// postmeta) may already reference this exact file by its original name, and a
-				// silent rename breaks that reference on the destination even though the
-				// migration otherwise succeeded. Migrated media should keep the exact filename
-				// (and dimensions) it had on the source, not get reprocessed under the
-				// destination's own upload policy. Disabled only for the duration of this call —
-				// never affects any other attachment metadata generation on the destination.
-				add_filter( 'big_image_size_threshold', '__return_false' );
 				$meta = wp_generate_attachment_metadata( $dest_att_id, $sideload['file'] );
-				remove_filter( 'big_image_size_threshold', '__return_false' );
 				if ( empty( $meta ) ) {
 					wp_delete_attachment( $dest_att_id, true );
 					if ( $source_att_id ) {
@@ -343,6 +330,7 @@ class MediaImporter {
 					}
 					continue;
 				}
+				$meta = self::restore_original_filename_after_core_processing( $dest_att_id, $sideload['file'], $meta );
 				wp_update_attachment_metadata( $dest_att_id, $meta );
 
 				if ( ! empty( $att['alt_text'] ) ) {
@@ -419,6 +407,69 @@ class MediaImporter {
 		};
 		add_filter( 'upload_dir', $filter );
 		return $filter;
+	}
+
+	/**
+	 * Undoes a filename-preservation-breaking side effect of wp_generate_attachment_metadata():
+	 * WordPress core's own image processing (big-image auto-scaling, `big_image_size_threshold`,
+	 * 5.3+, OR EXIF-orientation auto-rotation — both go through the same internal
+	 * `_wp_image_meta_replace_original()` path) leaves the true original file untouched at its
+	 * original name, but re-processes a NEW derivative (resized or rotated) under a suffixed name
+	 * ("{name}-scaled.{ext}" / "{name}-rotated.{ext}") and repoints `_wp_attached_file` — the
+	 * primary served file — at that new derivative instead. A migrated attachment often already
+	 * has source content (post_content, other postmeta) referencing this exact file by its
+	 * original name; left as WP core leaves it, the file actually served no longer matches.
+	 *
+	 * Rather than disabling this processing (losing the resize/rotation-correction benefit
+	 * entirely), this keeps whatever WP core produced but renames the new derivative back into
+	 * the original file's name — the original file itself is discarded to free that name, since
+	 * keeping both would just relocate the naming mismatch onto whichever copy kept the suffix.
+	 *
+	 * Deliberately narrow: only fires when `$meta['original_image']` is set (i.e. WP core
+	 * actually produced a derivative) AND the derivative's extension exactly matches the
+	 * original's. A mismatched extension means a genuine format conversion happened (e.g.
+	 * HEIC -> JPEG, `generate_filename('')`, no suffix but a different extension) — renaming a
+	 * converted file's bytes back under the original (wrong-format) extension would be actively
+	 * incorrect, not a naming fix, so that case is left as WP core produced it.
+	 *
+	 * @param int    $dest_att_id
+	 * @param string $original_file The exact path wp_handle_sideload() placed the file at,
+	 *                               before any of wp_generate_attachment_metadata()'s own
+	 *                               processing — WP core never moves or renames this file, only
+	 *                               ever creates an additional derivative alongside it.
+	 * @param array  $meta          wp_generate_attachment_metadata()'s return value.
+	 * @return array The (possibly adjusted) metadata to pass to wp_update_attachment_metadata().
+	 */
+	private static function restore_original_filename_after_core_processing( int $dest_att_id, string $original_file, array $meta ): array {
+		if ( empty( $meta['original_image'] ) ) {
+			return $meta;
+		}
+
+		$derivative_file = get_attached_file( $dest_att_id );
+		if ( $derivative_file === $original_file ) {
+			return $meta;
+		}
+
+		$original_ext   = strtolower( (string) pathinfo( $original_file, PATHINFO_EXTENSION ) );
+		$derivative_ext = strtolower( (string) pathinfo( $derivative_file, PATHINFO_EXTENSION ) );
+		if ( $original_ext !== $derivative_ext ) {
+			return $meta; // Genuine format conversion — WP core's naming is correct as-is.
+		}
+
+		// rename() atomically replaces an existing destination on the POSIX filesystems this
+		// plugin actually runs on (Linux hosting, including VIP) — deliberately not preceded by
+		// a separate unlink() of $original_file, so a failed rename() never leaves the true
+		// original deleted with nothing to replace it; either both survive as WP core left them,
+		// or the derivative fully replaces the original in one step.
+		if ( ! @rename( $derivative_file, $original_file ) ) { // phpcs:ignore WordPress.PHP.NoSilencedErrors
+			return $meta; // Leave WP core's own naming in place rather than risk a dangling reference.
+		}
+
+		update_attached_file( $dest_att_id, $original_file );
+		$meta['file'] = _wp_relative_upload_path( $original_file );
+		unset( $meta['original_image'] );
+
+		return $meta;
 	}
 
 	/**
